@@ -1222,35 +1222,42 @@ void apartment_decrement_mta_usage(CO_MTA_USAGE_COOKIE cookie)
 }
 
 static const WCHAR aptwinclassW[] = L"OleMainThreadWndClass";
-static ATOM apt_win_class;
 
-static BOOL WINAPI register_class( INIT_ONCE *once, void *param, void **context )
+/* Bug #12 (Proton macOS): the prior upstream code relied on a process-
+ * static InitOnceExecuteOnce to register OleMainThreadWndClass exactly
+ * once per process, then cached the atom returned by RegisterClassW for
+ * UnregisterClassW at process tear-down.
+ *
+ * The atom-cache was a trap in our environment. The wineserver maintains
+ * a session-shared atom table; combined with patch 0007 (Bug #9 stub
+ * class pinned at atom 5 for Chromium MessageWindow), we observed the
+ * cached atom getting polluted to 5 across fresh CEF subprocesses. Any
+ * subsequent CreateWindow retry by atom (or UnregisterClassW by atom)
+ * would then route to the WRONG class, COM marshalling thought it
+ * succeeded, WM_USER messages were posted but never dispatched, and
+ * the calling thread spun at 100%+ CPU forever.
+ *
+ * Drop the static atom cache entirely. Always RegisterClassW, accept
+ * ERROR_CLASS_ALREADY_EXISTS as a non-error, do CreateWindow by name
+ * only, and at cleanup time UnregisterClassW by name. No atom round-
+ * trips anywhere. */
+static void register_apt_win_class(void)
 {
     WNDCLASSW wclass;
 
-    /* Dispatching to the correct thread in an apartment is done through
-     * window messages rather than RPC transports. When an interface is
-     * marshalled into another apartment in the same process, a window of the
-     * following class is created. The *caller* of CoMarshalInterface (i.e., the
-     * application) is responsible for pumping the message loop in that thread.
-     * The WM_USER messages which point to the RPCs are then dispatched to
-     * apartment_wndproc by the user's code from the apartment in which the
-     * interface was unmarshalled.
-     */
     memset(&wclass, 0, sizeof(wclass));
     wclass.lpfnWndProc = apartment_wndproc;
     wclass.hInstance = hProxyDll;
     wclass.lpszClassName = aptwinclassW;
-    apt_win_class = RegisterClassW(&wclass);
-    return TRUE;
+    if (!RegisterClassW(&wclass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        ERR("Bug #12: RegisterClassW(OleMainThreadWndClass) failed err=%ld hProxyDll=%p\n",
+            GetLastError(), hProxyDll);
 }
 
 /* create a window for the apartment or return the current one if one has
  * already been created */
 HRESULT apartment_createwindowifneeded(struct apartment *apt)
 {
-    static INIT_ONCE class_init_once = INIT_ONCE_STATIC_INIT;
-
     if (apt->multi_threaded)
         return S_OK;
 
@@ -1258,12 +1265,13 @@ HRESULT apartment_createwindowifneeded(struct apartment *apt)
     {
         HWND hwnd;
 
-        InitOnceExecuteOnce( &class_init_once, register_class, NULL, NULL );
+        register_apt_win_class();
 
         hwnd = CreateWindowW(aptwinclassW, NULL, 0, 0, 0, 0, 0, HWND_MESSAGE, 0, hProxyDll, NULL);
         if (!hwnd)
         {
-            ERR("CreateWindow failed with error %ld\n", GetLastError());
+            ERR("CreateWindow failed with error %ld hProxyDll=%p\n",
+                GetLastError(), hProxyDll);
             return HRESULT_FROM_WIN32(GetLastError());
         }
         if (InterlockedCompareExchangePointer((void **)&apt->win, hwnd, NULL))
@@ -1288,8 +1296,10 @@ OXID apartment_getoxid(const struct apartment *apt)
 
 void apartment_global_cleanup(void)
 {
-    if (apt_win_class)
-        UnregisterClassW((const WCHAR *)MAKEINTATOM(apt_win_class), hProxyDll);
+    /* Bug #12: unregister by name; we no longer cache the atom (see
+     * register_apt_win_class above). UnregisterClassW returns FALSE if
+     * the class was never registered in this process, which is fine. */
+    UnregisterClassW(aptwinclassW, hProxyDll);
     apartment_release_dlls();
     DeleteCriticalSection(&apt_cs);
 }
