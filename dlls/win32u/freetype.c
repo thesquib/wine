@@ -1479,6 +1479,17 @@ static void load_mac_fonts(void)
 static BOOL init_freetype(void)
 {
     ft_handle = dlopen(SONAME_LIBFREETYPE, RTLD_NOW);
+#ifdef __APPLE__
+    /* Rosetta 2 strips DYLD_LIBRARY_PATH from x86_64-translated processes,
+     * so a bare SONAME often fails even with the dylib installed via
+     * Intel Homebrew at /usr/local/lib. Fall back to absolute paths. */
+    if (!ft_handle) ft_handle = dlopen("/usr/local/lib/" SONAME_LIBFREETYPE, RTLD_NOW);
+    if (!ft_handle) ft_handle = dlopen("/opt/homebrew/lib/" SONAME_LIBFREETYPE, RTLD_NOW);
+    if (!ft_handle) {
+        const char *custom = getenv("WINE_FREETYPE_PATH");
+        if (custom) ft_handle = dlopen(custom, RTLD_NOW);
+    }
+#endif
     if(!ft_handle) {
         WINE_MESSAGE(
       "Wine cannot find the FreeType font library.  To enable Wine to\n"
