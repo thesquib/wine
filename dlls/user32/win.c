@@ -290,12 +290,70 @@ HWND WIN_CreateWindowEx( CREATESTRUCTW *cs, LPCWSTR className, HINSTANCE module,
     WCHAR name_buf[8];
     HMENU menu;
 
+    /* Bug #8 diagnostic: capture the raw className parameter as the caller
+     * passed it, before init_class_name() converts integer atoms to "#NNN"
+     * strings. If className is already MAKEINTATOM(5) on entry, the caller
+     * (e.g. Chrome) hardcodes the atom value. If className is a string but
+     * post-init class.Buffer == L"#5", Wine transforms it. RA is inside
+     * CreateWindowExA/W (caller of this function); we don't walk further up
+     * the stack because __builtin_return_address(N>0) crashed under PE/Wine
+     * when an upstream frame lacked a frame pointer. */
+    {
+        void *ra = __builtin_return_address(0);
+        BOOL is_int = IS_INTRESOURCE( className );
+        UINT atom_val = is_int ? (UINT)(UINT_PTR)className : 0;
+        BOOL is_msg_parent = (cs->hwndParent == HWND_MESSAGE);
+        if (is_int && atom_val < 0xC000)
+        {
+            ERR( "WIN_CreateWindowEx ENTRY: SUSPICIOUS low int-atom className=%p (atom=%u/%#x) "
+                 "unicode=%d hwndParent=%p%s module=%p RA=%p\n",
+                 className, atom_val, atom_val, unicode, cs->hwndParent,
+                 is_msg_parent ? " (HWND_MESSAGE)" : "", module, ra );
+        }
+        else if (is_msg_parent)
+        {
+            ERR( "WIN_CreateWindowEx ENTRY: HWND_MESSAGE call className=%s (raw=%p, %s) "
+                 "unicode=%d module=%p RA=%p\n",
+                 is_int ? "<int>" : debugstr_w(className), className,
+                 is_int ? "int-atom" : "string", unicode, module, ra );
+        }
+        else if (is_int)
+        {
+            TRACE( "WIN_CreateWindowEx ENTRY: int-atom className=%p (atom=%#x) "
+                   "unicode=%d hwndParent=%p module=%p RA=%p\n",
+                   className, atom_val, unicode, cs->hwndParent, module, ra );
+        }
+        else
+        {
+            TRACE( "WIN_CreateWindowEx ENTRY: string className=%s "
+                   "unicode=%d hwndParent=%p module=%p RA=%p\n",
+                   debugstr_w(className), unicode, cs->hwndParent, module, ra );
+        }
+    }
+
     init_class_name( &class, className );
     get_class_version( &class, &version, TRUE );
 
+    /* Bug #8 diagnostic: if init_class_name produced the symptomatic "#5"
+     * (or any low int-atom #NNN) from a non-IS_INTRESOURCE input, that's a
+     * Wine-side transformation bug. If the className was already
+     * MAKEINTATOM(small), we already logged it above - this branch tells us
+     * about the OTHER case. */
+    if (!IS_INTRESOURCE( className ) && class.Length && class.Length <= 32 &&
+        class.Buffer && class.Buffer[0] == L'#')
+    {
+        ERR( "WIN_CreateWindowEx TRANSFORM: string className=%s -> class.Buffer=%s "
+             "(Wine produced a low int-atom name from a non-int-atom input)\n",
+             debugstr_w(className), debugstr_us(&class) );
+    }
+
     if (!NtUserGetClassInfoEx( module, &class, &info, NULL, FALSE ))
     {
-        TRACE( "%s %p -> not found\n", debugstr_us(&class), module );
+        ERR( "WIN_CreateWindowEx CLASS-NOT-FOUND: class=%s module=%p "
+             "raw className=%p (%s) hwndParent=%p%s\n",
+             debugstr_us(&class), module, className,
+             IS_INTRESOURCE( className ) ? "int-atom" : "string",
+             cs->hwndParent, cs->hwndParent == HWND_MESSAGE ? " (HWND_MESSAGE)" : "" );
         SetLastError( ERROR_CLASS_DOES_NOT_EXIST );
         return FALSE;
     }
