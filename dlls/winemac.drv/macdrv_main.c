@@ -26,6 +26,7 @@
 
 #include "config.h"
 
+#include <stdlib.h>
 #include <Security/AuthSession.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 
@@ -58,6 +59,8 @@ bool use_precise_scrolling = true;
 int gl_surface_mode = GL_SURFACE_IN_FRONT_OPAQUE;
 bool retina_enabled = false;
 bool enable_app_nap = false;
+double mouse_relative_motion_scale = 1.0;
+double mouse_relative_motion_cap = 0.0;
 
 UINT64 app_icon_callback = 0;
 UINT64 app_quit_request_callback = 0;
@@ -372,6 +375,25 @@ static void setup_options(void)
     if (!get_config_key(hkey, appkey, "EnableAppNap", buffer, sizeof(buffer)))
         enable_app_nap = IS_OPTION_TRUE(buffer[0]);
 
+    /* @@ Wine registry key: HKCU\Software\Wine\Mac Driver\MouseRelativeMotionScale (REG_SZ, e.g. "0.25") */
+    if (!get_config_key(hkey, appkey, "MouseRelativeMotionScale", buffer, sizeof(buffer)))
+    {
+        char ascii[32]; int i;
+        for (i = 0; i < (int)ARRAY_SIZE(ascii) - 1 && buffer[i]; i++) ascii[i] = (char)buffer[i];
+        ascii[i] = 0;
+        double v = atof(ascii);
+        if (v > 0.0 && v < 100.0) mouse_relative_motion_scale = v;
+    }
+    /* @@ Wine registry key: HKCU\Software\Wine\Mac Driver\MouseRelativeMotionCap (REG_SZ, e.g. "20") */
+    if (!get_config_key(hkey, appkey, "MouseRelativeMotionCap", buffer, sizeof(buffer)))
+    {
+        char ascii[32]; int i;
+        for (i = 0; i < (int)ARRAY_SIZE(ascii) - 1 && buffer[i]; i++) ascii[i] = (char)buffer[i];
+        ascii[i] = 0;
+        double v = atof(ascii);
+        if (v >= 0.0 && v < 10000.0) mouse_relative_motion_cap = v;
+    }
+
     /* Don't use appkey.  The DPI and monitor sizes should be consistent for all
        processes in the prefix. */
     if (!get_config_key(hkey, NULL, "RetinaMode", buffer, sizeof(buffer)))
@@ -446,6 +468,17 @@ static NTSTATUS macdrv_init(void *arg)
         ERR("Failed to start Cocoa app main loop\n");
         return STATUS_UNSUCCESSFUL;
     }
+
+    /* If an FPS-mode game (Skyrim, etc.) exits via its own in-game Quit
+     * path it bypasses Cocoa's applicationShouldTerminate: and the
+     * mouseMoved handler never gets a chance to revert
+     * CGAssociateMouseAndMouseCursorPosition(false). That leaves the
+     * system mouse disassociated and the Cocoa run loop wedged waiting
+     * on events that never arrive (the game appears to "stop responding"
+     * but never exits). Register a libc atexit() handler so that any
+     * clean exit() - including the Wine ntdll process-shutdown path -
+     * re-couples the mouse unconditionally. */
+    atexit(macdrv_restore_mouse_association);
 
     init_user_driver();
     return STATUS_SUCCESS;

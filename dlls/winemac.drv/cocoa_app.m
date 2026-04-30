@@ -43,6 +43,176 @@ static NSString* const WineActivatingAppConfigDirKey = @"ActivatingAppConfigDir"
 
 bool macdrv_err_on;
 
+/* File-scope tracking for FPS-mode mouse disassociation so we can revert on
+ * process exit. The mouseMoved handler toggles this when entering/leaving
+ * FPS-style relative-motion mode. If a game exits without a clean Cocoa
+ * teardown (e.g. Skyrim's in-game Quit) the mouseMoved transitions never
+ * fire back to NO, leaving the system mouse disassociated and the run loop
+ * waiting for events that never arrive. macdrv_restore_mouse_association()
+ * is registered via atexit() in macdrv_init so any process exit re-couples
+ * the mouse + cursor unconditionally. */
+BOOL macdrv_mouse_disassociated = NO;
+
+void macdrv_restore_mouse_association(void)
+{
+    /* Safe to call from any thread / context, including atexit on a
+     * non-main thread. CGAssociateMouseAndMouseCursorPosition is a
+     * lightweight CG call - no Cocoa locking required. */
+    if (macdrv_mouse_disassociated)
+    {
+        CGAssociateMouseAndMouseCursorPosition(true);
+        macdrv_mouse_disassociated = NO;
+    }
+}
+
+/* ---------------------------------------------------------------------
+ * Strategy E.1 - Vulkan-path layer-host broadcast.
+ *
+ * winemac.drv's Vulkan path creates a CAMetalLayer inside a WineMetalView
+ * which lives as a subview of the surface->cocoa_view. The cocoa_view is
+ * normally inserted into the WineContentView via macdrv_set_view_superview
+ * during macdrv_client_surface_update - but only if get_win_data(toplevel)
+ * succeeds. When the toplevel HWND belongs to another Wine process (or is
+ * not yet registered in this process's win_datas) the update silently
+ * returns and the cocoa_view is never parented. MoltenVK then renders into
+ * a layer that's offscreen, producing DOOM's "title bar but no content"
+ * symptom.
+ *
+ * The fallback mirrors DXMT's existing same-process direct-attach trick:
+ * wrap the CAMetalLayer in a CAContext and post a
+ * DXMTRemoteLayerHostRequest notification. The existing handleDXMT...
+ * observer will (via macdrv_resolve_hwnd_for_hosting) find a visible
+ * WineContentView in this or a sibling process and attach the layer
+ * directly (same process) or via CALayerHost(contextId:) (cross process).
+ *
+ * The notification name is reused intentionally: the observer's contract
+ * is HWND-keyed and protocol-agnostic - it doesn't care whether the layer
+ * came from DXMT or winevulkan.
+ * ------------------------------------------------------------------- */
+typedef uint32_t CGSConnectionID;
+extern CGSConnectionID CGSMainConnectionID(void);
+
+@interface CAContext : NSObject
++ (CAContext *)contextWithCGSConnection:(CGSConnectionID)cid options:(NSDictionary *)opts;
+@property (retain) CALayer *layer;
+@property (readonly) uint32_t contextId;
+@end
+
+__attribute__((visibility("default")))
+void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer)
+{
+    fprintf(stderr, "winemac:VK broadcast ENTER hwnd=%p layer=%p isMain=%d\n",
+            hwnd, metal_layer, (int)[NSThread isMainThread]);
+    if (!hwnd || !metal_layer) {
+        fprintf(stderr, "winemac:E.1-vulkan - refusing to broadcast hwnd=%p layer=%p\n",
+                hwnd, metal_layer);
+        return;
+    }
+
+    /* Track per-hwnd state so we don't re-arm the retry timer for every
+     * surface_update call. The CAContext must be retained for the lifetime
+     * of the layer (its dealloc breaks hosting). */
+    static NSMutableDictionary *ctxByHwnd = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ctxByHwnd = [[NSMutableDictionary alloc] init]; });
+    fprintf(stderr, "winemac:VK broadcast STEPB1 ctxByHwnd=%p\n", ctxByHwnd);
+
+    @autoreleasepool {
+        NSNumber *key = @((uintptr_t)hwnd);
+        BOOL firstTime = (ctxByHwnd[key] == nil);
+        fprintf(stderr, "winemac:VK broadcast STEPB2 firstTime=%d\n", firstTime);
+
+        __block uint32_t contextId = 0;
+        if (firstTime) {
+            /* CAContext.contextWithCGSConnection: must run on the main
+             * thread - it touches the WindowServer connection. The first
+             * caller is typically Wine's render thread, so dispatch sync
+             * to main. */
+            __block CAContext *ctx = nil;
+            dispatch_block_t make = ^{
+                fprintf(stderr, "winemac:VK broadcast STEPB3a calling CAContext contextWithCGSConnection\n");
+                /* Bug (Proton macOS) 2026-04-29: this code is MRC, not ARC.
+                 * `+contextWithCGSConnection:options:` returns an autoreleased
+                 * object. The dispatch_sync's main-thread autorelease pool
+                 * drains when the block returns, releasing the CAContext -
+                 * leaving `ctx` dangling. The next access (`ctxByHwnd[key] = ctx`
+                 * outside the block) then fault with STATUS_ACCESS_VIOLATION
+                 * (0xc0000005), aborting `vkCreateWin32SurfaceKHR`. Manual
+                 * retain inside the block keeps the object alive past the
+                 * dispatch boundary; the dictionary's strong reference takes
+                 * over ownership when ctx is stored. */
+                ctx = [[CAContext contextWithCGSConnection:CGSMainConnectionID() options:nil] retain];
+                fprintf(stderr, "winemac:VK broadcast STEPB3b ctx=%p (retained)\n", ctx);
+                ctx.layer = (__bridge CALayer *)metal_layer;
+                fprintf(stderr, "winemac:VK broadcast STEPB3c ctx.layer set\n");
+                contextId = ctx.contextId;
+                fprintf(stderr, "winemac:VK broadcast STEPB3d contextId=%u\n", contextId);
+            };
+            if ([NSThread isMainThread]) {
+                fprintf(stderr, "winemac:VK broadcast STEPB3 on main thread, calling make() inline\n");
+                make();
+            } else {
+                fprintf(stderr, "winemac:VK broadcast STEPB3 not main, dispatch_sync to main\n");
+                dispatch_sync(dispatch_get_main_queue(), make);
+                fprintf(stderr, "winemac:VK broadcast STEPB3 dispatch_sync returned\n");
+            }
+
+            if (!ctx) {
+                fprintf(stderr, "winemac:E.1-vulkan - failed to create CAContext for hwnd=%p\n", hwnd);
+                return;
+            }
+            ctxByHwnd[key] = ctx;
+            fprintf(stderr, "winemac:E.1-vulkan - created CAContext id=%u for layer=%p hwnd=%p\n",
+                    contextId, metal_layer, hwnd);
+        } else {
+            CAContext *existing = ctxByHwnd[key];
+            contextId = existing.contextId;
+        }
+
+        __block uintptr_t capturedHwnd = (uintptr_t)hwnd;
+        __block uintptr_t capturedLayer = (uintptr_t)metal_layer;
+        __block uint32_t capturedCtx = contextId;
+        __block int capturedPid = getpid();
+        void (^doBroadcast)(void) = ^{
+            NSDictionary *info = @{
+                @"hwnd": @(capturedHwnd),
+                @"contextId": @(capturedCtx),
+                @"pid": @(capturedPid),
+                @"layerPtr": @(capturedLayer)
+            };
+            [[NSDistributedNotificationCenter defaultCenter]
+                postNotificationName:@"DXMTRemoteLayerHostRequest"
+                              object:nil
+                            userInfo:info
+                  deliverImmediately:YES];
+        };
+        doBroadcast();
+        fprintf(stderr, "winemac:E.1-vulkan - broadcast hwnd=%p ctxId=%u pid=%d layer=%p (firstTime=%d)\n",
+                hwnd, contextId, getpid(), metal_layer, firstTime);
+
+        /* On the first broadcast, arm the same retry pattern as DXMT - the
+         * target NSWindow may not be on_screen yet when surface_create
+         * fires. Retry every 500ms for 30 seconds. */
+        if (firstTime) {
+            __block int retryCount = 0;
+            __block void (^retryBlock)(void);
+            void (^retryBlockContent)(void) = ^{
+                retryCount++;
+                doBroadcast();
+                if (retryCount < 60) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                 (int64_t)(0.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), retryBlock);
+                }
+            };
+            retryBlock = [retryBlockContent copy];
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), retryBlock);
+        }
+    }
+}
+
 
 #if !defined(MAC_OS_VERSION_14_0) || MAC_OS_X_VERSION_MAX_ALLOWED < MAC_OS_VERSION_14_0
 @interface NSApplication (CooperativeActivationSelectorsForOldSDKs)
@@ -107,6 +277,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
+    - (void) handleDXMTRemoteLayerHostRequest:(NSNotification *)note;
 
     static void PerformRequest(void *info);
 
@@ -1361,19 +1532,60 @@ static NSString* WineLocalizedString(unsigned int stringID)
             // If we recently warped the cursor (other than in our cursor-clipping
             // event tap), discard mouse move events until we see an event which is
             // later than that time.
+            //
+            // 2026-04-26 macOS-port mod: trackpad events arrive in dense clusters
+            // with timestamps within ~10ms of each other. Skyrim/DS3 warp the
+            // cursor every frame for relative-motion capture; the previous "<=
+            // warp time" discard swallowed almost all trackpad input. Use a
+            // tighter 16ms (~1 frame) discard window instead - keeps the warp's
+            // own synthetic events filtered while letting genuine pre-warp
+            // trackpad samples through.
+            //
+            // Also: track whether we've seen a SetCursorPos in the last 500ms.
+            // If yes, the app is doing FPS-style cursor recentering; force
+            // RELATIVE mouse mode so the game's mouse-look reads delta values
+            // instead of (always-the-same after warp) absolute positions.
+            BOOL recentWarp = NO;
             if (lastSetCursorPositionTime)
             {
-                if ([anEvent timestamp] <= lastSetCursorPositionTime)
+                NSTimeInterval evt_time = [anEvent timestamp];
+                if (evt_time + 0.016 <= lastSetCursorPositionTime)
                     return;
 
                 lastSetCursorPositionTime = 0;
-                forceNextMouseMoveAbsolute = TRUE;
+                /* Don't force absolute on the first post-warp event - that
+                 * defeats relative-mode tracking for FPS games. Just clear
+                 * the discard window and let the regular interior/boundary
+                 * logic decide. */
+                recentWarp = YES;
+            }
+            /* FPS-mode trigger: app called ClipCursor OR SetCapture OR is in
+             * fullscreen with cursor hidden. Any of these suggests mouse-look.
+             * Force RELATIVE motion + disassociate Mac cursor so trackpad
+             * deltas go directly to the game. */
+            BOOL fpsModeActive = self.clippingCursor
+                              || (self.mouseCaptureWindow != nil
+                                  && self.mouseCaptureWindow == targetWindow)
+                              || (cursor_clipping_locks_windows
+                                  && [(WineWindow*)targetWindow respondsToSelector:@selector(fullscreen)]
+                                  && [(WineWindow*)targetWindow fullscreen]);
+            if (fpsModeActive != macdrv_mouse_disassociated) {
+                CGAssociateMouseAndMouseCursorPosition(!fpsModeActive);
+                macdrv_mouse_disassociated = fpsModeActive;
+                fprintf(stderr, "winemac:mouse FPS mode = %d (clippingCursor)\n", fpsModeActive);
             }
 
             if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
             {
                 absolute = TRUE;
                 forceNextMouseMoveAbsolute = FALSE;
+            }
+            else if (fpsModeActive)
+            {
+                /* FPS-mode override: app is recentering cursor every frame,
+                 * so it wants relative motion deltas. Skip the
+                 * "in interior of range = send absolute" heuristic. */
+                absolute = FALSE;
             }
             else
             {
@@ -1438,11 +1650,26 @@ static NSString* WineLocalizedString(unsigned int stringID)
             else
             {
                 double scale = retina_on ? 2 : 1;
+                /* Scale and cap relative deltas. The macOS trackpad/mouse driver
+                   pre-applies a pointer acceleration curve to -[NSEvent deltaX/Y].
+                   Games that run their own raw-input accel (Source engine, etc.)
+                   end up double-accelerated, producing "look at ceiling, spin fast".
+                   MouseRelativeMotionScale lets the user dampen; MouseRelativeMotionCap
+                   clamps per-axis magnitude in post-scale pixels (0 = disabled). */
+                double dx = [anEvent deltaX] * mouse_relative_motion_scale;
+                double dy = [anEvent deltaY] * mouse_relative_motion_scale;
+                if (mouse_relative_motion_cap > 0.0)
+                {
+                    if (dx >  mouse_relative_motion_cap) dx =  mouse_relative_motion_cap;
+                    if (dx < -mouse_relative_motion_cap) dx = -mouse_relative_motion_cap;
+                    if (dy >  mouse_relative_motion_cap) dy =  mouse_relative_motion_cap;
+                    if (dy < -mouse_relative_motion_cap) dy = -mouse_relative_motion_cap;
+                }
 
                 /* Add event delta to accumulated delta error */
                 /* deltaY is already flipped */
-                mouseMoveDeltaX += [anEvent deltaX];
-                mouseMoveDeltaY += [anEvent deltaY];
+                mouseMoveDeltaX += dx;
+                mouseMoveDeltaY += dy;
 
                 event = macdrv_create_event(MOUSE_MOVED_RELATIVE, targetWindow);
                 event->mouse_moved.x = mouseMoveDeltaX * scale;
@@ -1866,6 +2093,14 @@ static NSString* WineLocalizedString(unsigned int stringID)
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note){
+            /* Always defensively re-couple the mouse when ANY window closes -
+             * if the game decoupled it for FPS mode, our shutdown path stops
+             * receiving mouseMoved events so the explicit revert in mouseMoved
+             * never fires. Without this, _ReleaseMetalView's OnMainThread
+             * dispatch_sync hangs because Cocoa's run loop becomes unresponsive
+             * with the mouse in disassociated state. */
+            macdrv_restore_mouse_association();
+
             NSWindow* window = [note object];
             if ([window isKindOfClass:[WineWindow class]] && [(WineWindow*)window isFakingClose])
                 return;
@@ -1931,6 +2166,67 @@ static NSString* WineLocalizedString(unsigned int stringID)
                     name:(NSString*)kTISNotifyEnabledKeyboardInputSourcesChanged
                   object:nil];
 
+        /* Strategy E.1: cross-process CAMetalLayer hosting. DXMT in process A
+         * creates a CAMetalLayer + CAContext, broadcasts (hwnd, contextId, pid)
+         * via NSDistributedNotification. Each Wine process listens; the one
+         * owning the HWND inserts CALayerHost(contextId:) into its
+         * WineContentView's layer tree, causing WindowServer to composite
+         * process A's drawables INTO process B's NSWindow. */
+        /* Strategy E.1 observer can be disabled at runtime via the
+         * PROTON_DISABLE_E1 env var. Modern Steam (steam.exe + steamwebhelper)
+         * crashes early in CEF init when E.1 is enabled - likely a
+         * winemac.drv regression vs upstream/CrossOver Wine. Setting
+         * PROTON_DISABLE_E1=1 makes winemac.drv behave like upstream
+         * (no cross-process layer-host notifications), at the cost of
+         * losing E.1's DX12-cross-process layer hosting for game prefixes
+         * that depend on it (Elden Ring, Witcher 3 DX12 path). Game
+         * prefixes leave PROTON_DISABLE_E1 unset; only the Steam-in-bottle
+         * launch turns it on. */
+        /* Bug (Proton macOS) 2026-04-29: scope PROTON_DISABLE_E1 to the
+         * processes that actually need it. CreateProcess inheritance
+         * propagates Steam's env to every game it launches, breaking DXMT
+         * (Hades's DXMTRemoteLayerHostRequest gets no host) for games
+         * launched via `steam.exe -applaunch`. Honor PROTON_DISABLE_E1
+         * only for steam.exe / steamwebhelper.exe / cef.win64
+         * subprocesses; ignore it for everything else. */
+        BOOL disable_e1 = NO;
+        if (getenv("PROTON_DISABLE_E1"))
+        {
+            NSArray *argv = [[NSProcessInfo processInfo] arguments];
+            for (NSString *arg in argv)
+            {
+                NSString *lower = [arg lowercaseString];
+                if ([lower hasSuffix:@"\\steam.exe"] ||
+                    [lower hasSuffix:@"/steam.exe"] ||
+                    [lower hasSuffix:@"\\steamwebhelper.exe"] ||
+                    [lower hasSuffix:@"/steamwebhelper.exe"] ||
+                    [lower hasSuffix:@"\\gldriverquery.exe"] ||
+                    [lower hasSuffix:@"/gldriverquery.exe"] ||
+                    [lower hasSuffix:@"\\gldriverquery64.exe"] ||
+                    [lower hasSuffix:@"/gldriverquery64.exe"])
+                {
+                    disable_e1 = YES;
+                    break;
+                }
+            }
+            if (!disable_e1)
+                fprintf(stderr, "winemac:E.1 - pid=%d ignoring PROTON_DISABLE_E1 (process is not steam-related)\n",
+                        getpid());
+        }
+        if (!disable_e1)
+        {
+            [dnc addObserver:self
+                    selector:@selector(handleDXMTRemoteLayerHostRequest:)
+                        name:@"DXMTRemoteLayerHostRequest"
+                      object:nil
+          suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+            fprintf(stderr, "winemac:E.1 - pid=%d registered observer for DXMTRemoteLayerHostRequest\n", getpid());
+        }
+        else
+        {
+            fprintf(stderr, "winemac:E.1 - pid=%d skipped observer (PROTON_DISABLE_E1=1)\n", getpid());
+        }
+
         if ([NSApplication instancesRespondToSelector:@selector(yieldActivationToApplication:)])
         {
             /* App activation cooperation, starting in macOS 14 Sonoma. */
@@ -1940,6 +2236,173 @@ static NSString* WineLocalizedString(unsigned int stringID)
                       object:nil
           suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
         }
+    }
+
+    /* Strategy E.1 handler - see setupObservations for design notes. */
+    - (void) handleDXMTRemoteLayerHostRequest:(NSNotification *)note
+    {
+        extern void *macdrv_resolve_hwnd_for_hosting(void *hwnd, void **out_hwnd, int *out_is_window);
+
+        NSDictionary *info = [note userInfo];
+        void *hwnd = (void *)(uintptr_t)[(NSNumber *)info[@"hwnd"] unsignedLongLongValue];
+        uint32_t contextId = [(NSNumber *)info[@"contextId"] unsignedIntValue];
+        int senderPid = [(NSNumber *)info[@"pid"] intValue];
+
+        fprintf(stderr, "winemac:E.1 - pid=%d received DXMTRemoteLayerHostRequest hwnd=%p ctxId=%u senderPid=%d\n",
+                getpid(), hwnd, contextId, senderPid);
+        (void)senderPid; /* same-process is fine: game and DXMT live together */
+
+        void *outHwnd = NULL;
+        int isWindow = 0;
+        void *target = macdrv_resolve_hwnd_for_hosting(hwnd, &outHwnd, &isWindow);
+        fprintf(stderr, "winemac:E.1 - pid=%d resolver returned hwnd=%p target=%p isWindow=%d\n",
+                getpid(), outHwnd, target, isWindow);
+        if (!target) return;
+
+        BOOL sameProcess = (senderPid == getpid());
+        uintptr_t layerPtrVal = [(NSNumber *)info[@"layerPtr"] unsignedLongLongValue];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSView *view;
+            if (isWindow) {
+                NSWindow *win = (__bridge NSWindow *)target;
+                view = [win contentView];
+                fprintf(stderr, "winemac:E.1 - using NSWindow=%p contentView=%p\n", (void *)win, (void *)view);
+            } else {
+                view = (__bridge NSView *)target;
+            }
+            if (!view) {
+                fprintf(stderr, "winemac:E.1 - no view available\n");
+                return;
+            }
+            [view setWantsLayer:YES];
+            CALayer *parentLayer = [view layer];
+            if (!parentLayer) {
+                fprintf(stderr, "winemac:E.1 - view=%p has no layer (after wantsLayer)\n", (void *)view);
+                return;
+            }
+
+            CALayer *child = nil;
+            if (sameProcess && layerPtrVal) {
+                /* Same process: attach the CAMetalLayer directly. CALayerHost
+                 * is only for cross-process hosting - using it in-process leaves
+                 * the layer empty. */
+                child = (__bridge CALayer *)(void *)layerPtrVal;
+                fprintf(stderr,
+                        "winemac:E.1 - same-process direct CAMetalLayer attach: layer=%p (current superlayer=%p, parent=%p, parent has %lu sublayers)\n",
+                        (void *)child, (void *)child.superlayer, (void *)parentLayer,
+                        (unsigned long)parentLayer.sublayers.count);
+            } else {
+                Class hostCls = NSClassFromString(@"CALayerHost");
+                if (!hostCls) {
+                    fprintf(stderr, "winemac:E.1 - CALayerHost class unavailable\n");
+                    return;
+                }
+                child = [[hostCls alloc] init];
+                [child setValue:@(contextId) forKey:@"contextId"];
+                fprintf(stderr, "winemac:E.1 - cross-process CALayerHost(ctx=%u)\n", contextId);
+            }
+            /* Bug (Proton macOS) 2026-04-29: parentLayer.bounds is often
+             * 0×0 at attach time because the view's backing layer hasn't
+             * been laid out yet (NSView's `bounds` is set by the window
+             * resize machinery before the layer's `bounds` is updated).
+             * Use the view's bounds instead - they're populated by the
+             * time we get here (window opened → contentView resized →
+             * E.1 broadcast fires → we attach). Without this, MoltenVK
+             * renders 1512×982 swapchain images into a CAMetalLayer with
+             * frame=0×0, the layer occupies zero visible area on the
+             * parent view, and the user sees the parent NSWindow's
+             * white background instead of the rendered content. */
+            CGRect attachFrame = parentLayer.bounds;
+            if (attachFrame.size.width < 1 || attachFrame.size.height < 1)
+            {
+                NSRect viewBounds = view.bounds;
+                attachFrame = NSRectToCGRect(viewBounds);
+                fprintf(stderr, "winemac:E.1 - parentLayer.bounds was %gx%g, falling back to view.bounds=%gx%g\n",
+                        parentLayer.bounds.size.width, parentLayer.bounds.size.height,
+                        attachFrame.size.width, attachFrame.size.height);
+            }
+            /* Bug (Proton macOS) 2026-04-30: after Cmd-Tab away/back from a
+             * fullscreen Vulkan game (DOOM), Cocoa's fullscreen-exit/re-enter
+             * transition leaves view.bounds AND parentLayer.bounds both at
+             * 0×0 mid-transition. We end up attaching CAMetalLayers sized 0×0
+             * to a window that returns to fullscreen seconds later - the
+             * layers never resize, the user sees a white window. Fall back to
+             * the window's frame size, then to the screen size, so the
+             * autoresizingMask has something non-zero to scale from. */
+            if (attachFrame.size.width < 1 || attachFrame.size.height < 1)
+            {
+                CGSize fallback = CGSizeZero;
+                if (view.window) {
+                    NSRect winFrame = [view.window frame];
+                    fallback = winFrame.size;
+                }
+                if (fallback.width < 1 || fallback.height < 1) {
+                    NSScreen *screen = view.window.screen ?: [NSScreen mainScreen];
+                    if (screen) fallback = screen.frame.size;
+                }
+                if (fallback.width >= 1 && fallback.height >= 1) {
+                    attachFrame = (CGRect){{0, 0}, fallback};
+                    fprintf(stderr, "winemac:E.1 - view.bounds also 0x0, using window/screen fallback %gx%g\n",
+                            fallback.width, fallback.height);
+                }
+            }
+            child.frame = attachFrame;
+            child.contentsScale = parentLayer.contentsScale ?: 1.0;
+            child.zPosition = 1000.0; /* Force on top of any sibling layers */
+            /* Auto-resize with parent (window resize / fullscreen toggle) and
+             * stretch contents to fill - avoids gaps on right/bottom when the
+             * drawable's logical size is smaller than the contentView's
+             * point-bounds (typical at fullscreen on Retina). */
+            child.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+            child.contentsGravity = kCAGravityResize;
+
+            /* Remove any prior CALayerHost / CAMetalLayer we already attached
+             * for this view (from earlier broadcast retries). */
+            NSArray *existing = [parentLayer.sublayers copy];
+            for (CALayer *sib in existing) {
+                if ([sib isKindOfClass:NSClassFromString(@"CAMetalLayer")] ||
+                    [sib isKindOfClass:NSClassFromString(@"CALayerHost")]) {
+                    if (sib != child) [sib removeFromSuperlayer];
+                }
+            }
+            if (child.superlayer != parentLayer) [parentLayer addSublayer:child];
+
+            /* Bug (Proton macOS) 2026-04-30: macdrv_client_surface_present
+             * hides the old client_view when it swaps in the surface's
+             * cocoa_view - but on the first surface for a window the old
+             * client_view IS the cocoa_window's contentView. Hiding that
+             * makes the entire subtree (including our newly-attached
+             * CAMetalLayer) invisible: the user sees the NSWindow's white
+             * background. Force the view chain visible up to the window. */
+            {
+                NSView *vv = view;
+                int unhid = 0;
+                while (vv) {
+                    if ([vv isHidden]) {
+                        [vv setHidden:NO];
+                        unhid++;
+                    }
+                    vv = [vv superview];
+                }
+                if (unhid)
+                    fprintf(stderr, "winemac:E.1 - un-hid %d ancestor view(s) for view=%p\n",
+                            unhid, (void *)view);
+            }
+
+            /* The retry-arm we tried earlier (re-broadcasting until
+             * windowVisible=1) was wrong: each broadcast spawns a new
+             * CAMetalLayer-CAContext instance, leaving 8 dead surfaces queued
+             * by retry exhaustion time. The screen-size fallback above
+             * provides a non-zero attach frame even mid-transition; the
+             * autoresizingMask handles the resize when the window settles. */
+
+            fprintf(stderr, "winemac:E.1 - hosted child=%p onto view=%p layer=%p (frame=%gx%g, scale=%g, %lu sublayers) sameProc=%d viewHidden=%d windowVisible=%d\n",
+                    (void *)child, (void *)view, (void *)parentLayer,
+                    parentLayer.bounds.size.width, parentLayer.bounds.size.height,
+                    parentLayer.contentsScale, (unsigned long)parentLayer.sublayers.count, sameProcess,
+                    [view isHidden], [view.window isVisible]);
+        });
     }
 
     - (void) otherWineAppWillActivate:(NSNotification *)note
@@ -2240,12 +2703,18 @@ static NSString* WineLocalizedString(unsigned int stringID)
         NSApplicationTerminateReply ret = NSTerminateNow;
         NSAppleEventManager* m = [NSAppleEventManager sharedAppleEventManager];
         NSAppleEventDescriptor* desc = [m currentAppleEvent];
+        int32_t quitReason = [[desc attributeDescriptorForKeyword:kAEQuitReason] int32Value];
         macdrv_event* event;
         WineEventQueue* queue;
 
+        /* Defensive: in case FPS-mode disassociation is still active when
+         * the user invokes Dock-Quit / Cmd-Q, re-couple the mouse + cursor
+         * before we let Cocoa run its teardown. */
+        macdrv_restore_mouse_association();
+
         event = macdrv_create_event(APP_QUIT_REQUESTED, nil);
         event->deliver = 1;
-        switch ([[desc attributeDescriptorForKeyword:kAEQuitReason] int32Value])
+        switch (quitReason)
         {
             case kAELogOut:
             case kAEReallyLogOut:
@@ -2274,6 +2743,41 @@ static NSString* WineLocalizedString(unsigned int stringID)
         [eventQueuesLock unlock];
 
         macdrv_release_event(event);
+
+        /* Bug (Proton macOS) 2026-04-29: macOS's Dock unresponsive-app
+         * heuristic sends an unsolicited kAEQuitApplication when a
+         * Wine bottle running a busy game momentarily stops draining
+         * NSEvents. Returning NSTerminateLater puts the Cocoa main
+         * thread in a nested `_shouldTerminate` event loop waiting
+         * for `replyToApplicationShouldTerminate:` - but that reply
+         * only fires after every Wine window pumps WM_QUERYENDSESSION.
+         * If any window's owner thread is mid-stall (e.g. on
+         * user_lock contention), the reply never comes and the Cocoa
+         * main thread is permanently stuck - self-fueling because
+         * the stuck main thread reinforces the Dock's unresponsive
+         * verdict. See lldb bt at
+         * docs/macos/experiments/sample-hades-lldb-bts-2026-04-29.txt.
+         *
+         * For the only AppleEvent quit reason that's truly load-
+         * bearing (a logout / restart / shutdown - system is going
+         * away) we still want to honor the request, so keep the
+         * existing NSTerminateLater path. For QUIT_REASON_NONE
+         * (typically Cmd-Q / Dock-Quit / Dock-unresponsive-timeout),
+         * downgrade to NSTerminateCancel: post the event so any
+         * Wine app that wants to react can, but don't make Cocoa
+         * wait for our reply. The user can still close the bottle
+         * via the launcher's TERM/INT (kill-bottle-procs.sh). */
+        if (ret == NSTerminateLater
+            && quitReason != kAELogOut
+            && quitReason != kAEReallyLogOut
+            && quitReason != kAEShowRestartDialog
+            && quitReason != kAEShowShutdownDialog)
+        {
+            fprintf(stderr,
+                    "winemac: ignoring unsolicited kAEQuit (reason=%d) - returning NSTerminateCancel\n",
+                    (int)quitReason);
+            ret = NSTerminateCancel;
+        }
 
         return ret;
     }

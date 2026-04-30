@@ -981,7 +981,11 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = _device;
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = YES;
+        layer.presentsWithTransaction = NO;
+        if ([layer respondsToSelector:@selector(setAllowsNextDrawableTimeout:)])
+            layer.allowsNextDrawableTimeout = YES;
         layer.magnificationFilter = kCAFilterNearest;
         layer.backgroundColor = CGColorGetConstantColor(kCGColorBlack);
         layer.contentsScale = retina_on ? 2.0 : 1.0;
@@ -994,6 +998,39 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     }
 
 @end
+
+__attribute__((visibility("default")))
+void *macdrv_save_metal_layer_delegate(void *layer_ptr)
+{
+    @autoreleasepool {
+        /* Mac-port-26.2: clear the layer's delegate so MoltenVK's
+         * MVKSurface::initLayer takes the early-return path and skips its
+         * KVO `addObserver:forKeyPath:@"layer"` registration on the
+         * delegate. macOS 26's Foundation otherwise throws an Obj-C
+         * exception that unwinds through Wine's unix-call boundary as a
+         * non-zero NTSTATUS.
+         *
+         * We deliberately do NOT save+restore the delegate. The original
+         * delegate is the WineMetalView itself (auto-installed via
+         * `wantsLayer = YES`), and Wine's render path doesn't read it back
+         * after vkCreateMetalSurfaceEXT - so leaving it nil is harmless.
+         * The earlier save+restore implementation had a use-after-free
+         * race: between save and restore the delegate could be released by
+         * the AppKit teardown path, and re-retaining a dangling pointer
+         * crashed in objc_retain. Skipping restore eliminates the race. */
+        CAMetalLayer *layer = (CAMetalLayer *)layer_ptr;
+        layer.delegate = nil;
+        return NULL;
+    }
+}
+
+__attribute__((visibility("default")))
+void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
+{
+    /* Intentionally empty. See macdrv_save_metal_layer_delegate. */
+    (void)layer_ptr;
+    (void)saved;
+}
 
 
 @implementation WineWindow
@@ -3718,6 +3755,30 @@ void macdrv_set_window_min_max_sizes(macdrv_window w, CGSize min_size, CGSize ma
 }
 
 /***********************************************************************
+ *              macdrv_window_get_content_view
+ *
+ * Bug (Proton macOS): return the cocoa_window's content view as a
+ * macdrv_view handle. Used by `create_cocoa_window` in window.c to
+ * populate `data->client_view` so DXMT (which dlsym's `get_win_data`
+ * and reads the view slot) can attach its CAMetalLayer directly into
+ * the window's content view tree. Without this, DXMT's
+ * `_CreateMetalViewFromHWND` fallback path engages, creating a
+ * separate auxiliary NSWindow that's invisible behind the game's
+ * actual fullscreen window - visible result: black-screen rendering
+ * for HWNDs that go through Metal/DXMT and never had a separate
+ * client_view created via the legacy software-surface path.
+ */
+macdrv_view macdrv_window_get_content_view(macdrv_window w)
+{
+    if (!w) return NULL;
+    __block id view = nil;
+    OnMainThread(^{
+        view = [(WineWindow *)w contentView];
+    });
+    return (macdrv_view)view;
+}
+
+/***********************************************************************
  *              macdrv_create_view
  *
  * Creates and returns a view with the specified frame rect.  The
@@ -3922,6 +3983,10 @@ void macdrv_remove_view_opengl_context(macdrv_view v, macdrv_opengl_context c)
 }
 }
 
+/* DXMT/winemetal expects these as runtime-resolvable via dlsym(RTLD_DEFAULT).
+ * winemac.so is built with -fvisibility=hidden, so we have to opt these
+ * specific exports back in. See docs/macos/experiments/dxmt-wine-patches.md */
+__attribute__((visibility("default")))
 macdrv_metal_device macdrv_create_metal_device(void)
 {
 @autoreleasepool
@@ -3930,6 +3995,7 @@ macdrv_metal_device macdrv_create_metal_device(void)
 }
 }
 
+__attribute__((visibility("default")))
 void macdrv_release_metal_device(macdrv_metal_device d)
 {
 @autoreleasepool
@@ -3938,19 +4004,32 @@ void macdrv_release_metal_device(macdrv_metal_device d)
 }
 }
 
+__attribute__((visibility("default")))
 macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d)
 {
     id<MTLDevice> device = (id<MTLDevice>)d;
     WineContentView* view = (WineContentView*)v;
     __block WineMetalView *metalView;
 
+    /* DXMT-Mac debug: log the inputs so we can diagnose null-view / null-device
+     * issues in CreateMetalViewFromHWND. fprintf to stderr because TRACE/ERR
+     * routing through Wine's debug channels may be filtered when DXMT calls. */
+    fprintf(stderr, "winemac:macdrv_view_create_metal_view called: v=%p d=%p (view as WineContentView=%p, isWineContentView=%s, device class=%s)\n",
+            v, d, view,
+            view ? ([view isKindOfClass:[WineContentView class]] ? "YES" : "NO") : "(null)",
+            device ? object_getClassName(device) : "(null)");
+
     OnMainThread(^{
         metalView = [view newMetalViewWithDevice:device];
     });
 
+    fprintf(stderr, "winemac:macdrv_view_create_metal_view returning: metalView=%p (class=%s)\n",
+            metalView, metalView ? object_getClassName(metalView) : "(null)");
+
     return (macdrv_metal_view)metalView;
 }
 
+__attribute__((visibility("default")))
 macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v)
 {
     WineMetalView* view = (WineMetalView*)v;
@@ -3963,6 +4042,7 @@ macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v)
     return (macdrv_metal_layer)layer;
 }
 
+__attribute__((visibility("default")))
 void macdrv_view_release_metal_view(macdrv_metal_view v)
 {
     WineMetalView* view = (WineMetalView*)v;
