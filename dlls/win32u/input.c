@@ -2048,6 +2048,14 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
     old_thread = previous ? get_window_thread( previous, NULL ) : 0;
     new_thread = hwnd ? get_window_thread( hwnd, NULL ) : 0;
 
+    /* Bug (Proton macOS): cross-thread WM_ACTIVATEAPP broadcasts must be
+     * async, otherwise concurrent focus-change events on two threads (or
+     * processes) mutually block each other in send_message and the OS
+     * shows a spinning beach ball. Real Windows posts cross-process
+     * WM_ACTIVATEAPP asynchronously; match that. The intra-thread
+     * WM_NCACTIVATE / WM_ACTIVATE sends below stay sync because they
+     * target this thread's own hwnd and apps may veto WM_NCACTIVATE
+     * via the wndproc return value. */
     if (old_thread != new_thread)
     {
         HWND *list, *phwnd;
@@ -2060,7 +2068,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == old_thread)
-                        send_message( *phwnd, WM_ACTIVATEAPP, 0, new_active_thread_id );
+                        send_notify_message( *phwnd, WM_ACTIVATEAPP, 0, new_active_thread_id, FALSE );
                 }
             }
             if (new_thread)
@@ -2068,7 +2076,7 @@ BOOL set_active_window( HWND hwnd, HWND *prev, BOOL mouse, BOOL focus, DWORD new
                 for (phwnd = list; *phwnd; phwnd++)
                 {
                     if (get_window_thread( *phwnd, NULL ) == new_thread)
-                        send_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread );
+                        send_notify_message( *phwnd, WM_ACTIVATEAPP, 1, old_thread, FALSE );
                 }
             }
             free( list );
