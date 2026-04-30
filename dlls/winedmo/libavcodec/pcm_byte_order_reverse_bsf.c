@@ -26,6 +26,19 @@
 
 #ifdef HAVE_FFMPEG
 
+#if defined(__APPLE__)
+/* On macOS this file expects Proton's bundled ffmpeg fork. System/homebrew
+ * ffmpeg is newer and has moved AVBitStreamFilter.{filter,init} and
+ * AVCodecParameters.channels. Stub the filter with the minimum init so the
+ * symbol links; filter is effectively disabled and unix_demuxer.c's
+ * registration is a no-op. Reinstate full body when Proton's ffmpeg
+ * submodule is built and linked. */
+const AVBitStreamFilter ff_pcm_byte_order_reverse_bsf = {
+    .name = "pcm_byte_order_reverse",
+};
+
+#else /* !__APPLE__ - original Linux body below */
+
 #define IS_EMPTY(pkt) (!(pkt)->data && !(pkt)->side_data_elems)
 
 struct AVBSFInternal {
@@ -153,5 +166,7 @@ const AVBitStreamFilter ff_pcm_byte_order_reverse_bsf = {
     .init           = init,
     .codec_ids      = codec_ids,
 };
+
+#endif /* !__APPLE__ */
 
 #endif /* HAVE_FFMPEG */
