@@ -57,6 +57,44 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(fsync);
 
+#if !defined(__linux__)
+/* fsync is a futex-based synchronization path that requires Linux's
+ * __NR_futex/__NR_futex_waitv syscalls and shared-memory conventions.
+ * On non-Linux hosts (macOS arm64), stub the public API so the wineserver
+ * falls back to its own sync primitives. Eventual Mac equivalent should
+ * use os_sync_wait_on_address (macOS 14.4+) or Mach semaphores. */
+
+int fsync_enabled;
+
+NTSTATUS fsync_create_semaphore( HANDLE *handle, ACCESS_MASK access,
+        const OBJECT_ATTRIBUTES *attr, LONG initial, LONG max ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_open_semaphore( HANDLE *handle, ACCESS_MASK access,
+        const OBJECT_ATTRIBUTES *attr ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_release_semaphore( HANDLE handle, ULONG count, ULONG *prev ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_query_semaphore( HANDLE handle, void *info ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_create_event( HANDLE *handle, ACCESS_MASK access,
+        const OBJECT_ATTRIBUTES *attr, EVENT_TYPE event_type, BOOLEAN initial ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_open_event( HANDLE *handle, ACCESS_MASK access,
+        const OBJECT_ATTRIBUTES *attr ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_set_event( HANDLE handle, LONG *prev ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_reset_event( HANDLE handle, LONG *prev ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_pulse_event( HANDLE handle, LONG *prev ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_query_event( HANDLE handle, void *info ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_create_mutex( HANDLE *handle, ACCESS_MASK access,
+        const OBJECT_ATTRIBUTES *attr, BOOLEAN initial ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_open_mutex( HANDLE *handle, ACCESS_MASK access,
+        const OBJECT_ATTRIBUTES *attr ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_release_mutex( HANDLE handle, LONG *prev ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_query_mutex( HANDLE handle, void *info ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_close( HANDLE handle ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_wait_objects( DWORD count, const HANDLE *handles,
+        BOOLEAN wait_any, BOOLEAN alertable, const LARGE_INTEGER *timeout ) { return STATUS_NOT_IMPLEMENTED; }
+NTSTATUS fsync_signal_and_wait( HANDLE signal, HANDLE wait, BOOLEAN alertable,
+        const LARGE_INTEGER *timeout ) { return STATUS_NOT_IMPLEMENTED; }
+void fsync_init( DWORD pid ) { fsync_enabled = 0; }
+
+#else /* __linux__ */
+
 #include "pshpack4.h"
 #include "poppack.h"
 
@@ -1236,3 +1274,5 @@ NTSTATUS fsync_signal_and_wait( HANDLE signal, HANDLE wait, BOOLEAN alertable,
 
     return fsync_wait_objects( 1, &wait, TRUE, alertable, timeout );
 }
+
+#endif /* __linux__ */
