@@ -26,6 +26,7 @@
 
 #include <pthread.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -306,6 +307,105 @@ static pthread_mutex_t display_dc_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t user_mutex;
 static unsigned int user_lock_thread, user_lock_rec;
 
+/* Bug (Proton macOS) 2026-04-29: pthread mutexes don't auto-release on
+ * thread death; if a thread dies (SIGABRT, async signal, host-side kill)
+ * while holding user_lock, every subsequent acquirer permanently
+ * deadlocks. macOS pthread doesn't implement PTHREAD_MUTEX_ROBUST.
+ *
+ * Workaround layer 1: per-thread TSD (thread-specific data) that records
+ * "I hold user_lock at depth N". On thread death, the TSD destructor
+ * fires; if the TSD value is non-zero, this thread leaked the lock -
+ * recover by calling pthread_mutex_unlock() N times. Wine's recursive
+ * mutex semantics require unlock-once-per-acquire to fully release.
+ *
+ * Workaround layer 2: a watchdog thread that fires every 2 s and
+ * checks whether the lock-holder TID is making progress (via a
+ * monotonic acquire-counter incremented on every successful lock).
+ * If the holder hasn't moved in N seconds AND is still recorded as
+ * holder, force-unlock. Catches the case where the holder isn't dead
+ * (so TSD destructor doesn't fire) but is wedged inside a long
+ * external wait (Cocoa main-thread block, getaddrinfo, wineserver
+ * round-trip stuck in a peer process, etc.) while holding user_lock. */
+static pthread_key_t user_lock_owner_key;
+static pthread_once_t user_lock_owner_init_once = PTHREAD_ONCE_INIT;
+static unsigned long long user_lock_acquire_counter; /* monotonically incremented on each user_lock acquire */
+
+static void user_lock_owner_destructor( void *value )
+{
+    unsigned int rec = (unsigned int)(uintptr_t)value;
+    if (!rec) return;
+    if (user_lock_thread != GetCurrentThreadId()) return;
+    ERR("user_lock leaked by dying tid=%04x rec=%u - recovering by unlock x%u\n",
+        user_lock_thread, user_lock_rec, rec);
+    user_lock_rec = 0;
+    user_lock_thread = 0;
+    while (rec--) pthread_mutex_unlock( &user_mutex );
+}
+
+#define USER_LOCK_WATCHDOG_STALL_SECS 5
+#define USER_LOCK_WATCHDOG_POLL_SECS  2
+
+static void *user_lock_watchdog_proc( void *arg )
+{
+    unsigned long long last_seen_counter = 0;
+    unsigned int last_seen_tid = 0;
+    unsigned int stuck_seconds = 0;
+
+    pthread_setname_np("wine-user_lock-watchdog");
+
+    for (;;)
+    {
+        sleep( USER_LOCK_WATCHDOG_POLL_SECS );
+
+        unsigned long long counter_now = user_lock_acquire_counter;
+        unsigned int holder_now = user_lock_thread;
+        unsigned int rec_now = user_lock_rec;
+
+        if (!rec_now || !holder_now)
+        {
+            stuck_seconds = 0;
+            last_seen_counter = counter_now;
+            last_seen_tid = holder_now;
+            continue;
+        }
+
+        if (counter_now != last_seen_counter || holder_now != last_seen_tid)
+        {
+            stuck_seconds = 0;
+            last_seen_counter = counter_now;
+            last_seen_tid = holder_now;
+            continue;
+        }
+
+        stuck_seconds += USER_LOCK_WATCHDOG_POLL_SECS;
+        if (stuck_seconds >= USER_LOCK_WATCHDOG_STALL_SECS)
+        {
+            ERR("user_lock watchdog: holder tid=%04x rec=%u stuck for %u s - force-unlocking\n",
+                holder_now, rec_now, stuck_seconds);
+            user_lock_rec = 0;
+            user_lock_thread = 0;
+            while (rec_now--) pthread_mutex_unlock( &user_mutex );
+            stuck_seconds = 0;
+        }
+    }
+
+    return NULL;
+}
+
+static void user_lock_owner_init( void )
+{
+    pthread_t watchdog;
+    pthread_attr_t attr;
+
+    pthread_key_create( &user_lock_owner_key, user_lock_owner_destructor );
+
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
+    if (pthread_create( &watchdog, &attr, user_lock_watchdog_proc, NULL ))
+        ERR("user_lock_owner_init: failed to spawn watchdog thread\n");
+    pthread_attr_destroy( &attr );
+}
+
 #define GAMMA_RAMP_SIZE 256
 
 static WORD gamma_ramp_i[GAMMA_RAMP_SIZE * 3];
@@ -369,12 +469,35 @@ static void init_default_gamma_ramp(void)
 
 void user_lock(void)
 {
-    pthread_mutex_lock( &user_mutex );
+    pthread_once( &user_lock_owner_init_once, user_lock_owner_init );
+
+    /* Bug (Proton macOS) 2026-04-29 diagnostic: log the current holder
+     * TID on contention so we can find the leaker / long-holder. The
+     * trylock fast-path makes the no-contention case zero-overhead. */
+    if (pthread_mutex_trylock( &user_mutex ))
+    {
+        unsigned int holder = user_lock_thread;
+        unsigned int rec = user_lock_rec;
+        ERR("user_lock contention: holder tid=%04x rec=%u, my tid=%04x\n",
+            holder, rec, GetCurrentThreadId());
+        pthread_mutex_lock( &user_mutex );
+        ERR("user_lock acquired after wait: my tid=%04x (was waiting for holder=%04x)\n",
+            GetCurrentThreadId(), holder);
+    }
     if (!user_lock_rec++) user_lock_thread = GetCurrentThreadId();
+    user_lock_acquire_counter++; /* watchdog progress signal */
+
+    /* Track our acquire depth via TSD so the destructor can recover on
+     * thread death - see user_lock_owner_destructor. */
+    pthread_setspecific( user_lock_owner_key,
+                         (void *)(uintptr_t)(((unsigned int)(uintptr_t)pthread_getspecific( user_lock_owner_key )) + 1) );
 }
 
 void user_unlock(void)
 {
+    unsigned int depth = (unsigned int)(uintptr_t)pthread_getspecific( user_lock_owner_key );
+    if (depth) pthread_setspecific( user_lock_owner_key, (void *)(uintptr_t)(depth - 1) );
+
     if (!--user_lock_rec) user_lock_thread = 0;
     pthread_mutex_unlock( &user_mutex );
 }
