@@ -4057,9 +4057,47 @@ static void vulkan_init_once(void)
 
 #ifdef SONAME_LIBVULKAN
     vulkan_handle = dlopen( SONAME_LIBVULKAN, RTLD_NOW );
-    if (!vulkan_handle) ERR( "Failed to load %s\n", SONAME_LIBVULKAN );
-#else
+#endif
+#ifdef __APPLE__
+    /* On macOS our configure step does NOT define SONAME_LIBVULKAN - there is
+     * no system libvulkan to link against; the canonical Vulkan ICD is
+     * MoltenVK loaded directly. Try the staged dylib regardless of whether
+     * SONAME_LIBVULKAN is defined.
+     *
+     * Rosetta 2 also strips DYLD_LIBRARY_PATH/FALLBACK from x86_64-translated
+     * processes, so even when SONAME_LIBVULKAN IS defined a bare filename
+     * often fails to resolve. The same fallbacks (WINE_MOLTENVK_PATH env,
+     * $HOME/lib, /usr/local/lib) cover both cases.
+     *
+     * Without this, Chromium/CEF (in steamwebhelper) - which probes Vulkan
+     * for ANGLE - sees no Vulkan loader and ANGLE rejects with "minimum
+     * Vulkan instance version 1.1 required", killing the GPU process and
+     * leaving the Sign-In window painting as a black square. */
+    if (!vulkan_handle) {
+        const char *custom = getenv("WINE_MOLTENVK_PATH");
+        if (custom) vulkan_handle = dlopen(custom, RTLD_NOW);
+    }
+    if (!vulkan_handle) {
+        const char *home = getenv("HOME");
+        if (home) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/lib/libMoltenVK.dylib", home);
+            vulkan_handle = dlopen(path, RTLD_NOW);
+        }
+    }
+    if (!vulkan_handle)
+        vulkan_handle = dlopen("/usr/local/lib/libMoltenVK.dylib", RTLD_NOW);
+#endif
+#if !defined(SONAME_LIBVULKAN) && !defined(__APPLE__)
     ERR( "Wine was built without Vulkan support.\n" );
+#else
+    if (!vulkan_handle) ERR( "Failed to load Vulkan library (MoltenVK on macOS, %s elsewhere)\n",
+#ifdef SONAME_LIBVULKAN
+                              SONAME_LIBVULKAN
+#else
+                              "libvulkan"
+#endif
+                            );
 #endif
     if (!vulkan_handle) return;
 
