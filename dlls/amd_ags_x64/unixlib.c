@@ -31,9 +31,11 @@
 #include <fcntl.h>
 #include <errno.h>
 
+#if defined(__linux__)
 #include <xf86drm.h>
 #include <amdgpu_drm.h>
 #include <amdgpu.h>
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -53,6 +55,11 @@ static struct drm_amdgpu_info_device *amd_info;
 
 static NTSTATUS init( void *args )
 {
+#if !defined(__linux__)
+    /* AMD GPU Services via amdgpu DRM is Linux-only. No AMD discrete GPUs on
+     * Apple Silicon anyway; no GPU on non-Linux hosts satisfies this. */
+    return STATUS_UNSUCCESSFUL;
+#else
     drmDevicePtr devices[MAX_DEVICE_COUNT];
     amdgpu_device_handle h;
     uint32_t major, minor;
@@ -105,8 +112,17 @@ static NTSTATUS init( void *args )
     }
     drmFreeDevices(devices, count);
     return STATUS_SUCCESS;
+#endif /* __linux__ */
 }
 
+#if !defined(__linux__)
+/* Everything past here depends on amdgpu/DRM types. Stub get_device_info so
+ * the unix-call export table still links; init() above already early-returns. */
+static NTSTATUS get_device_info( void *args )
+{
+    return STATUS_NOT_FOUND;
+}
+#else /* __linux__ */
 #ifndef AMDGPU_VRAM_TYPE_DDR5
 #   define AMDGPU_VRAM_TYPE_DDR5  10
 #endif
@@ -275,6 +291,7 @@ static NTSTATUS get_device_info( void *args )
     TRACE("Device %04x not found.\n", params->device_id);
     return STATUS_NOT_FOUND;
 }
+#endif /* __linux__ */
 
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
