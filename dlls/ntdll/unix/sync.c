@@ -61,7 +61,9 @@
 # include <sys/event.h>
 #endif
 
+#ifdef __linux__
 # include "ntsync_tmp.h"
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -78,6 +80,35 @@ WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
 HANDLE keyed_event = 0;
 int inproc_device_fd = -1;
+
+/* Bug (Proton macOS) 2026-04-30: Skyrim SE on the bottle path stalls
+ * post-Start-Game with main thread sleep-polling and 0 NtSetEvent calls
+ * matching ~30 NtWaitFor* waits per 10s. We need to find which handle is
+ * orphan (waited-on but never signaled). This tracer logs every call to
+ * the wait + signal primitives so we can diff handle counts at the stall.
+ *
+ * Gated on PROTON_WAIT_TRACE=1 so it costs nothing for normal play. The
+ * fprintf(stderr) routes through the launcher's log redirect; format is
+ * grep-friendly: `wait-trace <op> tid=<tid> handle=<hex> [extra]`.
+ */
+#include <stdatomic.h>
+#include <unistd.h>
+static int wait_trace_enabled = -1;
+static inline int wait_trace_on(void)
+{
+    int v = atomic_load_explicit((_Atomic int *)&wait_trace_enabled, memory_order_relaxed);
+    if (v == -1)
+    {
+        const char *e = getenv("PROTON_WAIT_TRACE");
+        v = (e && *e == '1') ? 1 : 0;
+        atomic_store_explicit((_Atomic int *)&wait_trace_enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+#define WAIT_TRACE(fmt, ...) do { \
+    if (wait_trace_on()) \
+        fprintf(stderr, "wait-trace " fmt "\n", ##__VA_ARGS__); \
+} while (0)
 
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
 {
@@ -1128,6 +1159,8 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
 
     TRACE( "access %#x, name %s, type %u, state %u\n", access,
            attr ? debugstr_us(attr->ObjectName) : "(null)", type, state );
+    WAIT_TRACE("CreateEvent name=%s type=%u state=%u",
+               attr && attr->ObjectName ? "n" : "anon", type, state);
 
     *handle = 0;
     if (type != NotificationEvent && type != SynchronizationEvent) return STATUS_INVALID_PARAMETER;
@@ -1144,6 +1177,8 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
     }
     SERVER_END_REQ;
 
+    WAIT_TRACE("CreateEvent.RET handle=%p type=%u state=%u status=%#x",
+               *handle, type, state, ret);
     free( objattr );
     return ret;
 }
@@ -1179,11 +1214,17 @@ NTSTATUS WINAPI NtOpenEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_AT
 /******************************************************************************
  *              NtSetEvent (NTDLL.@)
  */
+static __attribute__((unused)) void wait_trace_signal(const char *op, HANDLE handle)
+{
+    WAIT_TRACE("%s handle=%p", op, handle);
+}
+
 NTSTATUS WINAPI NtSetEvent( HANDLE handle, LONG *prev_state )
 {
     unsigned int ret;
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+    WAIT_TRACE("SetEvent handle=%p", handle);
 
     if ((ret = inproc_set_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -1217,6 +1258,7 @@ NTSTATUS WINAPI NtResetEvent( HANDLE handle, LONG *prev_state )
     unsigned int ret;
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+    WAIT_TRACE("ResetEvent handle=%p", handle);
 
     if ((ret = inproc_reset_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -1251,6 +1293,7 @@ NTSTATUS WINAPI NtPulseEvent( HANDLE handle, LONG *prev_state )
     unsigned int ret;
 
     TRACE( "handle %p, prev_state %p\n", handle, prev_state );
+    WAIT_TRACE("PulseEvent handle=%p", handle);
 
     if ((ret = inproc_pulse_event( handle, prev_state )) != STATUS_NOT_IMPLEMENTED)
         return ret;
@@ -2342,6 +2385,17 @@ NTSTATUS WINAPI NtWaitForMultipleObjects( DWORD count, const HANDLE *handles, WA
     if (!count || count > MAXIMUM_WAIT_OBJECTS) return STATUS_INVALID_PARAMETER_1;
     if (type != WaitAll && type != WaitAny) FIXME( "Unsupported wait type %u\n", type );
 
+    if (wait_trace_on())
+    {
+        char buf[256];
+        int n = 0;
+        for (i = 0; i < count && n < (int)sizeof(buf) - 16; i++)
+            n += snprintf(buf + n, sizeof(buf) - n, "%s%p", i ? "," : "", handles[i]);
+        WAIT_TRACE("WaitFMO type=%u alertable=%u count=%u handles=[%s] timeout=%s",
+                   type, alertable, count, buf,
+                   timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
+    }
+
     if (TRACE_ON(sync))
     {
         TRACE( "type %u, alertable %u, handles {%p", type, alertable, handles[0] );
@@ -2380,6 +2434,9 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
     unsigned int ret;
 
     TRACE( "handle %p, alertable %u, timeout %s\n", handle, alertable, debugstr_timeout(timeout) );
+    WAIT_TRACE("WaitFSO handle=%p alertable=%u timeout=%s",
+               handle, alertable,
+               timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
 
     if ((ret = inproc_wait( 1, &handle, WaitAny, alertable, timeout )) != STATUS_NOT_IMPLEMENTED)
     {
@@ -2402,6 +2459,7 @@ NTSTATUS WINAPI NtWaitForSingleObject( HANDLE handle, BOOLEAN alertable, const L
 NTSTATUS WINAPI NtSignalAndWaitForSingleObject( HANDLE signal, HANDLE wait,
                                                 BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
+    WAIT_TRACE("SignalAndWait signal=%p wait=%p", signal, wait);
     union select_op select_op;
     UINT flags = SELECT_INTERRUPTIBLE;
     NTSTATUS ret;
@@ -2807,12 +2865,19 @@ NTSTATUS WINAPI NtOpenIoCompletion( HANDLE *handle, ACCESS_MASK access, const OB
 /***********************************************************************
  *             NtSetIoCompletion (NTDLL.@)
  */
+/* trace defined here so the wait/set IOCP pair gets logged */
+static __attribute__((unused)) void wait_trace_iocp(const char *op, HANDLE handle)
+{
+    WAIT_TRACE("%s handle=%p", op, handle);
+}
+
 NTSTATUS WINAPI NtSetIoCompletion( HANDLE handle, ULONG_PTR key, ULONG_PTR value,
                                    NTSTATUS status, SIZE_T count )
 {
     unsigned int ret;
 
     TRACE( "(%p, %lx, %lx, %x, %lx)\n", handle, key, value, status, count );
+    WAIT_TRACE("SetIOC handle=%p", handle);
 
     SERVER_START_REQ( add_completion )
     {
@@ -2867,6 +2932,8 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
     unsigned int status;
 
     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+    WAIT_TRACE("RemoveIOC handle=%p timeout=%s", handle,
+               timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
 
     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {
@@ -3574,14 +3641,25 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
     union tid_alert_entry *entry = get_tid_alert_entry( tid );
 
     TRACE( "%p\n", tid );
+    /* Bug (Proton macOS) 2026-04-30: Skyrim's Helgen-load stall is in
+     * the WaitOnAddress / AlertByThreadId path. Log every alert with
+     * caller_tid + target_tid + which path was taken. Diff against the
+     * NtWaitForAlertByThreadId trace to find unmatched waiters. */
+    WAIT_TRACE("AlertByTid caller=%lu target=%lu entry=%s",
+               (unsigned long)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+               (unsigned long)(uintptr_t)tid,
+               entry ? "ok" : "MISS");
 
     if (!entry) return STATUS_INVALID_CID;
 
 #ifdef USE_FUTEX
     {
         LONG *futex = &entry->futex;
-        if (!InterlockedExchange( futex, 1 ))
-            futex_wake_one( futex );
+        LONG prev = InterlockedExchange( futex, 1 );
+        int rc = 0;
+        if (!prev) rc = futex_wake_one( futex );
+        WAIT_TRACE("AlertByTid.futex target=%lu futex=%p prev=%ld wake_rc=%d errno=%d",
+                   (unsigned long)(uintptr_t)tid, futex, (long)prev, rc, rc < 0 ? errno : 0);
         return STATUS_SUCCESS;
     }
 #elif defined(HAVE_KQUEUE)
@@ -3596,7 +3674,9 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
             .udata = NULL
         };
 
-        kevent( entry->kq, &signal_event, 1, NULL, 0, NULL );
+        int rc = kevent( entry->kq, &signal_event, 1, NULL, 0, NULL );
+        WAIT_TRACE("AlertByTid.kqueue target=%lu kq=%d rc=%d errno=%d",
+                   (unsigned long)(uintptr_t)tid, entry->kq, rc, rc < 0 ? errno : 0);
         return STATUS_SUCCESS;
     }
 #else
@@ -3637,6 +3717,10 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
     BOOL waited = FALSE;
 
     TRACE( "%p %s\n", address, debugstr_timeout( timeout ) );
+    WAIT_TRACE("WaitForAlert tid=%lu addr=%p timeout=%s",
+               (unsigned long)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+               address,
+               timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
 
     if (!entry) return STATUS_INVALID_CID;
 
@@ -3667,6 +3751,10 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             }
             else
                 ret = futex_wait( futex, 0, NULL );
+
+            WAIT_TRACE("WaitForAlert.futex.RET tid=%lu futex=%p ret=%d errno=%d",
+                       (unsigned long)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+                       futex, ret, ret < 0 ? errno : 0);
 
             if (!timeout || timeout->QuadPart)
                 waited = TRUE;
@@ -3707,6 +3795,10 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
             ret = kevent( entry->kq, NULL, 0, &wait_event, 1, timeout ? &timespec : NULL );
         } while (ret == -1 && errno == EINTR);
+
+        WAIT_TRACE("WaitForAlert.kqueue.RET tid=%lu kq=%d ret=%d errno=%d",
+                   (unsigned long)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
+                   entry->kq, ret, ret < 0 ? errno : 0);
 
         switch (ret)
         {
