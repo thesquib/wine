@@ -45,6 +45,22 @@
 #include "request.h"
 #include "fsync.h"
 
+#if !defined(__linux__)
+/* Server-side fsync is futex-based + shared-memory. Stub on non-Linux so
+ * wineserver compiles; falls back to its own sync. See also
+ * dlls/ntdll/unix/fsync.c for the client-side stubs. */
+int do_fsync_cached = -1;
+int  fsync_check_support(void) { return 0; }
+void fsync_init(void) { }
+void fsync_free_shm_idx( int shm_idx ) { }
+void fsync_cleanup_process_shm_indices( process_id_t id ) { }
+int  fsync_grab_shm_idx( unsigned int shm_idx ) { return 0; }
+void fsync_set_event( unsigned int shm_idx ) { }
+void fsync_reset_event( unsigned int shm_idx ) { }
+void fsync_abandon_mutex( unsigned int shm_idx, thread_id_t tid ) { }
+DECL_HANDLER(fsync_free_shm_idx) { }
+#else
+
 #include "pshpack4.h"
 #include "poppack.h"
 
@@ -366,3 +382,4 @@ DECL_HANDLER(fsync_free_shm_idx)
     }
     fsync_free_shm_idx( req->shm_idx );
 }
+#endif /* __linux__ */
