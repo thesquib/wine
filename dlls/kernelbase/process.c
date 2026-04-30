@@ -625,6 +625,30 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
         {L"Red Tie Runner.exe", L" --use-angle=gl"},
         {L"UnrealCEFSubProcess.exe", L" --use-gl=swiftshader", "2316580"},
         {L"UnrealCEFSubProcess.exe", L" --use-angle=d3d9", "2684500"},
+        /* Bug #11 + #15 (Proton macOS): inject CEF flags for Steam's
+         * webhelper to keep all Chromium work in a single process.
+         *
+         *  - --in-process-gpu: Bug #11 cycle. The cross-process winemac
+         *    problem is that the gpu-process subprocess can't resolve
+         *    HWNDs owned by the browser process - every backend
+         *    (D3D11, ANGLE-Vulkan, SwiftShader) hits this somewhere
+         *    when binding a swapchain to a Chrome HWND. Run GPU work
+         *    in the browser process so HWND and GPU share an address
+         *    space and the cross-process lookup never happens.
+         *
+         *  - --single-process: Bug #15 cycle. Each fresh CEF
+         *    subprocess (renderer / network / utility) re-runs
+         *    Steam's platform_sockets init, and an init-order race
+         *    under our Wine's thread scheduling leaves
+         *    s_pWinsockInitData NULL when downstream code calls a
+         *    socket op - Steam asserts in
+         *    platform_sockets_win32.cpp:528, the subprocess dies,
+         *    and the browser process's UI thread blocks forever on
+         *    the IPC reply that never comes (user-visible beach
+         *    ball on click). --single-process collapses all
+         *    Chromium roles into the browser process, so Winsock
+         *    inits exactly once on a known-good thread. */
+        {L"steamwebhelper.exe", L" --in-process-gpu --single-process"},
     };
     unsigned int i;
     char sgi[64];
