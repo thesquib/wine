@@ -123,12 +123,16 @@ static NTSTATUS map_shared_session_block( SIZE_T offset, SIZE_T size, struct ses
 
     InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
     if ((status = NtOpenSection( &handle, SECTION_MAP_READ, &attr )))
-        WARN( "Failed to open shared session section, status %#x\n", status );
+        ERR( "Failed to open shared session section for offset %#lx, status %#x - "
+             "all class/window registrations past the first session block will fail.\n",
+             (unsigned long)offset, status );
     else
     {
         if ((status = NtMapViewOfSection( handle, GetCurrentProcess(), (void **)&block->data, 0, 0,
                                           &off, &block->size, ViewUnmap, 0, PAGE_READONLY )))
-            WARN( "Failed to map shared session block, status %#x\n", status );
+            ERR( "Failed to map shared session block: offset=%#lx aligned_off=%#llx "
+                 "status=%#x - class/window registrations in this block will fail.\n",
+                 (unsigned long)offset, (unsigned long long)off.QuadPart, status );
         else
         {
             list_add_tail( &session_blocks, &block->entry );
