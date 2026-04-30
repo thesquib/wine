@@ -780,6 +780,16 @@ static ULONG popcount( ULONG val )
 #endif
 }
 
+#ifndef linux
+/* WINE_CPU_TOPOLOGY relies on Linux /sys/devices/system/cpu/ entries; on
+ * macOS the host topology has to be queried via sysctlbyname("hw.*") instead.
+ * TODO: Mac-native topology override. For now, opt-out. */
+void fill_cpu_override(void)
+{
+    if (getenv("WINE_CPU_TOPOLOGY"))
+        ERR("WINE_CPU_TOPOLOGY is not yet supported on non-Linux hosts.\n");
+}
+#else
 void fill_cpu_override(void)
 {
     const char *env_override = getenv("WINE_CPU_TOPOLOGY");
@@ -975,6 +985,7 @@ error:
     cpu_override.mapping.cpu_count = 0;
     ERR("Invalid WINE_CPU_TOPOLOGY string %s (%s).\n", debugstr_a(env_override), debugstr_a(s));
 }
+#endif /* linux */
 
 struct cpu_topology_override *get_cpu_topology_override(void)
 {
