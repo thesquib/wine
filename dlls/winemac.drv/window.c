@@ -191,6 +191,7 @@ static struct macdrv_win_data *alloc_win_data(HWND hwnd)
  *
  * Lock and return the data structure associated with a window.
  */
+__attribute__((visibility("default")))
 struct macdrv_win_data *get_win_data(HWND hwnd)
 {
     struct macdrv_win_data *data;
@@ -199,6 +200,23 @@ struct macdrv_win_data *get_win_data(HWND hwnd)
     pthread_mutex_lock(&win_data_mutex);
     if (win_datas && (data = (struct macdrv_win_data*)CFDictionaryGetValue(win_datas, hwnd)))
         return data;
+
+    /* DXMT-Mac debug: lookup miss. Dump dict size + a sample of keys so we
+     * know whether win_datas is empty (winemac.drv hasn't created any yet)
+     * or just missing this HWND (timing/race). */
+    {
+        CFIndex count = win_datas ? CFDictionaryGetCount(win_datas) : -1;
+        fprintf(stderr, "winemac:get_win_data MISS for hwnd=%p, win_datas=%p count=%ld\n",
+                hwnd, win_datas, (long)count);
+        if (win_datas && count > 0 && count < 20) {
+            const void **keys = malloc(sizeof(void*) * count);
+            CFDictionaryGetKeysAndValues(win_datas, keys, NULL);
+            for (CFIndex i = 0; i < count; i++)
+                fprintf(stderr, "  win_datas key[%ld]=%p\n", (long)i, keys[i]);
+            free(keys);
+        }
+    }
+
     pthread_mutex_unlock(&win_data_mutex);
     return NULL;
 }
@@ -208,10 +226,155 @@ struct macdrv_win_data *get_win_data(HWND hwnd)
  *              release_win_data
  *
  * Release the data returned by get_win_data.
+ *
+ * NOTE: get_win_data + release_win_data are exported via visibility("default")
+ * so DXMT's winemetal.so can dlsym them. See docs/macos/experiments/dxmt-wine-patches.md
  */
+__attribute__((visibility("default")))
 void release_win_data(struct macdrv_win_data *data)
 {
     if (data) pthread_mutex_unlock(&win_data_mutex);
+}
+
+
+/***********************************************************************
+ *              macdrv_lookup_client_view
+ *
+ * Strategy E.1 helper: look up an HWND in this process's win_datas and
+ * return its client_view (the WineContentView). Returns NULL if HWND
+ * isn't owned by this process. Safe to call from any thread/process.
+ *
+ * Used by cocoa_app.m's NSDistributedNotification handler - pure C signature
+ * so no Wine PE-header coupling on the Cocoa side.
+ */
+__attribute__((visibility("default")))
+void *macdrv_lookup_client_view(void *hwnd)
+{
+    struct macdrv_win_data *data = get_win_data((HWND)hwnd);
+    void *v = NULL;
+    if (data) {
+        v = (void *)data->client_view;
+        release_win_data(data);
+    }
+    return v;
+}
+
+
+/***********************************************************************
+ *              macdrv_resolve_hwnd_for_hosting
+ *
+ * Strategy E.1 fallback chain: given an HWND that may not be backed by a
+ * Cocoa view (e.g. a headless swap-chain HWND), find a candidate visible
+ * WineContentView to host a remote CAMetalLayer onto.
+ *
+ *   (a) Walk GA_ROOT - if hwnd has a valid root ancestor in this process's
+ *       win_datas with a non-zero client_view, use it.
+ *   (b) Heuristic - pick the largest visible win_data in this process.
+ *
+ * Returns NULL if no suitable view in THIS process. Output param *out_hwnd
+ * receives the resolved HWND for diagnostics.
+ *
+ * Called from cocoa_app.m's NSDistributedNotification handler.
+ */
+/***********************************************************************
+ *              macdrv_resolve_hwnd_for_hosting (E.1 - heuristic resolver)
+ *
+ * Pick a Cocoa target to insert a CALayerHost into for cross-process hosting.
+ * Strategy:
+ *   1. Try direct HWND lookup - if its client_view is set, return it as a view.
+ *   2. Else if its cocoa_window is set, return cocoa_window with *out_is_window=1.
+ *   3. Else iterate win_datas for largest on_screen window meeting same criteria.
+ *
+ * out_is_window: set to 1 if returned pointer is an NSWindow*, 0 if NSView*.
+ * Pure CF/pthread, safe from any thread (no Wine NT syscalls).
+ */
+__attribute__((visibility("default")))
+void *macdrv_resolve_hwnd_for_hosting(void *target_hwnd, void **out_hwnd, int *out_is_window)
+{
+    if (out_hwnd) *out_hwnd = NULL;
+    if (out_is_window) *out_is_window = 0;
+
+    /* Bug (Proton macOS) 2026-04-30: this resolver is invoked from the main
+     * thread inside the DXMTRemoteLayerHostRequest notification observer.
+     * If a worker thread is currently inside apply_window_pos →
+     * macdrv_WindowPosChanged → set_cocoa_window_properties → OnMainThread
+     * (waiting for the main queue to drain), it is HOLDING win_data_mutex
+     * while we try to acquire it - and we are blocking the main queue, so
+     * the worker can never make progress. Classic A↔B deadlock; observed
+     * tonight on Skyrim SE (Bethesda Creation Engine SetWindowPos churn).
+     *
+     * Use trylock here. The DXMT-Mac broadcast retries up to 60× at 500ms,
+     * so a deferred attach is fine; missing one tick beats deadlocking the
+     * whole game. */
+    if (pthread_mutex_trylock(&win_data_mutex) != 0) {
+        fprintf(stderr, "winemac:E.1 resolver - win_data_mutex contended, deferring (pid=%d)\n", getpid());
+        return NULL;
+    }
+
+    /* (1) Direct lookup of target HWND. Even if client_view is NULL, cocoa_window may suffice. */
+    if (win_datas) {
+        struct macdrv_win_data *data = (struct macdrv_win_data*)CFDictionaryGetValue(win_datas, target_hwnd);
+        if (data) {
+            if (data->client_view) {
+                void *v = (void *)data->client_view;
+                pthread_mutex_unlock(&win_data_mutex);
+                if (out_hwnd) *out_hwnd = target_hwnd;
+                return v;
+            }
+            if (data->cocoa_window) {
+                void *w = (void *)data->cocoa_window;
+                pthread_mutex_unlock(&win_data_mutex);
+                if (out_hwnd) *out_hwnd = target_hwnd;
+                if (out_is_window) *out_is_window = 1;
+                return w;
+            }
+        }
+    }
+
+    /* (2) Heuristic - iterate win_datas, pick largest on_screen window. */
+    void *best = NULL;
+    HWND best_hwnd_local = NULL;
+    int best_area = 0;
+    int best_is_window = 0;
+
+    if (win_datas) {
+        CFIndex count = CFDictionaryGetCount(win_datas);
+        fprintf(stderr, "winemac:E.1 resolver - pid=%d scanning %ld win_datas entries\n", getpid(), (long)count);
+        if (count > 0) {
+            const void **keys = malloc(sizeof(void *) * count);
+            const void **vals = malloc(sizeof(void *) * count);
+            CFDictionaryGetKeysAndValues(win_datas, keys, vals);
+            for (CFIndex i = 0; i < count; i++) {
+                struct macdrv_win_data *d = (struct macdrv_win_data *)vals[i];
+                if (!d) continue;
+                int w = d->rects.window.right - d->rects.window.left;
+                int h = d->rects.window.bottom - d->rects.window.top;
+                int area = w * h;
+                fprintf(stderr, "  E.1 candidate hwnd=%p client_view=%p cocoa_window=%p on_screen=%u %dx%d area=%d\n",
+                        (void *)keys[i], (void *)d->client_view, (void *)d->cocoa_window, d->on_screen, w, h, area);
+                if (!d->on_screen) continue;
+                void *cand = NULL; int cand_is_window = 0;
+                if (d->client_view) cand = (void *)d->client_view;
+                else if (d->cocoa_window) { cand = (void *)d->cocoa_window; cand_is_window = 1; }
+                if (!cand) continue;
+                if (area > best_area) {
+                    best_area = area;
+                    best = cand;
+                    best_hwnd_local = (HWND)keys[i];
+                    best_is_window = cand_is_window;
+                }
+            }
+            free(keys);
+            free(vals);
+        }
+    }
+    pthread_mutex_unlock(&win_data_mutex);
+
+    if (best) {
+        if (out_hwnd) *out_hwnd = best_hwnd_local;
+        if (out_is_window) *out_is_window = best_is_window;
+    }
+    return best;
 }
 
 
@@ -484,6 +647,18 @@ static void create_cocoa_window(struct macdrv_win_data *data)
 
     data->cocoa_window = macdrv_create_cocoa_window(&wf, frame, data->hwnd, thread_data->queue);
     if (!data->cocoa_window) goto done;
+
+    /* Bug (Proton macOS): expose the cocoa_window's contentView so DXMT
+     * (which dlsym's get_win_data and reads the view slots) finds a
+     * real NSView and can attach its CAMetalLayer directly into the
+     * window's content view tree, instead of falling back to creating
+     * a separate auxiliary NSWindow that's invisible behind the game's
+     * actual fullscreen window. Mirror the same value into both
+     * `client_view` (our internal name) and `client_cocoa_view` (the
+     * older field name DXMT was compiled against - DXMT's struct layout
+     * checks the offset-24 slot directly). */
+    data->client_view = macdrv_window_get_content_view(data->cocoa_window);
+    data->client_cocoa_view = data->client_view;
 
     set_cocoa_window_properties(data);
 
@@ -1101,6 +1276,12 @@ static void macdrv_client_surface_detach(struct client_surface *client)
     }
 }
 
+/* Strategy E.1 - Vulkan-path fallback. Implemented in cocoa_app.m. Wraps
+ * the surface's CAMetalLayer in a CAContext + broadcasts via
+ * NSDistributedNotification so a sibling process (or this one, after a
+ * later WM_NCCREATE) can host the layer into a visible WineContentView. */
+extern void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer);
+
 static void macdrv_client_surface_update(struct client_surface *client)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
@@ -1113,7 +1294,32 @@ static void macdrv_client_surface_update(struct client_surface *client)
     NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
-    if (!(data = get_win_data(toplevel))) return;
+    if (!(data = get_win_data(toplevel)))
+    {
+        /* Strategy E.1 (Vulkan path): toplevel HWND is not in this process's
+         * win_datas - either it lives in a sibling Wine process or it has not
+         * been registered yet (race against WM_NCCREATE). Without a fallback
+         * the cocoa_view never gets a superview, so MoltenVK renders into an
+         * orphan layer and DOOM presents a title bar with no content.
+         *
+         * If the surface has a Metal view (i.e. winevulkan called us), pull
+         * the underlying CAMetalLayer and broadcast a host-request matching
+         * DXMT's pattern. The existing DXMTRemoteLayerHostRequest observer
+         * uses macdrv_resolve_hwnd_for_hosting to locate a visible Wine
+         * NSWindow and inserts the layer into its contentView. The observer's
+         * contract is HWND-keyed and protocol-agnostic, so reuse is safe. */
+        if (surface->metal_view)
+        {
+            void *metal_layer = (void *)macdrv_view_get_metal_layer(surface->metal_view);
+            fprintf(stderr,
+                    "winemac:E.1-vulkan - surface_update MISS for hwnd=%p toplevel=%p, "
+                    "broadcasting metal_layer=%p\n",
+                    hwnd, toplevel, metal_layer);
+            if (metal_layer)
+                macdrv_broadcast_vulkan_layer_host_request((void *)toplevel, metal_layer);
+        }
+        return;
+    }
     OffsetRect(&rect, data->rects.client.left - data->rects.visible.left, data->rects.client.top - data->rects.visible.top);
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
@@ -1130,7 +1336,19 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
     if (!(data = get_win_data(surface->client.hwnd))) return;
     if (data->client_view != surface->cocoa_view)
     {
-        if (data->client_view) macdrv_set_view_hidden(data->client_view, TRUE);
+        /* Bug (Proton macOS) 2026-04-30: don't hide the previous
+         * client_view when it IS the cocoa_window's actual contentView.
+         * Hiding the contentView blanks the entire window subtree
+         * (including subviews like surface->cocoa_view we just made
+         * visible), and the user sees only the NSWindow's white
+         * background. The hide-old/show-new pattern is for
+         * dedicated client surface views; the initial contentView
+         * is shared and must remain visible. */
+        if (data->client_view &&
+            data->client_view != macdrv_window_get_content_view(data->cocoa_window))
+        {
+            macdrv_set_view_hidden(data->client_view, TRUE);
+        }
         macdrv_set_view_hidden(surface->cocoa_view, FALSE);
         data->client_view = surface->cocoa_view;
     }
@@ -1155,14 +1373,21 @@ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
     NtUserMapWindowPoints(hwnd, toplevel, (POINT *)&rect, 2, NtUserGetWinMonitorDpi(toplevel, MDT_RAW_DPI));
 
     surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd);
+    /* Bug #11 (Proton macOS): client_surface_create returns NULL when called
+     * from a process that doesn't own the HWND (e.g. CEF gpu-process
+     * creating a Vulkan surface for a Chrome HWND that lives in the browser
+     * process). The pre-existing code dereferenced `surface` unconditionally
+     * before the NULL check below, faulting with STATUS_ACCESS_VIOLATION
+     * which the loader-thunks `assert(!status && …)` then turned into an
+     * abort, killing the gpu-process. Bail cleanly instead and let
+     * winevulkan return VK_ERROR_INITIALIZATION_FAILED to ANGLE. */
+    if (!surface) return NULL;
+
     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(rect));
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
-    if (surface)
-    {
-        macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0);
-    }
+    macdrv_client_surface_update(&surface->client);
+    macdrv_client_surface_present(&surface->client, 0);
 
     return surface;
 }

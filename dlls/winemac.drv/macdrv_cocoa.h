@@ -128,6 +128,8 @@ extern CFDictionaryRef localized_strings;
 extern bool retina_enabled;  /* Whether Retina mode is enabled via registry setting. */
 extern bool retina_on;       /* Whether Retina mode is currently active (enabled and display is in default mode). */
 extern bool enable_app_nap;
+extern double mouse_relative_motion_scale; /* Multiplier applied to relative trackpad/mouse deltas before delivery (default 1.0). */
+extern double mouse_relative_motion_cap;   /* Absolute cap per-axis in post-scale pixels; 0 disables the cap (default 0.0). */
 
 static inline CGRect cgrect_mac_from_win(CGRect rect)
 {
@@ -204,6 +206,7 @@ extern void macdrv_window_rejected_focus(const struct macdrv_event *event);
 extern void macdrv_beep(void);
 extern void macdrv_set_application_icon(CFArrayRef images);
 extern void macdrv_quit_reply(int reply);
+extern void macdrv_restore_mouse_association(void);
 extern bool macdrv_using_input_method(void);
 extern void macdrv_set_mouse_capture_window(macdrv_window window);
 extern void macdrv_set_cocoa_retina_mode(bool new_mode);
@@ -515,6 +518,7 @@ extern void macdrv_window_use_per_pixel_alpha(macdrv_window w, bool use_per_pixe
 extern void macdrv_set_window_mask(macdrv_window w, CGRect rect);
 extern void macdrv_give_cocoa_window_focus(macdrv_window w, bool activate);
 extern void macdrv_set_window_min_max_sizes(macdrv_window w, CGSize min_size, CGSize max_size);
+extern macdrv_view macdrv_window_get_content_view(macdrv_window w);
 extern macdrv_view macdrv_create_view(CGRect rect);
 extern void macdrv_dispose_view(macdrv_view v);
 extern void macdrv_set_view_frame(macdrv_view v, CGRect rect);
@@ -526,6 +530,8 @@ extern macdrv_metal_device macdrv_create_metal_device(void);
 extern void macdrv_release_metal_device(macdrv_metal_device d);
 extern macdrv_metal_view macdrv_view_create_metal_view(macdrv_view v, macdrv_metal_device d);
 extern macdrv_metal_layer macdrv_view_get_metal_layer(macdrv_metal_view v);
+extern void *macdrv_save_metal_layer_delegate(void *layer_ptr);
+extern void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved);
 extern void macdrv_view_release_metal_view(macdrv_metal_view v);
 extern bool macdrv_get_view_backing_size(macdrv_view v, int backing_size[2]);
 extern void macdrv_set_view_backing_size(macdrv_view v, const int backing_size[2]);
