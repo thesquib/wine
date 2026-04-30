@@ -3207,7 +3207,21 @@ void signal_init_process(void)
 
 void set_thread_teb( TEB *teb )
 {
+#ifdef __APPLE__
+    /* NOTE (macOS/Rosetta spike): Calling _thread_set_tsd_base((uint64_t)teb)
+     * overwrites the pthread TSD that libsystem uses for _pthread_self(). Any
+     * subsequent pthread API (e.g. pthread_mutex_lock called from early
+     * init_startup_info -> get_drives_info -> mutex_lock) then dereferences
+     * garbage and SIGBUSes. Wine's unix side already uses a pthread_key
+     * (teb_key, set via pthread_setspecific in virtual_alloc_first_teb /
+     * start_thread) so NtCurrentTeb() works without %gs. For PE/Windows-side
+     * code that reads %gs:0x30, we rely on Rosetta's shadow %gs handling
+     * (TODO: verify once PE code actually loads). Making this a no-op is the
+     * minimum to get past the early pthread-lock crash. */
+    (void)teb;
+#else
     arch_prctl( ARCH_SET_GS, teb );
+#endif
 }
 
 /***********************************************************************
