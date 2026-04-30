@@ -149,30 +149,22 @@ static VkResult macdrv_vulkan_surface_create(HWND hwnd, BOOL raw, const struct v
      * directly callable; use _NSGetArgv to peek at the argv our wine
      * loader was started with - the PE path appears as one of the
      * arguments. */
-    int disable_e1_vk = 0;
-    if (getenv("PROTON_DISABLE_E1_VULKAN_BROADCAST"))
-    {
-        extern char ***_NSGetArgv(void);
-        extern int *_NSGetArgc(void);
-        char **argv = *_NSGetArgv();
-        int argc = *_NSGetArgc(), i;
-        for (i = 0; i < argc; i++)
-        {
-            const char *a = argv[i];
-            const char *base = strrchr(a, '/');
-            const char *back = strrchr(a, '\\');
-            if (back > base) base = back;
-            base = base ? base + 1 : a;
-            if (!strcasecmp(base, "steam.exe") ||
-                !strcasecmp(base, "steamwebhelper.exe") ||
-                !strcasecmp(base, "gldriverquery.exe") ||
-                !strcasecmp(base, "gldriverquery64.exe"))
-            {
-                disable_e1_vk = 1;
-                break;
-            }
-        }
-    }
+    /* Bug (Proton macOS) 2026-05-01: original 2026-04-29 logic limited
+     * PROTON_DISABLE_E1_VULKAN_BROADCAST to argv matching steam.exe /
+     * steamwebhelper.exe so an env-leak from Steam.exe wouldn't disable
+     * broadcast for `-applaunch` games. With recipe-driven launches
+     * (mac/bottles/launch-bottle-game.sh reading bottle.protonConfig)
+     * the env is now set per-recipe intentionally - Elden Ring wants
+     * broadcast OFF because the same dispatch_sync CAContext path that
+     * patch 0022 fixed has another reproducible 0xc0000005 fault
+     * downstream. Trusting the env unconditionally lets the recipe
+     * actually take effect. The argv-scan path was also a NULL-deref
+     * footgun if any argv[i] was NULL.
+     *
+     * Steam-in-bottle path now sets the env explicitly via the bottle
+     * launcher's bottleSteam strategy, so the auto-detect for
+     * steam.exe/steamwebhelper.exe is no longer load-bearing. */
+    int disable_e1_vk = !!getenv("PROTON_DISABLE_E1_VULKAN_BROADCAST");
     if (!disable_e1_vk)
     {
         void *metal_layer = (void *)macdrv_view_get_metal_layer(surface->metal_view);
