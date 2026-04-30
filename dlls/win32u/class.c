@@ -463,12 +463,15 @@ static CLASS *find_class( HINSTANCE module, UNICODE_STRING *name )
     ULONG_PTR instance = (UINT_PTR)module;
     CLASS *class;
     int is_win16;
+    int total = 0, name_matches = 0;
 
     user_lock();
     LIST_FOR_EACH_ENTRY( class, &class_list, CLASS, entry )
     {
         UINT_PTR class_instance = get_class_instance( class );
+        total++;
         if (!class_name_matches( class, name )) continue;
+        name_matches++;
         is_win16 = !(class_instance >> 16);
         if (!instance || !class->local || class_instance == instance ||
             (!is_win16 && ((class_instance & ~0xffff) == (instance & ~0xffff))))
@@ -478,6 +481,28 @@ static CLASS *find_class( HINSTANCE module, UNICODE_STRING *name )
         }
     }
     user_unlock();
+    /* Bug #8 diagnostic: log when find_class returns NULL with details about
+     * what was searched. Only trigger on non-empty searches to avoid noise
+     * from window-class enumeration callers. Filter to atomic-looking
+     * names (#NNN) since that's the symptom we care about. */
+    if (name && name->Length && name->Length <= 32 &&
+        name->Buffer && name->Buffer[0] == L'#')
+    {
+        ERR( "find_class MISS: name=%s len=%u module=%p instance=%lx - "
+             "walked %d entries, %d name-matches. Class list dump follows:\n",
+             debugstr_us(name), (unsigned)name->Length, module, instance,
+             total, name_matches );
+        LIST_FOR_EACH_ENTRY( class, &class_list, CLASS, entry )
+        {
+            const WCHAR *cname = (WCHAR *)class->shared->shm.class.name;
+            UINT clen = class->shared->shm.class.name_len;
+            UINT_PTR cinst = get_class_instance( class );
+            ERR( "  class @%p name_len=%u name=%s inst=%lx local=%d\n",
+                 class, clen,
+                 debugstr_wn( cname, clen / sizeof(WCHAR) ),
+                 cinst, class->local );
+        }
+    }
     return NULL;
 }
 
@@ -571,7 +596,12 @@ ATOM WINAPI NtUserRegisterClassExWOW( const WNDCLASSEXW *wc, UNICODE_STRING *nam
 
     if (!(shared = find_shared_session_object( locator.id, locator.offset )))
     {
-        ERR( "Failed to get shared session object for window class\n" );
+        ERR( "Failed to get shared session object for window class %s "
+             "(locator id=%#llx offset=%#llx server_atom=%04x) - "
+             "RegisterClassEx will return 0; CreateWindow will fail with "
+             "ERROR_CLASS_DOES_NOT_EXIST. Check for preceding winstation ERRs.\n",
+             debugstr_us(name),
+             (unsigned long long)locator.id, (unsigned long long)locator.offset, atom );
         SERVER_START_REQ( destroy_class )
         {
             req->instance = wine_server_client_ptr( instance );
@@ -597,6 +627,11 @@ ATOM WINAPI NtUserRegisterClassExWOW( const WNDCLASSEXW *wc, UNICODE_STRING *nam
     TRACE( "name=%s->%s atom=%04x wndproc=%p hinst=%p bg=%p style=%08x clsExt=%d winExt=%d class=%p\n",
            debugstr_w(wc->lpszClassName), debugstr_us(name), atom, wc->lpfnWndProc, instance,
            wc->hbrBackground, wc->style, wc->cbClsExtra, wc->cbWndExtra, class );
+    /* Bug #8 diagnostic: log the atom returned to every caller so we can
+     * correlate with later find_class lookups. Atoms < 0xC000 are
+     * suspicious for user-registered classes (system range). */
+    ERR( "RegisterClass RETURN: name=%s atom=%#x (%u) inst=%p - caller will use this atom in CreateWindow.\n",
+         debugstr_us(name), atom, atom, instance );
 
     class->hIcon         = wc->hIcon;
     class->hIconSm       = wc->hIconSm;
@@ -1097,6 +1132,28 @@ static const struct builtin_class_descr message_builtin_class =
     .proc = NTUSER_WNDPROC_MESSAGE,
 };
 
+/* Bug #9 Proton workaround: Chromium 126 (Steam's CEF) calls
+ * CreateWindow(MAKEINTATOM(5), …, HWND_MESSAGE, …) very early in
+ * webhelper subprocess startup with the atom value 5 hardcoded - its
+ * MessageWindow::WindowClass::atom_ resolves to 5 via a path that does
+ * not call RegisterClassEx (sandbox/IPC inheritance, sentinel value, or
+ * ambient-state assumption that holds on real Windows but not on us).
+ * Without this class registered, find_class("#5") returns NULL,
+ * CreateWindow returns ERROR_CLASS_DOES_NOT_EXIST (0x583), webhelper
+ * times out, Steam restarts it in a loop and the CEF UI never comes up.
+ *
+ * Pre-registering "#5" at user32 init makes wine_server_add_atom assign
+ * integer atom 5 directly (see get_int_atom_value above), so Chrome's
+ * lookup succeeds. The proc is the same NTUSER_WNDPROC_MESSAGE used by
+ * the HWND_MESSAGE parent - it falls through to DefWindowProc for any
+ * message we receive on this window, which is the safest behavior for
+ * a class we don't control. */
+static const struct builtin_class_descr proton_atom5_stub_class =
+{
+    .name = "#5",
+    .proc = NTUSER_WNDPROC_MESSAGE,
+};
+
 static const struct builtin_class_descr builtin_classes[] =
 {
     /* button */
@@ -1255,4 +1312,10 @@ void register_desktop_class(void)
 {
     register_builtin( &desktop_builtin_class );
     register_builtin( &message_builtin_class );
+    /* Bug #9: register the atom-5 stub here (alongside desktop + Message) so
+     * it's available BEFORE the lazy register_builtin_classes() runs, since
+     * Chromium's webhelper calls CreateWindow(MAKEINTATOM(5), …) very early
+     * in subprocess startup - before any of the standard control classes
+     * (Button, Edit, …) get registered. See proton_atom5_stub_class. */
+    register_builtin( &proton_atom5_stub_class );
 }
