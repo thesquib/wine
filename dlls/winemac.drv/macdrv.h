@@ -177,6 +177,17 @@ struct macdrv_win_data
     HWND                hwnd;                   /* hwnd that this private data belongs to */
     macdrv_window       cocoa_window;
     macdrv_view         client_view;
+    /* Bug (Proton macOS): DXMT compiled against an older macdrv_win_data
+     * layout that has `client_cocoa_view` at offset 24. Add the field
+     * here at that offset and keep it mirrored to client_view in
+     * window.c::create_cocoa_window so DXMT's
+     * `if (win_data->client_cocoa_view)` check in winemetal_unix.c's
+     * `_CreateMetalViewFromHWND` succeeds and DXMT takes the normal
+     * macdrv_view_create_metal_view path (rendering into the actual
+     * cocoa_window's contentView), instead of the fallback that creates
+     * a separate auxiliary NSWindow invisible behind the game's real
+     * fullscreen window. See docs/macos/experiments/sample-hades-stall.txt. */
+    macdrv_view         client_cocoa_view;
     struct window_rects rects;                  /* window rects in monitor DPI, relative to parent client area */
     int                 pixel_format;           /* pixel format for GL */
     HANDLE              drag_event;             /* event to signal that Cocoa-driven window dragging has ended */
