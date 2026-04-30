@@ -5429,6 +5429,39 @@ BOOL WINAPI NtUserDestroyWindow( HWND hwnd )
     return user_destroy_window( hwnd, TRUE );
 }
 
+/***********************************************************************
+ *           thread_owns_any_window
+ *
+ * Bug (Proton macOS) 2026-04-29: lock-free pre-check used by
+ * destroy_thread_windows to skip the user_lock acquire when the
+ * exiting thread owns no windows. shared_session->user_entries is
+ * SHM-mapped + read with read_acquire_user_entry's seqlock, so this
+ * walk is safe without holding user_lock. Most Wine threads (audio
+ * worker, thread-pool worker, dxmt-encode-thr, etc.) exit owning
+ * zero windows; serializing their pthread-cleanup chains through
+ * user_lock causes the game's render thread (in PeekMessage,
+ * waiting on user_lock) and the exiting worker to fight over the
+ * same mutex. Any prior thread that took user_lock and died
+ * abnormally leaks the lock (POSIX pthread mutexes don't auto-
+ * release on thread death) and deadlocks every subsequent acquirer.
+ * The pre-check sidesteps the entire chain for the common
+ * zero-windows case.
+ */
+static BOOL thread_owns_any_window( UINT tid )
+{
+    UINT i;
+    for (i = 0; i < MAX_USER_HANDLES; i++)
+    {
+        struct user_entry entry;
+        HANDLE handle;
+        if (get_user_entry_at( i, NTUSER_OBJ_WINDOW, &entry, &handle )
+            && entry.pid == GetCurrentProcessId()
+            && entry.tid == tid)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 /*****************************************************************************
  *           destroy_thread_windows
  *
@@ -5452,6 +5485,11 @@ void destroy_thread_windows(void)
 
     /* recycle WND structs as destroy_entry structs */
     C_ASSERT( sizeof(struct destroy_entry) <= sizeof(WND) );
+
+    /* Bug (Proton macOS): skip user_lock acquire if this thread owns
+     * zero windows - see thread_owns_any_window above. */
+    if (!thread_owns_any_window( GetCurrentThreadId() ))
+        return;
 
     user_lock();
     while ((win = next_thread_user_object( GetCurrentThreadId(), &handle, NTUSER_OBJ_WINDOW )))
