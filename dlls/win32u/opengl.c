@@ -1569,6 +1569,32 @@ static void init_egl_platforms( struct opengl_funcs *funcs, const struct opengl_
 {
 }
 
+/* Framebuffer-surface path is EGL-dependent but referenced outside the EGL
+ * guard further down in this file. On non-EGL builds (macOS) we stub the
+ * symbols so the file compiles; fullscreen-hack framebuffer surfaces just
+ * don't work, which is fine until we wire a Metal-backed equivalent. */
+struct framebuffer_surface
+{
+    struct opengl_drawable base;
+    struct opengl_drawable *target;
+};
+static const struct opengl_drawable_funcs framebuffer_surface_funcs = {0};
+
+static BOOL needs_framebuffer_surface( HWND hwnd )
+{
+    return FALSE;
+}
+
+static struct opengl_drawable *framebuffer_surface_create( int format, struct client_surface *client, struct opengl_drawable *target )
+{
+    return NULL;
+}
+
+static struct framebuffer_surface *framebuffer_from_opengl_drawable( struct opengl_drawable *drawable )
+{
+    return NULL;
+}
+
 #endif /* SONAME_LIBEGL */
 
 static UINT read_drm_device_prop( const char *name, const char *prop )

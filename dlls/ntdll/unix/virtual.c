@@ -1009,7 +1009,11 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
         if (builtin->unix_path && !builtin->unix_handle)
         {
             load_steam_overlay(builtin->unix_path);
-            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
+            /* macOS: RTLD_GLOBAL so other unixlibs (e.g. DXMT's winemetal.so)
+             * can dlsym(RTLD_DEFAULT, ...) macdrv_* exports from winemac.so.
+             * Without this, RTLD_LOCAL hides our symbols even though they
+             * have visibility("default"). See docs/macos/experiments/dxmt-build-from-source.md */
+            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW | RTLD_GLOBAL );
             if (!builtin->unix_handle)
                 WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
         }
@@ -1043,7 +1047,9 @@ NTSTATUS load_builtin_unixlib( void *module, const char *name )
         if (!builtin->unix_handle)
         {
             load_steam_overlay(builtin->unix_path);
-            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW );
+            /* macOS: RTLD_GLOBAL so DXMT's winemetal.so etc. can dlsym
+             * macdrv_* exports via RTLD_DEFAULT. See above. */
+            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW | RTLD_GLOBAL );
         }
         break;
     }
