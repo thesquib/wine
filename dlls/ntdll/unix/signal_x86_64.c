@@ -2236,6 +2236,25 @@ static inline BOOL handle_interrupt( ucontext_t *sigcontext, EXCEPTION_RECORD *r
     switch (ERROR_sig(sigcontext) >> 3)
     {
     case 0x29:
+    {
+        /* PROTON_DARWIN: ER's anti-tamper layer fires __fastfail at
+         * known site eldenring.exe+0x148695 (rcx=7) when an integrity
+         * check on `int 0x29`-driven code path returns non-zero. Skip
+         * past the int 0x29 instruction (advance RIP by 2 bytes) when
+         * bypass is enabled and the fault is inside the ER PE range.
+         * ER's caller falls through to the gentler RaiseException
+         * path (mov $0x40000015 / call 0x142520454). */
+        ULONG_PTR ripv = (ULONG_PTR)context->Rip;
+        if (ripv >= 0x140000000UL && ripv < 0x150000000UL &&
+            getenv("PROTON_ER_DEADBA_BYPASS"))
+        {
+            ERR_(seh)( "INT 0x29 bypass at rip=%p (rcx=%lu)\n",
+                       (void *)ripv, (unsigned long)context->Rcx );
+            context->Rip = ripv + 2;
+            RIP_sig(sigcontext) = ripv + 2;
+            leave_handler( sigcontext );
+            return TRUE;
+        }
         /* __fastfail: process state is corrupted */
         rec->ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
         rec->ExceptionFlags = EXCEPTION_NONCONTINUABLE;
@@ -2243,6 +2262,7 @@ static inline BOOL handle_interrupt( ucontext_t *sigcontext, EXCEPTION_RECORD *r
         rec->ExceptionInformation[0] = context->Rcx;
         NtRaiseException( rec, context, FALSE );
         return TRUE;
+    }
     case 0x2c:
         rec->ExceptionCode = STATUS_ASSERTION_FAILURE;
         break;
@@ -2794,6 +2814,26 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             static const unsigned char deadba_pat[11] =
                 { 0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xba, 0xad, 0xde, 0x00 };
             int is_deadba = (rip_in_pe && !memcmp( rip, deadba_pat, sizeof(deadba_pat) ));
+
+            /* PROTON_DARWIN: ER Dantelion2 panic bypass - opt-in.
+             * Set PROTON_ER_DEADBA_BYPASS=1 to fix-and-skip past the
+             * sentinel: write 2 to ER's panic_state global at
+             * 0x143b4059c (the value that legitimately bumps from 1
+             * via 0x1451f2c99 cmove $0xe,%r11; cmove pair) and
+             * advance RIP by 11 bytes past the mov [0], 0xdeadba so
+             * the SEGV never fires. */
+            if (is_deadba && getenv("PROTON_ER_DEADBA_BYPASS"))
+            {
+                volatile unsigned int *pstate = (volatile unsigned int *)0x143b4059cUL;
+                ERR_(seh)( "DEADBA bypass: writing 2 to 0x143b4059c (was %u) and skipping insn\n",
+                           *pstate );
+                *pstate = 2;
+                RIP_sig(ucontext) = ripv + 11;
+                leave_handler( ucontext );
+                return;
+            }
+
+
             ERR_(seh)( "PE-AV at rip=%p%s%s (faultaddr=%p)\n",
                        rip,
                        is_deadba ? " [DEADBA SENTINEL]" : "",
