@@ -2777,6 +2777,79 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         break;
     }
     if (handle_syscall_fault( ucontext, &rec, &context.c )) return;
+
+    /* PROTON_DARWIN: capture register/stack state on any AV that's
+     * either inside the eldenring.exe PE range (0x140000000..0x150000000)
+     * OR a NULL-RIP call (indirect-call-through-NULL — common Dantelion2
+     * panic surface). Broad by design; we're hunting for ER's panic
+     * surface. */
+    if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
+    {
+        const unsigned char *rip = (const unsigned char *)RIP_sig(ucontext);
+        const ULONG_PTR ripv = (ULONG_PTR)rip;
+        const int rip_in_pe = (ripv >= 0x140000000UL && ripv < 0x150000000UL);
+        const int rip_is_null = (ripv == 0);
+        if (rip_in_pe || rip_is_null)
+        {
+            static const unsigned char deadba_pat[11] =
+                { 0xc7, 0x04, 0x25, 0x00, 0x00, 0x00, 0x00, 0xba, 0xad, 0xde, 0x00 };
+            int is_deadba = (rip_in_pe && !memcmp( rip, deadba_pat, sizeof(deadba_pat) ));
+            ERR_(seh)( "PE-AV at rip=%p%s%s (faultaddr=%p)\n",
+                       rip,
+                       is_deadba ? " [DEADBA SENTINEL]" : "",
+                       rip_is_null ? " [NULL-CALL]" : "",
+                       (void *)rec.ExceptionInformation[1] );
+            if (rip_in_pe)
+                ERR_(seh)( "  insn bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                           rip[0], rip[1], rip[2], rip[3], rip[4], rip[5],
+                           rip[6], rip[7], rip[8], rip[9], rip[10], rip[11] );
+            const ULONG_PTR rcx = RCX_sig(ucontext);
+            const ULONG_PTR rdx = RDX_sig(ucontext);
+            const ULONG_PTR r8  = R8_sig(ucontext);
+            const ULONG_PTR r9  = R9_sig(ucontext);
+            const ULONG_PTR *sp = (const ULONG_PTR *)RSP_sig(ucontext);
+            int i;
+            ERR_(seh)( "register/stack capture follows (rip_in_pe=%d rip_is_null=%d is_deadba=%d)\n",
+                       rip_in_pe, rip_is_null, is_deadba );
+            ERR_(seh)( "  rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
+                       (long)RAX_sig(ucontext), (long)RBX_sig(ucontext), (long)rcx, (long)rdx );
+            ERR_(seh)( "  rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
+                       (long)RSI_sig(ucontext), (long)RDI_sig(ucontext),
+                       (long)RBP_sig(ucontext), (long)RSP_sig(ucontext) );
+            ERR_(seh)( "  r8 =%016lx r9 =%016lx r10=%016lx r11=%016lx\n",
+                       (long)r8, (long)r9, (long)R10_sig(ucontext), (long)R11_sig(ucontext) );
+            ERR_(seh)( "  r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
+                       (long)R12_sig(ucontext), (long)R13_sig(ucontext),
+                       (long)R14_sig(ucontext), (long)R15_sig(ucontext) );
+            for (i = 0; i < 4; i++)
+            {
+                ULONG_PTR p = (i==0)?rcx:(i==1)?rdx:(i==2)?r8:r9;
+                static const char * const nm[4] = { "rcx", "rdx", "r8", "r9" };
+                if (p > 0x10000 && p < (ULONG_PTR)0x800000000000UL)
+                {
+                    char buf[257]; int j;
+                    for (j = 0; j < 256; j++)
+                    {
+                        char c = ((const char *)p)[j];
+                        if (!c) break;
+                        buf[j] = (c >= 0x20 && c < 0x7f) ? c : '.';
+                    }
+                    buf[j] = 0;
+                    if (j >= 4) ERR_(seh)( "  arg %s -> \"%s\"\n", nm[i], buf );
+                }
+            }
+            /* stack qword dump; cap at 32 to stay within current frame */
+            for (i = 0; i < 32 && sp; i++)
+            {
+                ULONG_PTR v = sp[i];
+                if (v >= 0x140000000UL && v < 0x150000000UL)
+                    ERR_(seh)( "  rsp+0x%03x: %016lx (PE)\n", i*8, (long)v );
+                else
+                    ERR_(seh)( "  rsp+0x%03x: %016lx\n", i*8, (long)v );
+            }
+        }
+    }
+
     setup_raise_exception( ucontext, &rec, &context );
 }
 
