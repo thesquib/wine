@@ -1160,8 +1160,19 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     {
         ret = set_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_AMD64 );
 #ifdef __APPLE__
+        /* PROTON_DARWIN: Rosetta x86_64 doesn't support setting hardware
+         * debug registers. Plain Wine returns STATUS_UNSUCCESSFUL which
+         * breaks anti-tamper integrity checks in Themida-protected
+         * games (Elden Ring's Dantelion2 sentinel checks DR0-DR7 set
+         * succeeded). Fake success so the caller proceeds; we still
+         * update the cached values so subsequent GetThreadContext
+         * round-trips return what was set. CrossOver does the same. */
         if ((flags & CONTEXT_DEBUG_REGISTERS) && (ret == STATUS_UNSUCCESSFUL))
-            WARN_(seh)( "Setting debug registers is not supported under Rosetta\n" );
+        {
+            WARN_(seh)( "Setting debug registers is not supported under Rosetta, faking success\n" );
+            ret = STATUS_SUCCESS;
+            self = TRUE;
+        }
 #endif
         if (ret || !self) return ret;
         if (flags & CONTEXT_DEBUG_REGISTERS)
@@ -1962,6 +1973,87 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
 }
 
 
+#ifdef __APPLE__
+/* PROTON_DARWIN: ports of CrossOver's Rosetta-aware fault handlers.
+ * Rosetta on Apple Silicon doesn't natively support several x86_64
+ * instructions; without these, anti-tamper code in Themida/VMProtect-
+ * protected games (Elden Ring, FromSoft titles) fails its integrity
+ * checks and aborts. CrossOver wine 11.0 source has these patches
+ * (CW HACKs 20186, 23427); ported verbatim. */
+
+static BOOL sequoia_or_later = FALSE;
+
+/***********************************************************************
+ *           handle_cet_nop  (CW HACK 20186)
+ *
+ * RDSSPD/RDSSPQ (Intel CET shadow-stack reads) are NOPs on non-CET
+ * CPUs but Rosetta on Big Sur traps them as illegal-instruction. Skip
+ * past them so the program continues. (Sequoia Rosetta handles this
+ * natively, so the helper is a no-op there.)
+ */
+static inline BOOL handle_cet_nop( ucontext_t *sigcontext, CONTEXT *context )
+{
+    BYTE instr[16];
+    unsigned int i, prefix_count = 0;
+    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    for (i = 0; i < len; i++) switch (instr[i])
+    {
+    case 0x2e: case 0x36: case 0x3e: case 0x26:
+    case 0x40: case 0x41: case 0x42: case 0x43:
+    case 0x44: case 0x45: case 0x46: case 0x47:
+    case 0x48: case 0x49: case 0x4a: case 0x4b:
+    case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+    case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0xf0: case 0xf2: case 0xf3:
+        if (++prefix_count >= 15) return FALSE;
+        continue;
+    case 0x0f:
+        if (i == len - 1) return 0;
+        if (instr[i + 1] == 0x1E)  /* RDSSPD/RDSSPQ */
+        {
+            RIP_sig(sigcontext) += prefix_count + 3;
+            TRACE_(seh)( "skipped RDSSPD/RDSSPQ instruction\n" );
+            return TRUE;
+        }
+        return FALSE;
+    default:
+        return FALSE;
+    }
+    return FALSE;
+}
+
+/***********************************************************************
+ *           emulate_xgetbv  (CW HACK 23427)
+ *
+ * XGETBV (0F 01 D0) reads xcr0 / xstate-feature mask. Real Intel HW
+ * supports it in user mode (when OSXSAVE is set in CR4); Rosetta
+ * traps it as illegal-instruction. Anti-tamper VMs use it to
+ * fingerprint AVX/AVX-512 support. Emulate by setting eax to the
+ * appropriate xcr0 value (0xe7 with AVX-512 on Sequoia, 0x07
+ * earlier) and advancing RIP by 3.
+ */
+static inline BOOL emulate_xgetbv( ucontext_t *sigcontext, CONTEXT *context )
+{
+    BYTE instr[3];
+    unsigned int len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    if (len < 3 || instr[0] != 0x0f || instr[1] != 0x01 || instr[2] != 0xd0 ||
+        (RCX_sig(sigcontext) & 0xffffffff) != 0)
+        return FALSE;
+
+    RDX_sig(sigcontext) = 0;
+    if (sequoia_or_later)
+        RAX_sig(sigcontext) = 0xe7;  /* fpu/mmx, sse, avx, avx-512 */
+    else
+        RAX_sig(sigcontext) = 0x07;  /* fpu/mmx, sse */
+    RIP_sig(sigcontext) += 3;
+    TRACE_(seh)( "emulated an XGETBV instruction\n" );
+    return TRUE;
+}
+#endif
+
+
 /***********************************************************************
  *           is_privileged_instr
  *
@@ -2728,6 +2820,12 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         rec.ExceptionCode = EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
         break;
     case TRAP_x86_PRIVINFLT:   /* Invalid opcode exception */
+#ifdef __APPLE__
+        /* CW HACK 20186 - skip Intel CET RDSSPD/RDSSPQ that Rosetta traps */
+        if (handle_cet_nop( ucontext, &context.c )) return;
+        /* CW HACK 23427 - emulate XGETBV that Rosetta traps */
+        if (emulate_xgetbv( ucontext, &context.c )) return;
+#endif
         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
         break;
     case TRAP_x86_STKFLT:  /* Stack fault */
@@ -3252,6 +3350,12 @@ void signal_init_process(void)
     WOW_TEB *wow_teb = get_wow_teb( NtCurrentTeb() );
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
     void *ptr, *kernel_stack = (char *)thread_data->kernel_stack + kernel_stack_size;
+
+#ifdef __APPLE__
+    /* CW HACK 23427: macOS-version detection for XGETBV emulation. */
+    if (__builtin_available( macOS 15.0, * ))
+        sequoia_or_later = TRUE;
+#endif
 
     if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
     frame_size = offsetof( struct syscall_frame, xstate ) + xstate_size;
