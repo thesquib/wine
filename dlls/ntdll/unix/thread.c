@@ -1609,6 +1609,25 @@ NTSTATUS send_debug_event( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_c
  */
 NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance )
 {
+#if defined(__APPLE__) && defined(__x86_64__)
+    /* PROTON_DARWIN: ER's anti-tamper fires RaiseException(STATUS_FATAL_APP_EXIT)
+     * from a fall-through path past int 0x29 (and possibly other sites). When
+     * PROTON_ER_FATAL_EXIT_BYPASS=1 and the exception originates from ER's PE
+     * range, NtContinue past it instead of dispatching - the call site doesn't
+     * expect RaiseException to return, but the surrounding code is usually a
+     * defensive "give up" branch and survives a no-op return. */
+    if (first_chance && rec->ExceptionCode == 0x40000015UL /* STATUS_FATAL_APP_EXIT */)
+    {
+        ULONG_PTR addr = (ULONG_PTR)rec->ExceptionAddress;
+        if (addr >= 0x140000000UL && addr < 0x150000000UL && getenv( "PROTON_ER_FATAL_EXIT_BYPASS" ))
+        {
+            ERR_(seh)( "PROTON_ER_FATAL_EXIT_BYPASS: skipping STATUS_FATAL_APP_EXIT at %p (rip=%p)\n",
+                       (void *)addr, (void *)(ULONG_PTR)((CONTEXT *)context)->Rip );
+            return NtContinue( context, FALSE );
+        }
+    }
+#endif
+
     NTSTATUS status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
 
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
