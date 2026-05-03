@@ -2122,8 +2122,31 @@ void try_patch_dantelion( void )
     if (!getenv("PROTON_ER_DANTELION_PATCH")) return;
 
     /* Don't dereference the gate page until we know ER is mapped at
-     * preferred base. Quickest sniff: ER PE header at 0x140000000
-     * with "MZ" then PE\0\0 at e_lfanew. */
+     * preferred base AND the gate offset is within its image. Use
+     * NtQueryVirtualMemory at THREE addresses: image base header,
+     * panic_state, and the gate. All three must be MEM_COMMIT — that
+     * weeds out smaller images (Steam.exe, wineboot.exe, explorer.exe
+     * etc.) that load at 0x140000000 but don't extend to the gate
+     * offset (0x11f2ca4 from base ≈ 18 MB). Reading unmapped gate
+     * memory raises SIGBUS and corrupts wine. */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T ret_len;
+        const ULONG_PTR probe[3] = {
+            0x140000000UL,    /* PE header — every PE at this base has it */
+            0x143b4059cUL,    /* panic_state — in ER's .data */
+            0x1451f2ca4UL,    /* gate — in ER's .text */
+        };
+        unsigned i;
+        for (i = 0; i < 3; i++)
+        {
+            if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)probe[i],
+                                      MemoryBasicInformation, &mbi, sizeof(mbi),
+                                      &ret_len ) != 0)
+                return;
+            if (mbi.State != MEM_COMMIT) return;
+        }
+    }
     const unsigned char *base = (const unsigned char *)0x140000000UL;
     if (base[0] != 'M' || base[1] != 'Z') return;
 
@@ -3067,58 +3090,76 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             }
 
 
-            ERR_(seh)( "PE-AV at rip=%p%s%s (faultaddr=%p)\n",
-                       rip,
-                       is_deadba ? " [DEADBA SENTINEL]" : "",
-                       rip_is_null ? " [NULL-CALL]" : "",
-                       (void *)rec.ExceptionInformation[1] );
-            if (rip_in_pe)
-                ERR_(seh)( "  insn bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                           rip[0], rip[1], rip[2], rip[3], rip[4], rip[5],
-                           rip[6], rip[7], rip[8], rip[9], rip[10], rip[11] );
-            const ULONG_PTR rcx = RCX_sig(ucontext);
-            const ULONG_PTR rdx = RDX_sig(ucontext);
-            const ULONG_PTR r8  = R8_sig(ucontext);
-            const ULONG_PTR r9  = R9_sig(ucontext);
-            const ULONG_PTR *sp = (const ULONG_PTR *)RSP_sig(ucontext);
-            int i;
-            ERR_(seh)( "register/stack capture follows (rip_in_pe=%d rip_is_null=%d is_deadba=%d)\n",
-                       rip_in_pe, rip_is_null, is_deadba );
-            ERR_(seh)( "  rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
-                       (long)RAX_sig(ucontext), (long)RBX_sig(ucontext), (long)rcx, (long)rdx );
-            ERR_(seh)( "  rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
-                       (long)RSI_sig(ucontext), (long)RDI_sig(ucontext),
-                       (long)RBP_sig(ucontext), (long)RSP_sig(ucontext) );
-            ERR_(seh)( "  r8 =%016lx r9 =%016lx r10=%016lx r11=%016lx\n",
-                       (long)r8, (long)r9, (long)R10_sig(ucontext), (long)R11_sig(ucontext) );
-            ERR_(seh)( "  r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
-                       (long)R12_sig(ucontext), (long)R13_sig(ucontext),
-                       (long)R14_sig(ucontext), (long)R15_sig(ucontext) );
-            for (i = 0; i < 4; i++)
+            /* PROTON_DARWIN: PE-AV diagnostic dump.
+             *
+             * CRITICAL: this block dereferences register-shaped values
+             * (rcx/rdx/r8/r9) and stack qwords (sp[i]) WITHOUT being
+             * able to validate them — which is the WHOLE POINT in
+             * diagnosing a crash. But on a healthy fault path (e.g.
+             * an SEH-handled AV) those reads can hit unmapped memory
+             * and fire SIGSEGV #2 on the already-occupied alt-stack →
+             * 'nested exception on signal stack' abort. ER's
+             * FD4JobWorker threads tripped this when their SEH-caught
+             * faults had wild register values.
+             *
+             * Default-OFF; opt in with PROTON_ER_VERBOSE_AV=1. The
+             * bypass-via-DEADBA path above does NOT need this block,
+             * so leaving it off here doesn't hurt the fix. */
+            if (getenv("PROTON_ER_VERBOSE_AV"))
             {
-                ULONG_PTR p = (i==0)?rcx:(i==1)?rdx:(i==2)?r8:r9;
-                static const char * const nm[4] = { "rcx", "rdx", "r8", "r9" };
-                if (p > 0x10000 && p < (ULONG_PTR)0x800000000000UL)
+                ERR_(seh)( "PE-AV at rip=%p%s%s (faultaddr=%p)\n",
+                           rip,
+                           is_deadba ? " [DEADBA SENTINEL]" : "",
+                           rip_is_null ? " [NULL-CALL]" : "",
+                           (void *)rec.ExceptionInformation[1] );
+                if (rip_in_pe)
+                    ERR_(seh)( "  insn bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                               rip[0], rip[1], rip[2], rip[3], rip[4], rip[5],
+                               rip[6], rip[7], rip[8], rip[9], rip[10], rip[11] );
+                const ULONG_PTR rcx = RCX_sig(ucontext);
+                const ULONG_PTR rdx = RDX_sig(ucontext);
+                const ULONG_PTR r8  = R8_sig(ucontext);
+                const ULONG_PTR r9  = R9_sig(ucontext);
+                const ULONG_PTR *sp = (const ULONG_PTR *)RSP_sig(ucontext);
+                int i;
+                ERR_(seh)( "register/stack capture follows (rip_in_pe=%d rip_is_null=%d is_deadba=%d)\n",
+                           rip_in_pe, rip_is_null, is_deadba );
+                ERR_(seh)( "  rax=%016lx rbx=%016lx rcx=%016lx rdx=%016lx\n",
+                           (long)RAX_sig(ucontext), (long)RBX_sig(ucontext), (long)rcx, (long)rdx );
+                ERR_(seh)( "  rsi=%016lx rdi=%016lx rbp=%016lx rsp=%016lx\n",
+                           (long)RSI_sig(ucontext), (long)RDI_sig(ucontext),
+                           (long)RBP_sig(ucontext), (long)RSP_sig(ucontext) );
+                ERR_(seh)( "  r8 =%016lx r9 =%016lx r10=%016lx r11=%016lx\n",
+                           (long)r8, (long)r9, (long)R10_sig(ucontext), (long)R11_sig(ucontext) );
+                ERR_(seh)( "  r12=%016lx r13=%016lx r14=%016lx r15=%016lx\n",
+                           (long)R12_sig(ucontext), (long)R13_sig(ucontext),
+                           (long)R14_sig(ucontext), (long)R15_sig(ucontext) );
+                for (i = 0; i < 4; i++)
                 {
-                    char buf[257]; int j;
-                    for (j = 0; j < 256; j++)
+                    ULONG_PTR p = (i==0)?rcx:(i==1)?rdx:(i==2)?r8:r9;
+                    static const char * const nm[4] = { "rcx", "rdx", "r8", "r9" };
+                    if (p > 0x10000 && p < (ULONG_PTR)0x800000000000UL)
                     {
-                        char c = ((const char *)p)[j];
-                        if (!c) break;
-                        buf[j] = (c >= 0x20 && c < 0x7f) ? c : '.';
+                        char buf[257]; int j;
+                        for (j = 0; j < 256; j++)
+                        {
+                            char c = ((const char *)p)[j];
+                            if (!c) break;
+                            buf[j] = (c >= 0x20 && c < 0x7f) ? c : '.';
+                        }
+                        buf[j] = 0;
+                        if (j >= 4) ERR_(seh)( "  arg %s -> \"%s\"\n", nm[i], buf );
                     }
-                    buf[j] = 0;
-                    if (j >= 4) ERR_(seh)( "  arg %s -> \"%s\"\n", nm[i], buf );
                 }
-            }
-            /* stack qword dump; cap at 32 to stay within current frame */
-            for (i = 0; i < 32 && sp; i++)
-            {
-                ULONG_PTR v = sp[i];
-                if (v >= 0x140000000UL && v < 0x150000000UL)
-                    ERR_(seh)( "  rsp+0x%03x: %016lx (PE)\n", i*8, (long)v );
-                else
-                    ERR_(seh)( "  rsp+0x%03x: %016lx\n", i*8, (long)v );
+                /* stack qword dump; cap at 32 to stay within current frame */
+                for (i = 0; i < 32 && sp; i++)
+                {
+                    ULONG_PTR v = sp[i];
+                    if (v >= 0x140000000UL && v < 0x150000000UL)
+                        ERR_(seh)( "  rsp+0x%03x: %016lx (PE)\n", i*8, (long)v );
+                    else
+                        ERR_(seh)( "  rsp+0x%03x: %016lx\n", i*8, (long)v );
+                }
             }
         }
     }
