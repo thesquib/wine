@@ -2054,6 +2054,128 @@ static inline BOOL emulate_xgetbv( ucontext_t *sigcontext, CONTEXT *context )
 #endif
 
 
+#ifdef __APPLE__
+/* PROTON_DARWIN: ER Dantelion-engine panic-gate runtime patcher.
+ *
+ * ER's panic-state global at 0x143b4059c gates the FromSoft DL_PANIC
+ * sentinel at eldenring.exe+0x1EB9989. The legitimate bump from 1 → 2
+ * happens at exactly one instruction stream:
+ *
+ *   0x1451f2c99: mov 0x143b4059c, %eax       ; eax = state
+ *   0x1451f2c9f: mov $2, %ecx
+ *   0x1451f2ca4: cmp $0xe, %r11               ; r11 must equal 14
+ *   0x1451f2ca8: cmove %ecx, %eax              ; iff equal, eax = 2
+ *   0x1451f2cab: mov %eax, 0x143b4059c        ; write back
+ *
+ * `r11` is the working register inside ER's Themida-style obfuscated
+ * VM bytecode. In our environment something computes a value !=14 and
+ * the bump never happens. CrossOver's proprietary cxcompatdb.so has
+ * an ER-specific runtime hack that we don't have. Equivalent fix:
+ * patch the cmp at 0x1451f2ca4 from `cmp $0xe, %r11` (4 bytes
+ * 49 83 fb 0e) to `cmp %r11, %r11` + nop (4d 39 db 90), making the
+ * cmove fire unconditionally.
+ *
+ * Idempotent: only patches when the original bytes match (so a
+ * relocated ER image or future ER patch won't get clobbered) and
+ * remembers via static flag. Also writes 2 to panic_state directly
+ * in case the gate has already run by the time we patch.
+ *
+ * Triggered from segv_handler entry, so first PE-range fault wakes
+ * the patcher. If the gate runs successfully before any fault, we
+ * never patch (and don't need to — ER won't panic). If the gate
+ * fails, ER's panic-detection eventually fires the deadba which
+ * is itself a PE-range fault — patcher kicks in then. */
+static volatile int dantelion_patched = 0;
+
+#include <pthread.h>
+
+void try_patch_dantelion( void );
+
+static void *dantelion_patch_thread( void *unused )
+{
+    int i;
+    (void)unused;
+    /* Poll for up to ~10 seconds for ER's PE to be mapped at preferred
+     * base, then patch. ER takes ~1-3s from process start to reach
+     * the gate insn, so 10s is generous. */
+    for (i = 0; i < 100 && !dantelion_patched; i++)
+    {
+        try_patch_dantelion();
+        if (dantelion_patched) break;
+        usleep( 100000 );  /* 100 ms */
+    }
+    return NULL;
+}
+
+void try_patch_dantelion( void )
+{
+    static const ULONG_PTR GATE_ADDR     = 0x1451f2ca4UL;
+    static const ULONG_PTR STATE_ADDR    = 0x143b4059cUL;
+    static const ULONG_PTR ANTITAMP_FLAG = 0x143c5b108UL;
+    static const unsigned char expected[4] = { 0x49, 0x83, 0xfb, 0x0e };
+    static const unsigned char patched [4] = { 0x4d, 0x39, 0xdb, 0x90 };
+    void *addr;
+    SIZE_T sz;
+    DWORD old;
+
+    if (dantelion_patched) return;
+    if (!getenv("PROTON_ER_DANTELION_PATCH")) return;
+
+    /* Don't dereference the gate page until we know ER is mapped at
+     * preferred base. Quickest sniff: ER PE header at 0x140000000
+     * with "MZ" then PE\0\0 at e_lfanew. */
+    const unsigned char *base = (const unsigned char *)0x140000000UL;
+    if (base[0] != 'M' || base[1] != 'Z') return;
+
+    /* Verify gate bytes match what we expect — guards against a
+     * future ER update or a different image at this base. */
+    const unsigned char *gate = (const unsigned char *)GATE_ADDR;
+    if (memcmp(gate, expected, 4) != 0)
+    {
+        /* Maybe already patched? Mark and bail. */
+        if (memcmp(gate, patched, 4) == 0) dantelion_patched = 1;
+        return;
+    }
+
+    /* Make the page writable, patch, restore. */
+    addr = (void *)GATE_ADDR;
+    sz = 4;
+    if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                PAGE_EXECUTE_READWRITE, &old )) return;
+
+    memcpy( (void *)GATE_ADDR, patched, 4 );
+    /* Belt-and-suspenders: also force panic_state = 2 immediately so
+     * any panic-detection that ran before this patch sees the right
+     * value. */
+    *(volatile DWORD *)STATE_ADDR = 2;
+
+    NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+
+    /* Clear bit 1 of the anti-tamper flag at 0x143c5b108. The
+     * eldenring.exe+0x148678 fastfail site does
+     * `testb $0x2, 0x143c5b108; je $skip` — clearing the bit makes
+     * the whole int 0x29 / RaiseException(STATUS_FATAL_APP_EXIT)
+     * block fall straight through to the post-fastfail code. */
+    addr = (void *)ANTITAMP_FLAG;
+    sz = 4;
+    if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                PAGE_READWRITE, &old ) == 0)
+    {
+        DWORD prev = *(volatile DWORD *)ANTITAMP_FLAG;
+        *(volatile DWORD *)ANTITAMP_FLAG = prev & ~(DWORD)0x2;
+        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+        ERR_(seh)( "Dantelion antitamp flag at 0x%lx cleared (was 0x%x now 0x%x)\n",
+                   ANTITAMP_FLAG, prev, prev & ~(DWORD)0x2 );
+    }
+
+    dantelion_patched = 1;
+
+    ERR_(seh)( "Dantelion gate patched at 0x%lx (cmp r11,r11+nop) and panic_state set to 2\n",
+               GATE_ADDR );
+}
+#endif
+
+
 /***********************************************************************
  *           is_privileged_instr
  *
@@ -2337,8 +2459,16 @@ static inline BOOL handle_interrupt( ucontext_t *sigcontext, EXCEPTION_RECORD *r
          * ER's caller falls through to the gentler RaiseException
          * path (mov $0x40000015 / call 0x142520454). */
         ULONG_PTR ripv = (ULONG_PTR)context->Rip;
+        /* PROTON_ER_INT29_BYPASS is a SEPARATE switch from
+         * PROTON_ER_DEADBA_BYPASS now. The fall-through past int 0x29
+         * leads directly to RaiseException(STATUS_FATAL_APP_EXIT)
+         * which terminates anyway, so the bypass is mostly useful for
+         * diagnostic - when set we skip and let ER's softer exception
+         * path run. Default (with only DEADBA_BYPASS set) lets the
+         * fastfail terminate just the offending thread, leaving main
+         * thread alive. */
         if (ripv >= 0x140000000UL && ripv < 0x150000000UL &&
-            getenv("PROTON_ER_DEADBA_BYPASS"))
+            getenv("PROTON_ER_INT29_BYPASS"))
         {
             ERR_(seh)( "INT 0x29 bypass at rip=%p (rcx=%lu)\n",
                        (void *)ripv, (unsigned long)context->Rcx );
@@ -2810,6 +2940,11 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
     save_context( &context, ucontext );
+
+#ifdef __APPLE__
+    /* PROTON_DARWIN: opportunistic Dantelion gate patch. Idempotent. */
+    try_patch_dantelion();
+#endif
 
     switch(TRAP_sig(ucontext))
     {
@@ -3355,6 +3490,7 @@ void signal_init_process(void)
     /* CW HACK 23427: macOS-version detection for XGETBV emulation. */
     if (__builtin_available( macOS 15.0, * ))
         sequoia_or_later = TRUE;
+
 #endif
 
     if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
