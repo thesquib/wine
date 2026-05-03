@@ -66,6 +66,7 @@
 #endif
 #ifdef __APPLE__
 # include <mach/mach.h>
+# include <sys/sysctl.h>
 /* _thread_set_tsd_base is private API for setting GSBASE, added in macOS 10.12.
  * It's a small thunk that sets %eax, zeroes %esi, and does the syscall (which clobbers
  * %rcx and %r11).
@@ -98,6 +99,17 @@ WINE_DEFAULT_DEBUG_CHANNEL(unwind);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
 
 #include "dwarf.h"
+
+#ifdef __APPLE__
+/* CW HACK 23427: macOS-version flag for XGETBV emulation in handle_xgetbv,
+ * set in signal_init_process via __builtin_available (signal-unsafe). */
+static BOOL sequoia_or_later = FALSE;
+
+/* CW HACK 24256: Rosetta delivers stale MXCSR via signal contexts. We detect
+ * the translated case once at process init (sysctl is not signal-safe) and
+ * read the live mxcsr register inside save_context / sigsys_handler. */
+static BOOL is_rosetta2 = FALSE;
+#endif
 
 static USHORT cs32_sel;  /* selector for %cs in 32-bit mode */
 static USHORT cs64_sel;  /* selector for %cs in 64-bit mode */
@@ -1021,6 +1033,14 @@ static void save_context( struct xcontext *xcontext, const ucontext_t *sigcontex
 
         context->ContextFlags |= CONTEXT_FLOATING_POINT;
         memcpy( &context->FltSave, FPU_sig(sigcontext), sizeof(context->FltSave) );
+#ifdef __APPLE__
+        /* CW HACK 24256: under Rosetta the MxCsr in the signal sigcontext is
+         * stale; the live register read from inside the handler is correct
+         * (on real Intel macOS the live read holds an unrelated default and
+         * we must keep the sigcontext value, hence the is_rosetta2 gate). */
+        if (is_rosetta2)
+            __asm__ volatile( "stmxcsr %0" : "=m" (context->FltSave.MxCsr) );
+#endif
         context->MxCsr = context->FltSave.MxCsr;
         if (xstate_extended_features && (xs = XState_sig(FPU_sig(sigcontext))))
         {
@@ -1980,8 +2000,6 @@ NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status 
  * protected games (Elden Ring, FromSoft titles) fails its integrity
  * checks and aborts. CrossOver wine 11.0 source has these patches
  * (CW HACKs 20186, 23427); ported verbatim. */
-
-static BOOL sequoia_or_later = FALSE;
 
 /***********************************************************************
  *           handle_cet_nop  (CW HACK 20186)
@@ -3374,6 +3392,18 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
 
 #ifdef __APPLE__
+/* CW HACK 24265: M3 Rosetta will restore MxCsr from the signal sigcontext on
+ * sigreturn, even after we've patched FPU_sig. We redirect the syscall return
+ * through this thunk which reloads MxCsr from amd64_thread_data->mxcsr (offset
+ * 0x33c) before continuing into the syscall dispatcher prolog tail. */
+extern void __restore_mxcsr_thunk(void);
+__ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
+                   "pushq %rcx\n\t"
+                   "movq %gs:0x30,%rcx\n\t"
+                   "ldmxcsr 0x33c(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
+                   "popq %rcx\n\t"
+                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
+
 /**********************************************************************
  *		sigsys_handler
  *
@@ -3401,6 +3431,26 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         frame->restore_flags |= CONTEXT_CONTROL;
     }
     RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
+
+    /* CW HACK 24265: under Rosetta the FPU sigcontext MxCsr is stale; the live
+     * register holds the correct value. Patch FPU_sig and arrange for the
+     * sigreturn-induced restore to reload from amd64_thread_data->mxcsr via
+     * the thunk above (M3 silicon ignores our FPU_sig overwrite otherwise). */
+    if (is_rosetta2 && FPU_sig(ucontext))
+    {
+        XMM_SAVE_AREA32 fpu;
+        unsigned int direct_mxcsr;
+        __asm__ volatile( "stmxcsr %0" : "=m" (direct_mxcsr) );
+        memcpy( &fpu, FPU_sig(ucontext), sizeof(fpu) );
+
+        if (direct_mxcsr != fpu.MxCsr)
+        {
+            fpu.MxCsr = direct_mxcsr;
+            memcpy( FPU_sig(ucontext), &fpu, sizeof(fpu) );
+            amd64_thread_data()->mxcsr = direct_mxcsr;
+            RIP_sig(ucontext) = (ULONG64)__restore_mxcsr_thunk;
+        }
+    }
 }
 #endif
 
@@ -3532,6 +3582,18 @@ void signal_init_process(void)
     if (__builtin_available( macOS 15.0, * ))
         sequoia_or_later = TRUE;
 
+    /* CW HACK 24256: cache sysctl.proc_translated since sysctlbyname is not
+     * signal-safe. Used by save_context + sigsys_handler to fix MXCSR under
+     * Rosetta 2, where the value embedded in the signal sigcontext is wrong
+     * but the live mxcsr register read inside the handler is correct. */
+    {
+        int translated = 0;
+        size_t size = sizeof(translated);
+        if (sysctlbyname( "sysctl.proc_translated", &translated, &size, NULL, 0 ) == -1)
+            is_rosetta2 = FALSE;
+        else
+            is_rosetta2 = !!translated;
+    }
 #endif
 
     if (user_shared_data->XState.Size) xstate_size = user_shared_data->XState.Size - sizeof(XSAVE_FORMAT);
