@@ -1623,6 +1623,57 @@ NTSTATUS get_thread_wow64_context( HANDLE handle, void *ctx, ULONG size )
 }
 
 
+#ifdef __APPLE__
+/* PROTON_DARWIN: opt-in trace for diagnosing nested-exception recursion in
+ * setup_raise_exception's CONTEXT-copy on Apple Silicon Rosetta. The user
+ * PE stack page can be unmapped at the moment Wine writes to it; Rosetta's
+ * _platform_memmove faults, SIGSEGV #2 fires on the alt-stack already in
+ * use, and virtual_setup_exception's nested-exception detector aborts the
+ * thread. With PROTON_ER_RAISE_TRACE=1 this prints the destination ranges
+ * via raw write(2) (signal-safe) so we can correlate with the abort. */
+static int proton_raise_trace = -1;
+static int proton_raise_trace_enabled(void)
+{
+    if (proton_raise_trace == -1)
+    {
+        const char *v = getenv( "PROTON_ER_RAISE_TRACE" );
+        proton_raise_trace = (v && v[0] && v[0] != '0') ? 1 : 0;
+    }
+    return proton_raise_trace;
+}
+
+/* signal-safe: format an unsigned hex value into buf, return chars written */
+static int proton_emit_hex( char *buf, size_t bufsize, unsigned long long val )
+{
+    char tmp[18];
+    int n = 0, i;
+    if (!val) { tmp[n++] = '0'; }
+    else while (val) { unsigned d = val & 0xf; tmp[n++] = d < 10 ? '0' + d : 'a' + d - 10; val >>= 4; }
+    if ((size_t)n + 2 >= bufsize) return 0;
+    buf[0] = '0'; buf[1] = 'x';
+    for (i = 0; i < n; i++) buf[2 + i] = tmp[n - 1 - i];
+    return 2 + n;
+}
+
+static void proton_emit_trace( const char *tag, unsigned long long a, unsigned long long b,
+                               unsigned long long c, unsigned long long d )
+{
+    char buf[256];
+    int n = 0;
+    while (tag[n] && n < 64) { buf[n] = tag[n]; n++; }
+    buf[n++] = ' '; buf[n++] = 'a'; buf[n++] = '=';
+    n += proton_emit_hex( buf + n, sizeof(buf) - n, a );
+    buf[n++] = ' '; buf[n++] = 'b'; buf[n++] = '=';
+    n += proton_emit_hex( buf + n, sizeof(buf) - n, b );
+    buf[n++] = ' '; buf[n++] = 'c'; buf[n++] = '=';
+    n += proton_emit_hex( buf + n, sizeof(buf) - n, c );
+    buf[n++] = ' '; buf[n++] = 'd'; buf[n++] = '=';
+    n += proton_emit_hex( buf + n, sizeof(buf) - n, d );
+    buf[n++] = '\n';
+    write( 2, buf, n );
+}
+#endif
+
 /***********************************************************************
  *           setup_raise_exception
  */
@@ -1667,8 +1718,26 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     rsp &= ~(ULONG_PTR)15;
     stack_size = rsp - ((rsp - sizeof(*stack) - xstate_size) & ~(ULONG_PTR)63);
     stack = virtual_setup_exception( (void *)rsp, stack_size, rec );
+#ifdef __APPLE__
+    if (proton_raise_trace_enabled())
+        proton_emit_trace( "[proton_raise] pre-copy",
+                           (unsigned long long)(uintptr_t)stack,
+                           (unsigned long long)stack_size,
+                           (unsigned long long)sizeof(*stack),
+                           (unsigned long long)rsp );
+#endif
     stack->rec               = *rec;
+#ifdef __APPLE__
+    if (proton_raise_trace_enabled())
+        proton_emit_trace( "[proton_raise] rec-done",
+                           (unsigned long long)(uintptr_t)&stack->context,
+                           (unsigned long long)sizeof(stack->context), 0, 0 );
+#endif
     stack->context           = *context;
+#ifdef __APPLE__
+    if (proton_raise_trace_enabled())
+        proton_emit_trace( "[proton_raise] context-done", 0, 0, 0, 0 );
+#endif
     stack->machine_frame.rip = context->Rip;
     stack->machine_frame.rsp = context->Rsp;
 
@@ -2983,6 +3052,19 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     save_context( &context, ucontext );
 
 #ifdef __APPLE__
+    /* PROTON_DARWIN: detect recursive SIGSEGV (alt-stack already in use).
+     * If we re-enter segv_handler while the interrupted RSP is on the alt-
+     * stack itself, the previous handler invocation tripped during its
+     * own work (typically setup_raise_exception's CONTEXT-copy faulting
+     * via Rosetta memmove on an unmapped user PE stack page). Logged
+     * unconditionally because seeing this at all is news. */
+    if (is_inside_signal_stack( (void *)RSP_sig(ucontext) ))
+        proton_emit_trace( "[proton_raise] RECURSIVE-SEGV",
+                           (unsigned long long)(uintptr_t)siginfo->si_addr,
+                           (unsigned long long)RIP_sig(ucontext),
+                           (unsigned long long)RSP_sig(ucontext),
+                           (unsigned long long)TRAP_sig(ucontext) );
+
     /* PROTON_DARWIN: opportunistic Dantelion gate patch. Idempotent. */
     try_patch_dantelion();
 #endif
