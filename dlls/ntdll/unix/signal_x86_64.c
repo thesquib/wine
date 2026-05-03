@@ -2254,33 +2254,42 @@ void try_patch_dantelion( void )
                                 PAGE_EXECUTE_READWRITE, &old )) return;
 
     memcpy( (void *)GATE_ADDR, patched, 4 );
-    /* Belt-and-suspenders: also force panic_state = 2 immediately so
-     * any panic-detection that ran before this patch sees the right
-     * value. */
-    *(volatile DWORD *)STATE_ADDR = 2;
-
     NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
 
-    /* Clear bit 1 of the anti-tamper flag at 0x143c5b108. The
-     * eldenring.exe+0x148678 fastfail site does
-     * `testb $0x2, 0x143c5b108; je $skip` — clearing the bit makes
-     * the whole int 0x29 / RaiseException(STATUS_FATAL_APP_EXIT)
-     * block fall straight through to the post-fastfail code. */
-    addr = (void *)ANTITAMP_FLAG;
-    sz = 4;
-    if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
-                                PAGE_READWRITE, &old ) == 0)
+    /* Secondary patcher actions are opt-in — they were tried as
+     * belt-and-suspenders but observably push ER into a clean-exit
+     * code path (panic_state=2 reads as "panic already handled, run
+     * cleanup", so ER tears down before reaching CreateCommittedResource).
+     * Only run them when PROTON_ER_DANTELION_FORCE_STATE=1 is set. */
+    if (getenv( "PROTON_ER_DANTELION_FORCE_STATE" ))
     {
-        DWORD prev = *(volatile DWORD *)ANTITAMP_FLAG;
-        *(volatile DWORD *)ANTITAMP_FLAG = prev & ~(DWORD)0x2;
-        NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
-        ERR_(seh)( "Dantelion antitamp flag at 0x%lx cleared (was 0x%x now 0x%x)\n",
-                   ANTITAMP_FLAG, prev, prev & ~(DWORD)0x2 );
+        addr = (void *)STATE_ADDR;
+        sz = 4;
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                    PAGE_READWRITE, &old ) == 0)
+        {
+            *(volatile DWORD *)STATE_ADDR = 2;
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            ERR_(seh)( "Dantelion panic_state at 0x%lx forced to 2 (FORCE_STATE)\n",
+                       STATE_ADDR );
+        }
+
+        addr = (void *)ANTITAMP_FLAG;
+        sz = 4;
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                    PAGE_READWRITE, &old ) == 0)
+        {
+            DWORD prev = *(volatile DWORD *)ANTITAMP_FLAG;
+            *(volatile DWORD *)ANTITAMP_FLAG = prev & ~(DWORD)0x2;
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            ERR_(seh)( "Dantelion antitamp flag at 0x%lx cleared (was 0x%x now 0x%x) (FORCE_STATE)\n",
+                       ANTITAMP_FLAG, prev, prev & ~(DWORD)0x2 );
+        }
     }
 
     dantelion_patched = 1;
 
-    ERR_(seh)( "Dantelion gate patched at 0x%lx (cmp r11,r11+nop) and panic_state set to 2\n",
+    ERR_(seh)( "Dantelion gate patched at 0x%lx (cmp r11,r11+nop)\n",
                GATE_ADDR );
 }
 #endif
