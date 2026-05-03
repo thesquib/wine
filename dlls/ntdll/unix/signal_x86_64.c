@@ -3483,18 +3483,6 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 
 
 #ifdef __APPLE__
-/* CW HACK 24265: M3 Rosetta will restore MxCsr from the signal sigcontext on
- * sigreturn, even after we've patched FPU_sig. We redirect the syscall return
- * through this thunk which reloads MxCsr from amd64_thread_data->mxcsr (offset
- * 0x33c) before continuing into the syscall dispatcher prolog tail. */
-extern void __restore_mxcsr_thunk(void);
-__ASM_GLOBAL_FUNC( __restore_mxcsr_thunk,
-                   "pushq %rcx\n\t"
-                   "movq %gs:0x30,%rcx\n\t"
-                   "ldmxcsr 0x33c(%rcx)\n\t"  /* amd64_thread_data()->mxcsr */
-                   "popq %rcx\n\t"
-                   "jmp " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_prolog_end") );
-
 /**********************************************************************
  *		sigsys_handler
  *
@@ -3522,26 +3510,6 @@ static void sigsys_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         frame->restore_flags |= CONTEXT_CONTROL;
     }
     RIP_sig(ucontext) = (ULONG64)__wine_syscall_dispatcher_prolog_end_ptr;
-
-    /* CW HACK 24265: under Rosetta the FPU sigcontext MxCsr is stale; the live
-     * register holds the correct value. Patch FPU_sig and arrange for the
-     * sigreturn-induced restore to reload from amd64_thread_data->mxcsr via
-     * the thunk above (M3 silicon ignores our FPU_sig overwrite otherwise). */
-    if (is_rosetta2 && FPU_sig(ucontext))
-    {
-        XMM_SAVE_AREA32 fpu;
-        unsigned int direct_mxcsr;
-        __asm__ volatile( "stmxcsr %0" : "=m" (direct_mxcsr) );
-        memcpy( &fpu, FPU_sig(ucontext), sizeof(fpu) );
-
-        if (direct_mxcsr != fpu.MxCsr)
-        {
-            fpu.MxCsr = direct_mxcsr;
-            memcpy( FPU_sig(ucontext), &fpu, sizeof(fpu) );
-            amd64_thread_data()->mxcsr = direct_mxcsr;
-            RIP_sig(ucontext) = (ULONG64)__restore_mxcsr_thunk;
-        }
-    }
 }
 #endif
 
