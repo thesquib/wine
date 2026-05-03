@@ -3687,6 +3687,16 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
             size -= offset;
         }
 
+#ifdef __APPLE__
+        /* PROTON_DARWIN: PE image just mapped — early injection point
+         * for the ER Dantelion patcher. Idempotent and noop unless
+         * PROTON_ER_DANTELION_PATCH is set + the image is ER's. */
+        {
+            extern void try_patch_dantelion( void );
+            try_patch_dantelion();
+        }
+#endif
+
         image_info->base = wine_server_client_ptr( view->base );
         SERVER_START_REQ( map_image_view )
         {
