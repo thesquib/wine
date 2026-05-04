@@ -2289,6 +2289,26 @@ void try_patch_dantelion( void )
      * NOTE: previous design targeted the wrong address. Static disassembly
      * had to be redone with correct PE section mapping (delta 0x140000a00,
      * not 0x140000600 as initially assumed). */
+    /* PROTON_DARWIN: PANIC_TRACE - plant int3 at panic_real entry so we
+     * can identify which call site fires first. Each int3 hit logs the
+     * caller and tries to continue; for sites with real code after the
+     * call's int3+nop the caller resumes, otherwise faults soon. */
+    if (getenv( "PROTON_ER_PANIC_TRACE" ))
+    {
+        static const ULONG_PTR PANIC_REAL_ADDR = 0x142541bb8UL;
+        addr = (void *)PANIC_REAL_ADDR;
+        sz = 1;
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                    PAGE_EXECUTE_READWRITE, &old ) == 0)
+        {
+            unsigned char prev = *(volatile unsigned char *)PANIC_REAL_ADDR;
+            *(volatile unsigned char *)PANIC_REAL_ADDR = 0xcc;
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            ERR_(seh)( "PANIC_TRACE: planted int3 at panic_real entry 0x%lx (was 0x%02x)\n",
+                       PANIC_REAL_ADDR, prev );
+        }
+    }
+
     if (getenv( "PROTON_ER_PANIC2_PATCH" ))
     {
         static const ULONG_PTR JE_ADDR = 0x142541c5fUL;
@@ -3414,6 +3434,39 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     struct xcontext context;
 
     if (handle_syscall_trap( ucontext, siginfo )) return;
+
+#if defined(__APPLE__)
+    /* PROTON_DARWIN: panic-trace mode. When PROTON_ER_PANIC_TRACE=1 plants
+     * int3 at panic_real entry (0x142541bb8), this catches the SIGTRAP and
+     * logs the caller's return address (top of stack at function entry, which
+     * is the address right after the `call panic_real` instruction in ER).
+     * Then advances RIP past panic_real by setting RAX=0 and returning via
+     * the saved return address. Caller's `int3` after the call still fires
+     * unless we also skip 2 bytes; that's per-site so for now we just log
+     * each panic_real call - process will die, but log shows which call site
+     * fired first under our env. */
+    if (TRAP_sig(ucontext) == TRAP_x86_BPTFLT)
+    {
+        ULONG_PTR rip = RIP_sig(ucontext) - 1;  /* int3 already advanced RIP */
+        if (rip == 0x142541bb8UL)
+        {
+            ULONG_PTR rsp = RSP_sig(ucontext);
+            ULONG_PTR caller_ret = *(volatile ULONG_PTR *)rsp;
+            ERR_(seh)( "PANIC_TRACE: panic_real (0x142541bb8) called from caller-ret-addr 0x%lx (callsite likely 0x%lx)\n",
+                       caller_ret, caller_ret - 5 );
+            /* Advance past panic_real: pop return address, set rax=0, jump to caller */
+            RAX_sig(ucontext) = 0;
+            RSP_sig(ucontext) = rsp + 8;
+            /* Advance return RIP past the immediately-following int3+nop pair (2 bytes)
+             * so the caller's `call panic; int3; nop` becomes effectively a no-op.
+             * For call sites where the post-int3 bytes are obfuscated this will
+             * fault soon after, but the log line is what we need first. */
+            RIP_sig(ucontext) = caller_ret + 2;
+            leave_handler( ucontext );
+            return;
+        }
+    }
+#endif
 
     rec.ExceptionAddress = (void *)RIP_sig(ucontext);
     save_context( &context, ucontext );
