@@ -2299,6 +2299,7 @@ void try_patch_dantelion( void )
             0x142541bb8UL,  /* panic_real entry */
             0x142548660UL,  /* die_helper candidate entry 1 */
             0x142548665UL,  /* die_helper candidate entry 2 */
+            0x142520700UL,  /* die_wrapper that itself calls die_helper */
         };
         unsigned i;
         for (i = 0; i < sizeof(TRACE_ADDRS) / sizeof(TRACE_ADDRS[0]); i++)
@@ -3481,12 +3482,13 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * find the EXTERNAL caller that triggered entry into the die chain.
          * These addresses correspond to integrity-check funnel function entries
          * identified via static analysis (22 direct call xrefs found). */
-        if (rip == 0x142548660UL || rip == 0x142548665UL)
+        if (rip == 0x142548660UL || rip == 0x142548665UL || rip == 0x142520700UL)
         {
             ULONG_PTR rsp = RSP_sig(ucontext);
             ULONG_PTR caller_ret = *(volatile ULONG_PTR *)rsp;
-            ERR_(seh)( "PANIC_TRACE: die_helper (0x%lx) called from caller-ret-addr 0x%lx (callsite likely 0x%lx)\n",
-                       rip, caller_ret, caller_ret - 5 );
+            const char *label = (rip == 0x142520700UL) ? "die_wrapper_700" : "die_helper";
+            ERR_(seh)( "PANIC_TRACE: %s (0x%lx) called from caller-ret-addr 0x%lx (callsite likely 0x%lx)\n",
+                       label, rip, caller_ret, caller_ret - 5 );
             /* Don't try to continue - the helper is a dead end. Just skip past
              * its first instruction so the next int3 (from a different call site)
              * can fire. We pop the return addr and jump straight to caller. */
