@@ -2256,30 +2256,53 @@ void try_patch_dantelion( void )
     memcpy( (void *)GATE_ADDR, patched, 4 );
     NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
 
-    /* PROTON_DARWIN: patch the second panic helper at +0x25486AB.
-     * Field test (er-trace12.log) showed this site fires after the
-     * Dantelion gate is already patched, with the call chain:
-     *   ER code -> panic_helper@~+0x25486AB
-     *           -> RaiseException(0x40000015)   [+0x25486AB]
-     *           -> NtTerminateProcess(self, 3)  [+0x25486B5]
-     * The helper occupies at least 10 bytes; patching the byte at the
-     * RaiseException call site to 0xc3 (RET) makes the helper return
-     * to its caller without dying. Caller sees a clean return; ER
-     * continues. Gated on PROTON_ER_PANIC2_PATCH so it is opt-in. */
+    /* PROTON_DARWIN: patch the conditional inside ER's second panic helper
+     * (function entry 0x142548652). Static disassembly shows:
+     *
+     *   142548652: <prologue: xor esi,esi; mov [rsp+8],rbx; push rdi; sub rsp,0x20>
+     *   14254865e: mov ebx, ecx                  ; save input parameter
+     *   142548660: mov ecx, 3
+     *   142548665: call 0x142549f90              ; some hash/compute helper, returns
+     *   ...computation...
+     *   1425486b2: mov ecx, 3
+     *   1425486b7: call 0x142549fe4              ; small leaf helper, returns
+     *   1425486bc: test rbx, rbx
+     *   1425486bf: jne  0x1425486ce              ; <-- DEATH BRANCH if rbx != 0
+     *   1425486c1: xor eax, eax                  ; clean return path: return 0
+     *   1425486c3: <epilogue + ret>
+     *   ...
+     *   1425486d9: call qword ptr [rip+0x467411] ; <-- ACTUAL DEATH (indirect call
+     *                                              through fnptr table - what
+     *                                              terminates the process)
+     *
+     * Patching the `jne 0x1425486ce` (bytes 0x75 0x0d at virtual 0x1425486bf)
+     * to two NOPs (0x90 0x90) makes the function always fall through to the
+     * clean return path. Caller gets rax=0 back; ER continues without dying.
+     * This is the MINIMAL surgical fix - the helper still runs its normal
+     * inner work, just never reaches the indirect death call. */
     if (getenv( "PROTON_ER_PANIC2_PATCH" ))
     {
-        static const ULONG_PTR PANIC2_ADDR = 0x1425486abUL;
-        unsigned char ret_op = 0xc3;
-        addr = (void *)PANIC2_ADDR;
-        sz = 1;
+        static const ULONG_PTR JNE_ADDR = 0x1425486bfUL;
+        addr = (void *)JNE_ADDR;
+        sz = 2;
         if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
                                     PAGE_EXECUTE_READWRITE, &old ) == 0)
         {
-            unsigned char prev = *(volatile unsigned char *)PANIC2_ADDR;
-            *(volatile unsigned char *)PANIC2_ADDR = ret_op;
+            unsigned char prev0 = *(volatile unsigned char *)JNE_ADDR;
+            unsigned char prev1 = *(volatile unsigned char *)(JNE_ADDR + 1);
+            if (prev0 == 0x75 && prev1 == 0x0d)
+            {
+                *(volatile unsigned char *)JNE_ADDR       = 0x90;
+                *(volatile unsigned char *)(JNE_ADDR + 1) = 0x90;
+                ERR_(seh)( "Dantelion panic2 helper jne at 0x%lx patched to NOP NOP (was 75 0d) (PANIC2_PATCH)\n",
+                           JNE_ADDR );
+            }
+            else
+            {
+                ERR_(seh)( "Dantelion panic2 helper jne at 0x%lx unexpected bytes %02x %02x; not patching\n",
+                           JNE_ADDR, prev0, prev1 );
+            }
             NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
-            ERR_(seh)( "Dantelion panic2 helper at 0x%lx patched to RET (was 0x%02x now 0xc3) (PANIC2_PATCH)\n",
-                       PANIC2_ADDR, prev );
         }
     }
 
