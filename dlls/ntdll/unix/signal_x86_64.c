@@ -2399,6 +2399,7 @@ void try_patch_dantelion( void )
             0x142548660UL,  /* die_helper candidate entry 1 */
             0x142548665UL,  /* die_helper candidate entry 2 */
             0x142520700UL,  /* die_wrapper that itself calls die_helper */
+            0x141edc4c0UL,  /* inner cleanup helper - vtable-call site at +0x1e */
         };
         unsigned i;
         for (i = 0; i < sizeof(TRACE_ADDRS) / sizeof(TRACE_ADDRS[0]); i++)
@@ -3594,6 +3595,69 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
             RAX_sig(ucontext) = 0;
             RSP_sig(ucontext) = rsp + 8;
             RIP_sig(ucontext) = caller_ret;
+            leave_handler( ucontext );
+            return;
+        }
+        /* PROTON_DARWIN: vtable-resolution trap. The throw chain ends at
+         * 0x141edc4c0 (inner cleanup helper) which does:
+         *   141edc4c0: mov [rsp+8], rbx
+         *   141edc4c5: mov [rsp+0x10], rsi
+         *   141edc4ca: push rdi
+         *   141edc4cb: sub rsp, 0x20
+         *   141edc4cf: mov rdi, rcx                ; this = original arg
+         *   141edc4d2: mov rcx, [rcx+0x10]         ; rcx = obj at [this+0x10]
+         *   141edc4d6: test rcx, rcx
+         *   141edc4d9: je 0x141edc518
+         *   141edc4db: mov rax, [rcx]              ; rax = vtable
+         *   141edc4de: call [rax+0xa8]             ; <-- VIRTUAL CALL TARGET
+         *
+         * Plant int3 at 0x141edc4c0 (function entry). When it fires,
+         * read live rcx from sigcontext, deref rcx+0x10 (the obj),
+         * deref [obj] (vtable), and read [vtable+0xa8] (the actual virtual
+         * method address). Log all four. Then continue with int3 byte
+         * restored... actually we need to skip the int3 and re-execute
+         * the original first byte. Simpler: log + RIP advance over the
+         * cc + restore the original first byte to its real value. */
+        if (rip == 0x141edc4c0UL)
+        {
+            ULONG_PTR this_ptr = RCX_sig(ucontext);
+            ERR_(seh)( "VTABLE_TRACE: 0x141edc4c0 entry, rcx(this)=0x%lx\n", this_ptr );
+            if (this_ptr >= 0x100000UL)  /* sanity */
+            {
+                ULONG_PTR obj = *(volatile ULONG_PTR *)(this_ptr + 0x10);
+                ERR_(seh)( "VTABLE_TRACE:   [this+0x10] (obj) = 0x%lx\n", obj );
+                if (obj >= 0x100000UL)
+                {
+                    ULONG_PTR vtbl = *(volatile ULONG_PTR *)obj;
+                    ERR_(seh)( "VTABLE_TRACE:   [obj] (vtbl) = 0x%lx\n", vtbl );
+                    if (vtbl >= 0x140000000UL && vtbl < 0x150000000UL)
+                    {
+                        ULONG_PTR target = *(volatile ULONG_PTR *)(vtbl + 0xa8);
+                        ERR_(seh)( "VTABLE_TRACE:   [vtbl+0xa8] (virtual method target) = 0x%lx\n", target );
+                        /* also log a couple of other vtable slots for context */
+                        ULONG_PTR slot00 = *(volatile ULONG_PTR *)(vtbl + 0x00);
+                        ULONG_PTR slot08 = *(volatile ULONG_PTR *)(vtbl + 0x08);
+                        ULONG_PTR slot10 = *(volatile ULONG_PTR *)(vtbl + 0x10);
+                        ULONG_PTR slota0 = *(volatile ULONG_PTR *)(vtbl + 0xa0);
+                        ULONG_PTR slotb0 = *(volatile ULONG_PTR *)(vtbl + 0xb0);
+                        ERR_(seh)( "VTABLE_TRACE:   vtbl[0]=0x%lx [+8]=0x%lx [+10]=0x%lx [+a0]=0x%lx [+b0]=0x%lx\n",
+                                   slot00, slot08, slot10, slota0, slotb0 );
+                    }
+                }
+            }
+            /* The int3 we planted overwrote the first byte of the function
+             * (originally 0x48 from `mov [rsp+8], rbx`). We can't easily
+             * re-execute the real instruction in-place. Best option: skip
+             * past the function entirely - pop return addr, set rax=0, jump
+             * to caller's return point. The function's job (cleanup) won't
+             * happen but the calling code might survive. */
+            {
+                ULONG_PTR rsp = RSP_sig(ucontext);
+                ULONG_PTR caller_ret = *(volatile ULONG_PTR *)rsp;
+                RAX_sig(ucontext) = 0;
+                RSP_sig(ucontext) = rsp + 8;
+                RIP_sig(ucontext) = caller_ret;
+            }
             leave_handler( ucontext );
             return;
         }
