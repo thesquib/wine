@@ -2341,6 +2341,51 @@ void try_patch_dantelion( void )
                 NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
             }
         }
+
+        /* PROTON_DARWIN: PANIC3 also redirects ER's single C++-throw site for
+         * DLRF::DLRuntimeClassImpl<unsigned int, 1>. Disassembly + type_info
+         * decode + .text scan for `lea rdx, [rip+0x1c496e2]` found exactly
+         * ONE site at 0x141eb995f. Layout:
+         *
+         *   141eb995a: call 0x141ebb920          ; build exception object -> rax
+         *   141eb995f: lea rdx, [rip+0x1c496e2]  ; ThrowInfo for DLRuntimeClassImpl<uint,1>
+         *   141eb9966: mov rcx, rax              ; this = exception object
+         *   141eb9969: test rax, rax
+         *   141eb996c: je 0x141eb999a            ; if rax==0, skip throw (no-throw branch)
+         *   141eb996e: eb 55  jmp 0x141eb99c5    ; <-- ALWAYS jumps to throw if rax!=0
+         *
+         * The throw at 0x141eb99c5 ultimately calls _CxxThrowException which
+         * raises code 0xe06d7363. ER's surrounding code expects this throw
+         * to terminate the process; with PANIC3's filter neutered, the throw
+         * propagates as an unhandled exception and dies anyway.
+         *
+         * Patch the `eb 55` (jmp +0x55, target 0x141eb99c5) to `eb 2a`
+         * (jmp +0x2a, target 0x141eb999a). Both branches now go to the
+         * no-throw path. Whatever 0x141eb999a does is presumably safer
+         * than dying via unhandled C++ exception. */
+        {
+            static const ULONG_PTR JMP_TO_THROW = 0x141eb996eUL;
+            addr = (void *)JMP_TO_THROW;
+            sz = 2;
+            if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                        PAGE_EXECUTE_READWRITE, &old ) == 0)
+            {
+                unsigned char p0 = *(volatile unsigned char *)JMP_TO_THROW;
+                unsigned char p1 = *(volatile unsigned char *)(JMP_TO_THROW + 1);
+                if (p0 == 0xeb && p1 == 0x55)
+                {
+                    *(volatile unsigned char *)(JMP_TO_THROW + 1) = 0x2a;
+                    ERR_(seh)( "PANIC3: throw-jmp at 0x%lx redirected to no-throw branch (was eb 55 -> eb 2a)\n",
+                               JMP_TO_THROW );
+                }
+                else
+                {
+                    ERR_(seh)( "PANIC3: throw-jmp at 0x%lx unexpected bytes %02x %02x; not patching\n",
+                               JMP_TO_THROW, p0, p1 );
+                }
+                NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            }
+        }
     }
 
     /* PROTON_DARWIN: PANIC_TRACE - plant int3 at panic_real entry so we
