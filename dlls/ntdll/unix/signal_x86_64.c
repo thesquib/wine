@@ -2256,51 +2256,60 @@ void try_patch_dantelion( void )
     memcpy( (void *)GATE_ADDR, patched, 4 );
     NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
 
-    /* PROTON_DARWIN: patch the conditional inside ER's second panic helper
-     * (function entry 0x142548652). Static disassembly shows:
+    /* PROTON_DARWIN: patch the death gate inside ER's panic function at
+     * virtual 0x142541bb8. Static disassembly via Capstone shows:
      *
-     *   142548652: <prologue: xor esi,esi; mov [rsp+8],rbx; push rdi; sub rsp,0x20>
-     *   14254865e: mov ebx, ecx                  ; save input parameter
-     *   142548660: mov ecx, 3
-     *   142548665: call 0x142549f90              ; some hash/compute helper, returns
-     *   ...computation...
-     *   1425486b2: mov ecx, 3
-     *   1425486b7: call 0x142549fe4              ; small leaf helper, returns
-     *   1425486bc: test rbx, rbx
-     *   1425486bf: jne  0x1425486ce              ; <-- DEATH BRANCH if rbx != 0
-     *   1425486c1: xor eax, eax                  ; clean return path: return 0
-     *   1425486c3: <epilogue + ret>
+     *   142541bb8: <prologue> save rbx, args, push rbp, sub rsp,0x50
+     *   142541bce: mov ebx, ecx                  ; save input
+     *   ...PE-header integrity checks (MZ magic, PE magic, etc.)
+     *   142541c1a: call 0x142541cc0              ; sub-helper (returns)
+     *   142541c1f: <build args on stack>
+     *   142541c47: mov eax, 2
+     *   142541c50: mov [rbp-0x30], rcx (etc.)
+     *   142541c56: call 0x142541ab0              ; writes status to [rbp+0x20]
+     *   142541c5b: cmp dword [rbp+0x20], 0
+     *   142541c5f: je   0x142541c6c              ; <-- DEATH GATE if status==0
+     *   142541c61: mov rbx, [rsp+0x60]           ; clean return path
+     *   142541c66: add rsp, 0x50; pop rbp; ret
      *   ...
-     *   1425486d9: call qword ptr [rip+0x467411] ; <-- ACTUAL DEATH (indirect call
-     *                                              through fnptr table - what
-     *                                              terminates the process)
+     *   142541c6c: mov ecx, ebx
+     *   142541c6e: call 0x142541c74              ; <-- death sub-helper
+     *   142541c73: int3                          ; <-- never returns
      *
-     * Patching the `jne 0x1425486ce` (bytes 0x75 0x0d at virtual 0x1425486bf)
-     * to two NOPs (0x90 0x90) makes the function always fall through to the
-     * clean return path. Caller gets rax=0 back; ER continues without dying.
-     * This is the MINIMAL surgical fix - the helper still runs its normal
-     * inner work, just never reaches the indirect death call. */
+     * Patching `je 0x142541c6c` (bytes 0x74 0x0b at virtual 0x142541c5f) to
+     * two NOPs (0x90 0x90) makes the function always fall through to the
+     * clean return regardless of the [rbp+0x20] status value. Caller sees
+     * a normal return - no death sub-helper, no int3. ER continues.
+     *
+     * The check at [rbp+0x20] is set by the call to 0x142541ab0 (which
+     * itself reads ER's anti-tamper state). On macOS+Rosetta the state
+     * never matches what ER expects, so the function would always die.
+     * Bypassing the gate makes ER tolerate the integrity-state mismatch.
+     *
+     * NOTE: previous design targeted the wrong address. Static disassembly
+     * had to be redone with correct PE section mapping (delta 0x140000a00,
+     * not 0x140000600 as initially assumed). */
     if (getenv( "PROTON_ER_PANIC2_PATCH" ))
     {
-        static const ULONG_PTR JNE_ADDR = 0x1425486bfUL;
-        addr = (void *)JNE_ADDR;
+        static const ULONG_PTR JE_ADDR = 0x142541c5fUL;
+        addr = (void *)JE_ADDR;
         sz = 2;
         if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
                                     PAGE_EXECUTE_READWRITE, &old ) == 0)
         {
-            unsigned char prev0 = *(volatile unsigned char *)JNE_ADDR;
-            unsigned char prev1 = *(volatile unsigned char *)(JNE_ADDR + 1);
-            if (prev0 == 0x75 && prev1 == 0x0d)
+            unsigned char prev0 = *(volatile unsigned char *)JE_ADDR;
+            unsigned char prev1 = *(volatile unsigned char *)(JE_ADDR + 1);
+            if (prev0 == 0x74 && prev1 == 0x0b)
             {
-                *(volatile unsigned char *)JNE_ADDR       = 0x90;
-                *(volatile unsigned char *)(JNE_ADDR + 1) = 0x90;
-                ERR_(seh)( "Dantelion panic2 helper jne at 0x%lx patched to NOP NOP (was 75 0d) (PANIC2_PATCH)\n",
-                           JNE_ADDR );
+                *(volatile unsigned char *)JE_ADDR       = 0x90;
+                *(volatile unsigned char *)(JE_ADDR + 1) = 0x90;
+                ERR_(seh)( "Dantelion panic2 death-gate je at 0x%lx patched to NOP NOP (was 74 0b) (PANIC2_PATCH)\n",
+                           JE_ADDR );
             }
             else
             {
-                ERR_(seh)( "Dantelion panic2 helper jne at 0x%lx unexpected bytes %02x %02x; not patching\n",
-                           JNE_ADDR, prev0, prev1 );
+                ERR_(seh)( "Dantelion panic2 death-gate je at 0x%lx unexpected bytes %02x %02x; not patching\n",
+                           JE_ADDR, prev0, prev1 );
             }
             NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
         }
