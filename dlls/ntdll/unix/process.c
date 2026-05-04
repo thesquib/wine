@@ -972,6 +972,43 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
 
     TRACE("handle %p, exit_code %d, process_exiting %d.\n", handle, (int)exit_code, process_exiting);
 
+#if defined(__APPLE__) && defined(__x86_64__)
+    /* PROTON_DARWIN: log every NtTerminateProcess call unconditionally,
+     * with the calling RIP and exit code. Cheap diagnostic - lets us tell
+     * if ER's anti-tamper is calling ExitProcess from PE code rather than
+     * via NtRaiseException. When PROTON_ER_TERMINATE_BYPASS=1 and the
+     * caller's return-address chain points into ER's PE range, return
+     * STATUS_SUCCESS without actually terminating. */
+    if (handle == GetCurrentProcess())
+    {
+        ULONG_PTR caller_rip = (ULONG_PTR)__builtin_return_address(0);
+        ERR( "NtTerminateProcess: handle=self exit_code=0x%lx caller_ret=%p\n",
+                   (unsigned long)(LONG)exit_code, (void *)caller_rip );
+        /* Also walk a few stack frames to find the first PE-range RIP, since
+         * the immediate caller is RtlExitUserProcess/ExitProcess in ntdll. */
+        {
+            ULONG_PTR *fp = (ULONG_PTR *)__builtin_frame_address(0);
+            int depth;
+            for (depth = 0; depth < 16 && fp; depth++)
+            {
+                ULONG_PTR rip = fp[1];
+                if (rip >= 0x140000000UL && rip < 0x150000000UL)
+                {
+                    ERR( "NtTerminateProcess: ER caller frame[%d] rip=%p\n",
+                               depth, (void *)rip );
+                    if (getenv( "PROTON_ER_TERMINATE_BYPASS" ))
+                    {
+                        ERR( "PROTON_ER_TERMINATE_BYPASS: NOT terminating; returning STATUS_SUCCESS\n" );
+                        return STATUS_SUCCESS;
+                    }
+                    break;
+                }
+                fp = (ULONG_PTR *)fp[0];
+            }
+        }
+    }
+#endif
+
     if (handle == GetCurrentProcess())
     {
         if (process_termination_delay)
