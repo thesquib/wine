@@ -1643,23 +1643,31 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
     /* PROTON_DARWIN: log ER's PE frames when the DLRuntimeClassImpl<uint,1>
      * C++ exception fires (code 0xe06d7363, throwinfo=0x143B03048). Tells us
      * which ER PE address called _CxxThrowException so we can patch the
-     * throw site upstream. PROTON_ER_THROW_TRACE=1 to enable. */
-    if (first_chance && rec->ExceptionCode == 0xe06d7363UL &&
-        rec->NumberParameters >= 4 &&
-        rec->ExceptionInformation[2] == 0x143B03048UL &&
+     * throw site upstream. PROTON_ER_THROW_TRACE=1 to enable.
+     * Note: catches both first_chance=TRUE and FALSE since the dispatch path
+     * for C++ exceptions may bypass NtRaiseException on first chance. */
+    if (rec->ExceptionCode == 0xe06d7363UL &&
+        rec->NumberParameters >= 3 &&
         getenv( "PROTON_ER_THROW_TRACE" ))
     {
         CONTEXT *ctx = (CONTEXT *)context;
         ULONG_PTR rsp = ctx->Rsp;
-        int depth;
-        ERR_(seh)( "PROTON_ER_THROW_TRACE: DLRuntimeClassImpl<uint,1> thrown at rip=%p, rsp=%p\n",
+        int depth, found = 0;
+        ERR_(seh)( "PROTON_ER_THROW_TRACE: C++ exception code=0xe06d7363 first_chance=%d nparams=%lu, info[0]=0x%lx info[1]=0x%lx info[2]=0x%lx info[3]=0x%lx, rip=%p rsp=%p\n",
+                   first_chance, rec->NumberParameters,
+                   rec->ExceptionInformation[0], rec->ExceptionInformation[1],
+                   rec->ExceptionInformation[2],
+                   rec->NumberParameters >= 4 ? rec->ExceptionInformation[3] : 0,
                    (void *)(ULONG_PTR)ctx->Rip, (void *)rsp );
-        for (depth = 0; depth < 32; depth++)
+        for (depth = 0; depth < 64 && found < 12; depth++)
         {
             ULONG_PTR ret_addr = *(volatile ULONG_PTR *)(rsp + depth * 8);
             if (ret_addr >= 0x140000000UL && ret_addr < 0x150000000UL)
-                ERR_(seh)( "  ER frame[%d] ret=0x%lx (callsite ~0x%lx)\n",
-                           depth, ret_addr, ret_addr - 5 );
+            {
+                ERR_(seh)( "  ER frame[stack+0x%x] ret=0x%lx (callsite ~0x%lx)\n",
+                           depth * 8, ret_addr, ret_addr - 5 );
+                found++;
+            }
         }
     }
 #endif
