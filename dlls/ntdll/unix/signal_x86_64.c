@@ -2313,6 +2313,39 @@ void try_patch_dantelion( void )
             }
             NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
         }
+
+        /* PROTON_DARWIN: ER's caller of the panic uses a `call panic; int3`
+         * pattern. The int3 is meant to fire IF panic returns (panic is
+         * supposed to never return). Now that we made panic return cleanly
+         * via the death-gate patch, the int3 STILL fires and kills the
+         * thread (Wine's SIGTRAP handler raises STATUS_BREAKPOINT, ER's
+         * SEH chain doesn't catch it, thread dies). Patch the int3 (cc) at
+         * 0x1425486b5 to nop (90) so the thread continues past it. The
+         * byte after int3 is already a nop (90), so the thread executes
+         * two NOPs then proceeds to whatever comes next in the caller's
+         * code. */
+        {
+            static const ULONG_PTR INT3_ADDR = 0x1425486b5UL;
+            addr = (void *)INT3_ADDR;
+            sz = 1;
+            if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                        PAGE_EXECUTE_READWRITE, &old ) == 0)
+            {
+                unsigned char prev = *(volatile unsigned char *)INT3_ADDR;
+                if (prev == 0xcc)
+                {
+                    *(volatile unsigned char *)INT3_ADDR = 0x90;
+                    ERR_(seh)( "Dantelion panic2 int3 trap at 0x%lx patched to NOP (was cc) (PANIC2_PATCH)\n",
+                               INT3_ADDR );
+                }
+                else
+                {
+                    ERR_(seh)( "Dantelion panic2 int3 trap at 0x%lx unexpected byte %02x; not patching\n",
+                               INT3_ADDR, prev );
+                }
+                NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            }
+        }
     }
 
     /* Secondary patcher actions are opt-in — they were tried as
