@@ -2388,6 +2388,54 @@ void try_patch_dantelion( void )
         }
     }
 
+    /* PROTON_DARWIN: PANIC4 - bypass the throwing wrapper at 0x141eddcc2.
+     * Function does:
+     *   141eddcc2: sub rsp, 0x20         (4 bytes: 48 83 ec 20)
+     *   141eddcc6: mov rbx, rcx          (3 bytes)
+     *   141eddcc9: mov rcx, [rcx+8]      (4 bytes)
+     *   ...checks + virtual call [rdx+0xa8]...
+     *   141eddcfd: jmp [rax]             (tail-call via vtable slot 0 - also throws)
+     *
+     * The function is reached via vtable indirection during ER's anti-tamper
+     * cleanup. ALL paths lead to a virtual call that throws. Patch entry to
+     * `xor eax, eax; ret` (3 bytes: 33 c0 c3) overwriting the first 4 bytes
+     * of the prologue. Function returns 0 immediately - no virtuals fired,
+     * no throw.
+     *
+     * Caller's expectation: function returns boolean (al). With al=0 the
+     * caller's logic skips whatever depended on success. ER's anti-tamper
+     * cleanup is pre-empted; downstream code might continue to the next
+     * cleanup operation or skip cleanup entirely. */
+    if (getenv( "PROTON_ER_PANIC4_PATCH" ))
+    {
+        static const ULONG_PTR FN_ADDR = 0x141eddcc2UL;
+        addr = (void *)FN_ADDR;
+        sz = 4;
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                    PAGE_EXECUTE_READWRITE, &old ) == 0)
+        {
+            unsigned char p0 = *(volatile unsigned char *)FN_ADDR;
+            unsigned char p1 = *(volatile unsigned char *)(FN_ADDR + 1);
+            unsigned char p2 = *(volatile unsigned char *)(FN_ADDR + 2);
+            unsigned char p3 = *(volatile unsigned char *)(FN_ADDR + 3);
+            if (p0 == 0x48 && p1 == 0x83 && p2 == 0xec && p3 == 0x20)
+            {
+                *(volatile unsigned char *)(FN_ADDR + 0) = 0x33;  /* xor eax, eax */
+                *(volatile unsigned char *)(FN_ADDR + 1) = 0xc0;
+                *(volatile unsigned char *)(FN_ADDR + 2) = 0xc3;  /* ret */
+                *(volatile unsigned char *)(FN_ADDR + 3) = 0x90;  /* nop */
+                ERR_(seh)( "PANIC4: throw-wrapper at 0x%lx patched to xor eax,eax;ret;nop (was 48 83 ec 20)\n",
+                           FN_ADDR );
+            }
+            else
+            {
+                ERR_(seh)( "PANIC4: throw-wrapper at 0x%lx unexpected bytes %02x %02x %02x %02x; not patching\n",
+                           FN_ADDR, p0, p1, p2, p3 );
+            }
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+        }
+    }
+
     /* PROTON_DARWIN: PANIC_TRACE - plant int3 at panic_real entry so we
      * can identify which call site fires first. Each int3 hit logs the
      * caller and tries to continue; for sites with real code after the
@@ -3620,13 +3668,12 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * the original first byte. Simpler: log + RIP advance over the
          * cc + restore the original first byte to its real value. */
         /* PROTON_DARWIN: at 0x141eddce2 there's `call [rdx+0xa8]` - the virtual
-         * method dispatch from the function at 0x141eddcc2. THIS is where the
-         * throw fires (rdx holds the vtable). Plant int3 over the first byte
-         * of the call instruction (0xff -> 0xcc). When fired, read rdx live,
-         * log the resolved [rdx+0xa8] target, then advance RIP by 6 bytes
-         * (the size of the original `ff 92 a8 00 00 00` call) to skip the
-         * call entirely. Function continues to 0x141eddce8 with rax holding
-         * stale value from before - which 0x141eddce8 will overwrite. */
+         * method dispatch from the function at 0x141eddcc2. We previously
+         * tried skipping just the call and continuing to 0x141eddce8. That
+         * advanced past the throwing virtual but the function then runs
+         * `mov rax, [rbx]; ...; jmp [rax]` - a tail-call via vtable slot 0
+         * which ALSO throws. Bypassing the whole function instead is needed.
+         * (Kept this trap for one-shot logging of the vtable target.) */
         if (rip == 0x141eddce2UL)
         {
             ULONG_PTR rdx = RDX_sig(ucontext);
