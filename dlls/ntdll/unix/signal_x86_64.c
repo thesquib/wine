@@ -2256,6 +2256,33 @@ void try_patch_dantelion( void )
     memcpy( (void *)GATE_ADDR, patched, 4 );
     NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
 
+    /* PROTON_DARWIN: patch the second panic helper at +0x25486AB.
+     * Field test (er-trace12.log) showed this site fires after the
+     * Dantelion gate is already patched, with the call chain:
+     *   ER code -> panic_helper@~+0x25486AB
+     *           -> RaiseException(0x40000015)   [+0x25486AB]
+     *           -> NtTerminateProcess(self, 3)  [+0x25486B5]
+     * The helper occupies at least 10 bytes; patching the byte at the
+     * RaiseException call site to 0xc3 (RET) makes the helper return
+     * to its caller without dying. Caller sees a clean return; ER
+     * continues. Gated on PROTON_ER_PANIC2_PATCH so it is opt-in. */
+    if (getenv( "PROTON_ER_PANIC2_PATCH" ))
+    {
+        static const ULONG_PTR PANIC2_ADDR = 0x1425486abUL;
+        unsigned char ret_op = 0xc3;
+        addr = (void *)PANIC2_ADDR;
+        sz = 1;
+        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                    PAGE_EXECUTE_READWRITE, &old ) == 0)
+        {
+            unsigned char prev = *(volatile unsigned char *)PANIC2_ADDR;
+            *(volatile unsigned char *)PANIC2_ADDR = ret_op;
+            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            ERR_(seh)( "Dantelion panic2 helper at 0x%lx patched to RET (was 0x%02x now 0xc3) (PANIC2_PATCH)\n",
+                       PANIC2_ADDR, prev );
+        }
+    }
+
     /* Secondary patcher actions are opt-in — they were tried as
      * belt-and-suspenders but observably push ER into a clean-exit
      * code path (panic_state=2 reads as "panic already handled, run
