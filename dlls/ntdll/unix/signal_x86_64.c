@@ -2289,6 +2289,60 @@ void try_patch_dantelion( void )
      * NOTE: previous design targeted the wrong address. Static disassembly
      * had to be redone with correct PE section mapping (delta 0x140000a00,
      * not 0x140000600 as initially assumed). */
+    /* PROTON_DARWIN: PANIC3 - patch ER's MSVC C++ exception filter at
+     * 0x1424fbdb7. The filter checks if an exception is a real MSVC C++
+     * throw (magic 0xe06d7363 with NumberParameters=4 and a specific
+     * version magic). Real C++ exceptions trigger the die path
+     * (anti-tamper considers any C++ exception as tampering).
+     *
+     * Disassembly:
+     *   1424fbdcd: mov ecx, [rax+0x20]           ; load magic from exception
+     *   1424fbdd0: lea eax, [rcx - 0x19930520]
+     *   1424fbdd6: cmp eax, 2
+     *   1424fbdd9: jbe 0x1424fbdea               ; <-- DIE GATE 1
+     *   1424fbddb: cmp ecx, 0x1994000
+     *   1424fbde1: je  0x1424fbdea               ; <-- DIE GATE 2
+     *   1424fbde3: xor eax, eax                  ; clean return path
+     *   1424fbde5: add rsp, 0x28; ret
+     *   1424fbdea: call 0x142520700              ; die_wrapper -> dies
+     *
+     * Patch both jbe (76 0f) and je (74 07) to NOP NOP. Function always
+     * falls through to clean return 0 = "not a C++ exception we care
+     * about". The actual C++ exception then propagates through ER's
+     * normal SEH chain instead of triggering anti-tamper death. */
+    if (getenv( "PROTON_ER_PANIC3_PATCH" ))
+    {
+        struct { ULONG_PTR addr; unsigned char b0, b1; const char *name; } sites[] = {
+            { 0x1424fbdd9UL, 0x76, 0x0f, "jbe-die-gate" },
+            { 0x1424fbde1UL, 0x74, 0x07, "je-die-gate" },
+        };
+        unsigned i;
+        for (i = 0; i < sizeof(sites)/sizeof(sites[0]); i++)
+        {
+            addr = (void *)sites[i].addr;
+            sz = 2;
+            if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                        PAGE_EXECUTE_READWRITE, &old ) == 0)
+            {
+                unsigned char p0 = *(volatile unsigned char *)sites[i].addr;
+                unsigned char p1 = *(volatile unsigned char *)(sites[i].addr + 1);
+                if (p0 == sites[i].b0 && p1 == sites[i].b1)
+                {
+                    *(volatile unsigned char *)sites[i].addr       = 0x90;
+                    *(volatile unsigned char *)(sites[i].addr + 1) = 0x90;
+                    ERR_(seh)( "PANIC3: %s at 0x%lx patched to NOP NOP (was %02x %02x)\n",
+                               sites[i].name, sites[i].addr, p0, p1 );
+                }
+                else
+                {
+                    ERR_(seh)( "PANIC3: %s at 0x%lx unexpected bytes %02x %02x; not patching\n",
+                               sites[i].name, sites[i].addr, p0, p1 );
+                }
+                NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            }
+        }
+    }
+
     /* PROTON_DARWIN: PANIC_TRACE - plant int3 at panic_real entry so we
      * can identify which call site fires first. Each int3 hit logs the
      * caller and tries to continue; for sites with real code after the
