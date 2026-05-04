@@ -2400,6 +2400,7 @@ void try_patch_dantelion( void )
             0x142548665UL,  /* die_helper candidate entry 2 */
             0x142520700UL,  /* die_wrapper that itself calls die_helper */
             0x141edc4c0UL,  /* inner cleanup helper - vtable-call site at +0x1e */
+            0x141eddce2UL,  /* virtual call inside throwing fn - call [rdx+0xa8] */
         };
         unsigned i;
         for (i = 0; i < sizeof(TRACE_ADDRS) / sizeof(TRACE_ADDRS[0]); i++)
@@ -3618,6 +3619,37 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
          * restored... actually we need to skip the int3 and re-execute
          * the original first byte. Simpler: log + RIP advance over the
          * cc + restore the original first byte to its real value. */
+        /* PROTON_DARWIN: at 0x141eddce2 there's `call [rdx+0xa8]` - the virtual
+         * method dispatch from the function at 0x141eddcc2. THIS is where the
+         * throw fires (rdx holds the vtable). Plant int3 over the first byte
+         * of the call instruction (0xff -> 0xcc). When fired, read rdx live,
+         * log the resolved [rdx+0xa8] target, then advance RIP by 6 bytes
+         * (the size of the original `ff 92 a8 00 00 00` call) to skip the
+         * call entirely. Function continues to 0x141eddce8 with rax holding
+         * stale value from before - which 0x141eddce8 will overwrite. */
+        if (rip == 0x141eddce2UL)
+        {
+            ULONG_PTR rdx = RDX_sig(ucontext);
+            ERR_(seh)( "VTABLE_TRACE: 0x141eddce2 virtual call, rdx(vtable)=0x%lx\n", rdx );
+            if (rdx >= 0x140000000UL && rdx < 0x150000000UL)
+            {
+                ULONG_PTR target = *(volatile ULONG_PTR *)(rdx + 0xa8);
+                ULONG_PTR slot00 = *(volatile ULONG_PTR *)(rdx + 0x00);
+                ULONG_PTR slot08 = *(volatile ULONG_PTR *)(rdx + 0x08);
+                ULONG_PTR slot10 = *(volatile ULONG_PTR *)(rdx + 0x10);
+                ULONG_PTR slot98 = *(volatile ULONG_PTR *)(rdx + 0x98);
+                ULONG_PTR slota0 = *(volatile ULONG_PTR *)(rdx + 0xa0);
+                ULONG_PTR slotb0 = *(volatile ULONG_PTR *)(rdx + 0xb0);
+                ERR_(seh)( "VTABLE_TRACE:   [vtbl+0xa8] target = 0x%lx (the virtual that throws)\n", target );
+                ERR_(seh)( "VTABLE_TRACE:   vtbl[0]=0x%lx [+8]=0x%lx [+10]=0x%lx [+98]=0x%lx [+a0]=0x%lx [+b0]=0x%lx\n",
+                           slot00, slot08, slot10, slot98, slota0, slotb0 );
+            }
+            /* Skip the entire 6-byte `call [rdx+0xa8]` instruction. RIP is
+             * currently at 0x141eddce2 (the cc), advance to 0x141eddce8. */
+            RIP_sig(ucontext) = 0x141eddce8UL;
+            leave_handler( ucontext );
+            return;
+        }
         if (rip == 0x141edc4c0UL)
         {
             ULONG_PTR this_ptr = RCX_sig(ucontext);
