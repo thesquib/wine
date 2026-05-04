@@ -2314,34 +2314,67 @@ void try_patch_dantelion( void )
             NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
         }
 
-        /* PROTON_DARWIN: ER's caller of the panic uses a `call panic; int3`
-         * pattern. The int3 is meant to fire IF panic returns (panic is
-         * supposed to never return). Now that we made panic return cleanly
-         * via the death-gate patch, the int3 STILL fires and kills the
-         * thread (Wine's SIGTRAP handler raises STATUS_BREAKPOINT, ER's
-         * SEH chain doesn't catch it, thread dies). Patch the int3 (cc) at
-         * 0x1425486b5 to nop (90) so the thread continues past it. The
-         * byte after int3 is already a nop (90), so the thread executes
-         * two NOPs then proceeds to whatever comes next in the caller's
-         * code. */
+        /* PROTON_DARWIN: turn ER's die-helper bottom into a function-return.
+         *
+         * The bottom of the die-helper at 0x142548665 is a chain of "if
+         * integrity check failed, fastfail/RaiseException/panic":
+         *
+         *   142548690: mov ecx, 7
+         *   142548695: int 0x29                ; fastfail
+         *   142548697: <RaiseException(0x40000015) prep>
+         *   1425486a6: call 0x142520454        ; RaiseException
+         *   1425486ab: mov ecx, 3
+         *   1425486b0: call 0x142541d44        ; panic (we already neutered)
+         *   1425486b5: int3                    ; trap if panic returns
+         *   1425486b6: nop
+         *   1425486b7: <obfuscated/dead bytes - not real code>
+         *
+         * Even with the death-gate patch making panic return, the int3
+         * fires and the thread dies. NOPing int3 lets execution fall
+         * into the obfuscated bytes which decode as a wild call to
+         * 0x166b11004 (unmapped) - execute fault.
+         *
+         * Cleanest fix: replace `call panic; int3` (6 bytes at virtual
+         * 0x1425486b0) with `c3 90 90 90 90 90` (RET + 5 NOPs). The
+         * die-helper function this is in returns to its caller instead of
+         * dying. Caller of die-helper expected die-helper to never
+         * return; it'll get a clean return and continue with whatever
+         * follow-up logic it has. Better than dying on int3.
+         *
+         * Note: this also obviates the need to bypass int 0x29 (which is
+         * earlier in the function); when we make the bottom RET, the
+         * function is doomed to die earlier via int29 unless something
+         * jumps OVER int29. Looking at the disassembly, the path through
+         * int29 fires only if a specific test fails - test eax,eax+je
+         * skips it for one branch, but other branches go through it. So
+         * we may still see the int 0x29 path from some callers.
+         *
+         * If RET-at-call-site corrupts caller state again (different
+         * caller convention than the panic helper at 0x142548652 we
+         * tried earlier), we'd need to find the upstream conditional. */
         {
-            static const ULONG_PTR INT3_ADDR = 0x1425486b5UL;
-            addr = (void *)INT3_ADDR;
-            sz = 1;
+            static const ULONG_PTR DIE_RET_ADDR = 0x1425486b0UL;
+            unsigned char patch[6] = {0xc3, 0x90, 0x90, 0x90, 0x90, 0x90};
+            unsigned char expected_first = 0xe8;  /* call rel32 */
+            addr = (void *)DIE_RET_ADDR;
+            sz = 6;
             if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
                                         PAGE_EXECUTE_READWRITE, &old ) == 0)
             {
-                unsigned char prev = *(volatile unsigned char *)INT3_ADDR;
-                if (prev == 0xcc)
+                unsigned char prev0 = *(volatile unsigned char *)DIE_RET_ADDR;
+                unsigned char prev5 = *(volatile unsigned char *)(DIE_RET_ADDR + 5);
+                if (prev0 == expected_first && prev5 == 0xcc)
                 {
-                    *(volatile unsigned char *)INT3_ADDR = 0x90;
-                    ERR_(seh)( "Dantelion panic2 int3 trap at 0x%lx patched to NOP (was cc) (PANIC2_PATCH)\n",
-                               INT3_ADDR );
+                    int i;
+                    for (i = 0; i < 6; i++)
+                        *(volatile unsigned char *)(DIE_RET_ADDR + i) = patch[i];
+                    ERR_(seh)( "Dantelion panic2 call+int3 at 0x%lx patched to RET+5xNOP (was e8 .. cc) (PANIC2_PATCH)\n",
+                               DIE_RET_ADDR );
                 }
                 else
                 {
-                    ERR_(seh)( "Dantelion panic2 int3 trap at 0x%lx unexpected byte %02x; not patching\n",
-                               INT3_ADDR, prev );
+                    ERR_(seh)( "Dantelion panic2 call+int3 at 0x%lx unexpected bytes %02x..%02x; not patching\n",
+                               DIE_RET_ADDR, prev0, prev5 );
                 }
                 NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
             }
