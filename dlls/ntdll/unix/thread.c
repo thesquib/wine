@@ -1626,6 +1626,29 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
             return NtContinue( context, FALSE );
         }
     }
+
+    /* PROTON_DARWIN: log ER's PE frames when the DLRuntimeClassImpl<uint,1>
+     * C++ exception fires (code 0xe06d7363, throwinfo=0x143B03048). Tells us
+     * which ER PE address called _CxxThrowException so we can patch the
+     * throw site upstream. PROTON_ER_THROW_TRACE=1 to enable. */
+    if (first_chance && rec->ExceptionCode == 0xe06d7363UL &&
+        rec->NumberParameters >= 4 &&
+        rec->ExceptionInformation[2] == 0x143B03048UL &&
+        getenv( "PROTON_ER_THROW_TRACE" ))
+    {
+        CONTEXT *ctx = (CONTEXT *)context;
+        ULONG_PTR rsp = ctx->Rsp;
+        int depth;
+        ERR_(seh)( "PROTON_ER_THROW_TRACE: DLRuntimeClassImpl<uint,1> thrown at rip=%p, rsp=%p\n",
+                   (void *)(ULONG_PTR)ctx->Rip, (void *)rsp );
+        for (depth = 0; depth < 32; depth++)
+        {
+            ULONG_PTR ret_addr = *(volatile ULONG_PTR *)(rsp + depth * 8);
+            if (ret_addr >= 0x140000000UL && ret_addr < 0x150000000UL)
+                ERR_(seh)( "  ER frame[%d] ret=0x%lx (callsite ~0x%lx)\n",
+                           depth, ret_addr, ret_addr - 5 );
+        }
+    }
 #endif
 
     NTSTATUS status = send_debug_event( rec, context, first_chance, !(is_win64 || is_wow64() || is_old_wow64()) );
