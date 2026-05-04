@@ -2295,17 +2295,29 @@ void try_patch_dantelion( void )
      * call's int3+nop the caller resumes, otherwise faults soon. */
     if (getenv( "PROTON_ER_PANIC_TRACE" ))
     {
-        static const ULONG_PTR PANIC_REAL_ADDR = 0x142541bb8UL;
-        addr = (void *)PANIC_REAL_ADDR;
-        sz = 1;
-        if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
-                                    PAGE_EXECUTE_READWRITE, &old ) == 0)
+        static const ULONG_PTR TRACE_ADDRS[] = {
+            0x142541bb8UL,  /* panic_real entry */
+            0x142548660UL,  /* die_helper candidate entry 1 */
+            0x142548665UL,  /* die_helper candidate entry 2 */
+        };
+        unsigned i;
+        for (i = 0; i < sizeof(TRACE_ADDRS) / sizeof(TRACE_ADDRS[0]); i++)
         {
-            unsigned char prev = *(volatile unsigned char *)PANIC_REAL_ADDR;
-            *(volatile unsigned char *)PANIC_REAL_ADDR = 0xcc;
-            NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
-            ERR_(seh)( "PANIC_TRACE: planted int3 at panic_real entry 0x%lx (was 0x%02x)\n",
-                       PANIC_REAL_ADDR, prev );
+            ULONG_PTR a = TRACE_ADDRS[i];
+            addr = (void *)a;
+            sz = 1;
+            if (NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz,
+                                        PAGE_EXECUTE_READWRITE, &old ) == 0)
+            {
+                unsigned char prev = *(volatile unsigned char *)a;
+                if (prev != 0xcc)
+                {
+                    *(volatile unsigned char *)a = 0xcc;
+                    ERR_(seh)( "PANIC_TRACE: planted int3 at 0x%lx (was 0x%02x)\n",
+                               a, prev );
+                }
+                NtProtectVirtualMemory( NtCurrentProcess(), &addr, &sz, old, &old );
+            }
         }
     }
 
@@ -3462,6 +3474,25 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
              * For call sites where the post-int3 bytes are obfuscated this will
              * fault soon after, but the log line is what we need first. */
             RIP_sig(ucontext) = caller_ret + 2;
+            leave_handler( ucontext );
+            return;
+        }
+        /* PROTON_DARWIN: also trace the die-helper entry candidates so we can
+         * find the EXTERNAL caller that triggered entry into the die chain.
+         * These addresses correspond to integrity-check funnel function entries
+         * identified via static analysis (22 direct call xrefs found). */
+        if (rip == 0x142548660UL || rip == 0x142548665UL)
+        {
+            ULONG_PTR rsp = RSP_sig(ucontext);
+            ULONG_PTR caller_ret = *(volatile ULONG_PTR *)rsp;
+            ERR_(seh)( "PANIC_TRACE: die_helper (0x%lx) called from caller-ret-addr 0x%lx (callsite likely 0x%lx)\n",
+                       rip, caller_ret, caller_ret - 5 );
+            /* Don't try to continue - the helper is a dead end. Just skip past
+             * its first instruction so the next int3 (from a different call site)
+             * can fire. We pop the return addr and jump straight to caller. */
+            RAX_sig(ucontext) = 0;
+            RSP_sig(ucontext) = rsp + 8;
+            RIP_sig(ucontext) = caller_ret;
             leave_handler( ucontext );
             return;
         }
