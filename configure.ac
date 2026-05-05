@@ -2907,7 +2907,12 @@ WINE_CONFIG_MAKEFILE(dlls/l3codeca.acm)
 WINE_CONFIG_MAKEFILE(dlls/l3codecx.ax)
 WINE_CONFIG_MAKEFILE(dlls/light.msstyles)
 WINE_CONFIG_MAKEFILE(dlls/loadperf)
-WINE_CONFIG_MAKEFILE(dlls/lsteamclient)
+dnl PROTON_DARWIN: drop lsteamclient. The dir is a symlink to the proton parent's
+dnl lsteamclient submodule in dev checkouts, but a standalone fresh clone of
+dnl thesquib/wine#proton-mac doesn't have it. Our recipes universally set
+dnl PROTON_DISABLE_LSTEAMCLIENT=1, so we don't actually use lsteamclient on
+dnl macOS. Removing the reference makes the wine fork buildable standalone.
+dnl WINE_CONFIG_MAKEFILE(dlls/lsteamclient)
 WINE_CONFIG_MAKEFILE(dlls/localspl)
 WINE_CONFIG_MAKEFILE(dlls/localspl/tests)
 WINE_CONFIG_MAKEFILE(dlls/localui)
