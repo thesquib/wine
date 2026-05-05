@@ -3702,7 +3702,12 @@ WINE_CONFIG_MAKEFILE(programs/shutdown)
 WINE_CONFIG_MAKEFILE(programs/sort)
 WINE_CONFIG_MAKEFILE(programs/spoolsv)
 WINE_CONFIG_MAKEFILE(programs/start)
-WINE_CONFIG_MAKEFILE(programs/steam)
+dnl PROTON_DARWIN: programs/steam is a Proton-specific helper that lives
+dnl untracked in dev checkouts (drives Steam-in-bottle handshake from inside
+dnl wineprefix). Standalone fresh clones of this fork don't have it. Drop
+dnl the reference so configure works in CI; bottle launchers spawn
+dnl Steam.exe directly without needing the helper.
+dnl WINE_CONFIG_MAKEFILE(programs/steam)
 WINE_CONFIG_MAKEFILE(programs/subst)
 WINE_CONFIG_MAKEFILE(programs/svchost)
 WINE_CONFIG_MAKEFILE(programs/systeminfo)
