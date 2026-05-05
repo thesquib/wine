@@ -98,6 +98,13 @@ extern CGSConnectionID CGSMainConnectionID(void);
 @property (readonly) uint32_t contextId;
 @end
 
+/* Shared between the broadcast retry timer and the
+ * handleDXMTRemoteLayerHostRequest: handler. The handler adds the hwnd to
+ * this set when it successfully hosts the layer in this process; the retry
+ * timer reads it and bails. Both run on the main queue, so no locking is
+ * required. */
+static NSMutableSet *s_e1AttachedHwnds = nil;
+
 __attribute__((visibility("default")))
 void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer)
 {
@@ -192,12 +199,30 @@ void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer)
 
         /* On the first broadcast, arm the same retry pattern as DXMT - the
          * target NSWindow may not be on_screen yet when surface_create
-         * fires. Retry every 500ms for 30 seconds. */
+         * fires. Retry every 500ms for up to 30 seconds, but ABORT THE RETRY
+         * as soon as the same-process handler reports a successful attach.
+         *
+         * Bug (Proton macOS) 2026-05-05: without the abort, every retry fires
+         * a fresh broadcast that re-runs the attach handler in every receiver
+         * process. The re-attach re-sets layer.frame / contentsScale /
+         * autoresizingMask on the live CAMetalLayer 60 times across 30s,
+         * which the user perceives as constant flicker (Hades main menu).
+         * Cmd-Tab "fixed" it because the retry timer naturally ages out
+         * before focus returned. The handler now stamps `s_e1AttachedHwnds`
+         * with the hwnd on a successful attach (line ~2410); we check it
+         * here before re-broadcasting. */
         if (firstTime) {
             __block int retryCount = 0;
             __block void (^retryBlock)(void);
+            uintptr_t hwndKeyVal = (uintptr_t)hwnd;
             void (^retryBlockContent)(void) = ^{
                 retryCount++;
+                if ([s_e1AttachedHwnds containsObject:@(hwndKeyVal)]) {
+                    fprintf(stderr,
+                            "winemac:E.1-vulkan - retry abort: hwnd=%p already attached (after %d retries)\n",
+                            (void *)hwndKeyVal, retryCount);
+                    return;
+                }
                 doBroadcast();
                 if (retryCount < 60) {
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
@@ -2347,6 +2372,20 @@ static NSString* WineLocalizedString(unsigned int stringID)
                             fallback.width, fallback.height);
                 }
             }
+            /* Bug (Proton macOS) 2026-05-05: wrap all layer property mutations
+             * in a CATransaction with implicit actions disabled. Setting
+             * .frame / .contentsScale / .autoresizingMask on an already-
+             * attached CALayer would otherwise fire CA's default 0.25s
+             * implicit animation (kCAOnOrderInAnimation et al). Each E.1
+             * broadcast re-sets these properties, so without this the user
+             * sees a flicker every time DXMT/winevulkan re-broadcasts
+             * (which happens repeatedly during normal rendering as well as
+             * on focus / resize events). Cmd-Tab "fixes" the flicker
+             * because windowDidBecomeKey forces a synchronous layout that
+             * skips past the in-flight animation. */
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+
             child.frame = attachFrame;
             child.contentsScale = parentLayer.contentsScale ?: 1.0;
             child.zPosition = 1000.0; /* Force on top of any sibling layers */
@@ -2367,6 +2406,18 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 }
             }
             if (child.superlayer != parentLayer) [parentLayer addSublayer:child];
+
+            [CATransaction commit];
+
+            /* Stamp this hwnd so the broadcaster's retry timer (running in
+             * the same process for same-process attach, the common case)
+             * stops re-broadcasting once we've successfully hosted the
+             * layer. See comment in macdrv_broadcast_vulkan_layer_host_request
+             * for why the retries cause flicker. */
+            if (sameProcess) {
+                if (!s_e1AttachedHwnds) s_e1AttachedHwnds = [[NSMutableSet alloc] init];
+                [s_e1AttachedHwnds addObject:@((uintptr_t)hwnd)];
+            }
 
             /* Bug (Proton macOS) 2026-04-30: macdrv_client_surface_present
              * hides the old client_view when it swaps in the surface's
