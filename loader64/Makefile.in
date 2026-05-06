@@ -3,7 +3,8 @@ PARENTSRC = ../loader
 SOURCES = \
 	main.c \
 	preloader.c \
-	preloader_mac.c
+	preloader_mac.c \
+	wine_info.plist.in
 
 PROGRAMS = wine64 wine64-preloader
 INSTALL_LIB = wine64 wine64-preloader
