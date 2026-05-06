@@ -6,8 +6,16 @@ SOURCES = \
 	preloader_mac.c \
 	wine_info.plist.in
 
-PROGRAMS = wine64 wine64-preloader
-INSTALL_LIB = wine64 wine64-preloader
+dnl PROTON_DARWIN: wine64-preloader is Linux-only. On macOS x86_64, configure
+dnl detects that Mach-O zerofill sections obviate the preloader (sets
+dnl wine_use_preloader=no) and leaves WINEPRELOADER_LDFLAGS empty. The
+dnl link rule fires anyway with a bare $(LDFLAGS), and ld errors out on
+dnl `_main` undefined because preloader.c has no main(). Drop the
+dnl preloader from PROGRAMS / INSTALL_LIB so make never tries to link
+dnl it. We use loader/wine + loader64/wine64 directly; nothing needs
+dnl the preloader on this platform.
+PROGRAMS = wine64
+INSTALL_LIB = wine64
 UNIX_CFLAGS = -fPIE
 
 preloader_EXTRADEFS = -fno-builtin
