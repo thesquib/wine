@@ -50,6 +50,24 @@ static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs;
  * known and the swapchain hasn't yet been built. */
 extern void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer);
 
+/* Bug (Proton macOS) 2026-05-08 v3: orphan WineContentView cleanup at
+ * VkSurfaceKHR creation time. Helper defined in cocoa_app.m. The
+ * function resolves the top contentView from the view's window and
+ * wraps the work in its own CATransaction with implicit actions off. */
+extern void macdrv_remove_orphan_views_for_view(void *opaque_view, const char *call_site);
+
+/* Bug (Proton macOS) 2026-05-09 queued 0034: PROTON_PRESENT_TRACE.
+ * Cached single getenv. Log-only, default off. */
+static int proton_present_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached == -1) {
+        const char *v = getenv("PROTON_PRESENT_TRACE");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+
 static VkResult macdrv_vulkan_surface_create(HWND hwnd, BOOL raw, const struct vulkan_instance *instance,
                                              VkSurfaceKHR *handle, struct client_surface **client)
 {
@@ -84,6 +102,12 @@ static VkResult macdrv_vulkan_surface_create(HWND hwnd, BOOL raw, const struct v
         goto err;
     }
     fprintf(stderr, "winemac:VK surface_create STEP3 metal_view=%p\n", surface->metal_view);
+
+    /* Run orphan WineContentView cleanup right after the new metal_view
+     * is wired in but before the swapchain is built. The cocoa_view we
+     * pass is the just-created/just-becoming-active view; the helper
+     * will not remove it. */
+    macdrv_remove_orphan_views_for_view((void *)surface->cocoa_view, "vulkan-surface-create");
 
     if (instance->p_vkCreateMetalSurfaceEXT)
     {
@@ -180,6 +204,13 @@ static VkResult macdrv_vulkan_surface_create(HWND hwnd, BOOL raw, const struct v
     }
     fprintf(stderr, "winemac:VK surface_create STEP8 about to set client=&surface->client surface=%p client_ptr=%p\n",
             surface, client);
+
+    if (proton_present_trace_enabled()) {
+        void *ml_pt = (void *)macdrv_view_get_metal_layer(surface->metal_view);
+        fprintf(stderr, "[PRESENT-TRACE] surface_create surface=0x%llx hwnd=%p metal_view=%p metal_layer=%p\n",
+                (unsigned long long)(uintptr_t)*handle, hwnd, surface->metal_view, ml_pt);
+        fflush(stderr);
+    }
 
     *client = &surface->client;
     fprintf(stderr, "winemac:VK surface_create STEP9 client set to %p, returning VK_SUCCESS\n", *client);
