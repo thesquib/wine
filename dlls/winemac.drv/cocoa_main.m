@@ -19,8 +19,11 @@
  */
 
 #import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "macdrv_cocoa.h"
 #import "cocoa_app.h"
@@ -43,6 +46,11 @@ struct cocoa_app_startup_info {
     uint64_t            uptime_ns;
     BOOL                success;
 };
+
+
+/* Forward decl: defined further below, called by run_cocoa_app at
+ * NSApp-launch time. */
+static void install_proton_force_quit_hotkey(void);
 
 
 /***********************************************************************
@@ -94,10 +102,78 @@ static void run_cocoa_app(void* info)
     {
         @autoreleasepool
         {
+            install_proton_force_quit_hotkey();
             /* Never returns */
             [NSApp run];
         }
     }
+}
+
+/***********************************************************************
+ *              proton_force_quit_hotkey_handler
+ *
+ * Carbon hotkey callback. Fires on Cmd+Shift+Q at the system level
+ * regardless of which Wine window has focus, even in fullscreen.
+ * SIGTERMs the wine process so the normal signal-handler exit path
+ * runs (audio stop, etc.).
+ */
+static OSStatus proton_force_quit_hotkey_handler(EventHandlerCallRef nextHandler,
+                                                  EventRef event, void *userData)
+{
+    EventHotKeyID hkID;
+    OSStatus s = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+                                    NULL, sizeof(hkID), NULL, &hkID);
+    if (s == noErr && hkID.signature == 'PMW1' && hkID.id == 1) {
+        fprintf(stderr,
+                "winemac: PROTON_AUTO_EXIT - Cmd+Shift+Q force-quit hotkey, SIGTERM self (pid=%d)\n",
+                getpid());
+        kill(getpid(), SIGTERM);
+    }
+    return noErr;
+}
+
+/***********************************************************************
+ *              install_proton_force_quit_hotkey
+ *
+ * Register Cmd+Shift+Q as a Carbon system-level hotkey. Only active
+ * when PROTON_AUTO_EXIT_ON_LAST_WINDOW=1 is set. Carbon hotkeys
+ * bypass per-app keyboard capture and fire from any input state
+ * including fullscreen, where Dock/menu-bar/Cmd-Q via menu are all
+ * unreachable. Companion to the kAEQuit->SIGTERM path in
+ * applicationShouldTerminate.
+ */
+static void install_proton_force_quit_hotkey(void)
+{
+    static int installed = 0;
+    if (installed) return;
+
+    const char *env = getenv("PROTON_AUTO_EXIT_ON_LAST_WINDOW");
+    if (!env || env[0] == '0' || env[0] == '\0') return;
+
+    EventTypeSpec eventType;
+    eventType.eventClass = kEventClassKeyboard;
+    eventType.eventKind = kEventHotKeyPressed;
+    OSStatus s = InstallApplicationEventHandler(&proton_force_quit_hotkey_handler,
+                                                 1, &eventType, NULL, NULL);
+    if (s != noErr) {
+        fprintf(stderr, "winemac: failed to install hotkey handler (status=%d)\n", (int)s);
+        return;
+    }
+
+    EventHotKeyID hkID;
+    hkID.signature = 'PMW1';
+    hkID.id = 1;
+    EventHotKeyRef hkRef;
+    /* keyCode 0x0C = Q on every Mac keyboard layout (it's a physical key
+     * code, not a character). cmdKey | shiftKey selects modifier flags. */
+    s = RegisterEventHotKey(0x0C, cmdKey | shiftKey, hkID,
+                            GetApplicationEventTarget(), 0, &hkRef);
+    if (s != noErr) {
+        fprintf(stderr, "winemac: failed to register Cmd+Shift+Q hotkey (status=%d)\n", (int)s);
+        return;
+    }
+    installed = 1;
+    fprintf(stderr, "winemac: PROTON_AUTO_EXIT - Cmd+Shift+Q force-quit hotkey installed\n");
 }
 
 
