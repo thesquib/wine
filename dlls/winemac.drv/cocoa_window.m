@@ -25,6 +25,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 #include <dlfcn.h>
+#include <stdlib.h>
 
 #import "cocoa_window.h"
 
@@ -977,13 +978,45 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         [super setRetinaMode:mode];
     }
 
+    /* Bug (Proton macOS) 2026-05-09 queued 0037: PROTON_PRESENTS_WITH_TRANSACTION.
+     * Cached single getenv. Default off; A/B test for the DOOM Eternal
+     * activation-blackout fingerprint. */
+    static int proton_presents_with_transaction_enabled(void)
+    {
+        static int cached = -1;
+        if (cached == -1)
+        {
+            const char *v = getenv("PROTON_PRESENTS_WITH_TRANSACTION");
+            cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+        }
+        return cached;
+    }
+
+    /* Bug (Proton macOS) 2026-05-08 queued 0039: PROTON_NO_LEVEL_ELEVATION.
+     * Cached single getenv. Default off; A/B test for the DOOM Eternal
+     * activation-blackout fingerprint (level jump 0 -> 26). */
+    static int proton_no_level_elevation_enabled(void)
+    {
+        static int cached = -1;
+        if (cached < 0) {
+            const char *v = getenv("PROTON_NO_LEVEL_ELEVATION");
+            cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+        }
+        return cached;
+    }
+
     - (CALayer*) makeBackingLayer
     {
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = _device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer.framebufferOnly = YES;
-        layer.presentsWithTransaction = NO;
+        if (proton_presents_with_transaction_enabled())
+            layer.presentsWithTransaction = YES;
+        else
+            layer.presentsWithTransaction = NO;
+        fprintf(stderr, "winemac:E.1 [PWT-PATCH] CAMetalLayer ptr=%p presentsWithTransaction=%d\n",
+                layer, (int)layer.presentsWithTransaction);
         if ([layer respondsToSelector:@selector(setAllowsNextDrawableTimeout:)])
             layer.allowsNextDrawableTimeout = YES;
         layer.magnificationFilter = kCAFilterNearest;
@@ -1277,6 +1310,15 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
 
     - (NSInteger) minimumLevelForActive:(BOOL)active
     {
+        if (proton_no_level_elevation_enabled())
+        {
+            static BOOL logged = NO;
+            if (!logged) {
+                fprintf(stderr, "winemac: [LEVEL-GATE] holding minimumLevelForActive at NSNormalWindowLevel (env-gated)\n");
+                logged = YES;
+            }
+            return NSNormalWindowLevel;
+        }
         NSInteger level;
 
         if (self.floating && (active || topmost_float_inactive == TOPMOST_FLOAT_INACTIVE_ALL ||
@@ -2969,12 +3011,198 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
         return size;
     }
 
+    /* Bug (Proton macOS) 2026-05-09 v2: visible-until-focus diagnostic.
+     *
+     * v1 of this trace logged only the contentView.layer's direct
+     * sublayers and revealed only AppKit's auto NSViewBackingLayer at
+     * depth 1 - no CAMetalLayer. The CAMetalLayer is hosted somewhere
+     * deeper in the client_cocoa_view subtree (queued 0016) or on a
+     * sibling view's layer. v2 recurses the layer tree and walks the
+     * NSView subview tree so we can locate the actual hosted layer
+     * and capture its state at becomeKey vs resignKey.
+     *
+     * Gated on PROTON_E1_FOCUS_TRACE=1; cached once. Log-only.
+     */
+    #define PROTON_FOCUS_TRACE_LAYER_DEPTH 4
+    #define PROTON_FOCUS_TRACE_VIEW_DEPTH  3
+
+    static int proton_focus_trace_enabled(void)
+    {
+        static int cached = -1;
+        if (cached == -1)
+        {
+            const char *v = getenv("PROTON_E1_FOCUS_TRACE");
+            cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+        }
+        return cached;
+    }
+
+    static const char *proton_focus_trace_indent(NSUInteger depth)
+    {
+        static const char *pads[] = {
+            "  ",
+            "    ",
+            "      ",
+            "        ",
+            "          ",
+            "            ",
+        };
+        if (depth >= sizeof(pads) / sizeof(pads[0]))
+            depth = sizeof(pads) / sizeof(pads[0]) - 1;
+        return pads[depth];
+    }
+
+    static void proton_focus_trace_layer(CALayer *layer, CALayer *parent, NSUInteger depth)
+    {
+        if (!layer) return;
+        const char *pad = proton_focus_trace_indent(depth);
+        CGRect lb = [layer bounds];
+        CGRect lf = [layer frame];
+        NSArray *subs = [layer sublayers];
+        fprintf(stderr,
+                "[FOCUS-TRACE]%slayer[d=%lu]=%p parent=%p class=%s frame=%.0fx%.0f@%.0f,%.0f "
+                "bounds=%.0fx%.0f hidden=%d opaque=%d opacity=%.3f contents=%p sublayers=%lu\n",
+                pad, (unsigned long)depth, (void *)layer, (void *)parent,
+                object_getClassName(layer),
+                (double)lf.size.width, (double)lf.size.height,
+                (double)lf.origin.x, (double)lf.origin.y,
+                (double)lb.size.width, (double)lb.size.height,
+                (int)[layer isHidden], (int)[layer isOpaque],
+                (double)[layer opacity], (void *)[layer contents],
+                (unsigned long)[subs count]);
+
+        if ([layer isKindOfClass:[CAMetalLayer class]])
+        {
+            CAMetalLayer *ml = (CAMetalLayer *)layer;
+            CGSize ds = [ml drawableSize];
+            CGColorSpaceRef cs = [ml colorspace];
+            CFStringRef csName = cs ? CGColorSpaceCopyName(cs) : NULL;
+            /* displaySyncEnabled is iOS-only on CAMetalLayer; not declared on macOS SDK so omitted. */
+            fprintf(stderr,
+                    "[FOCUS-TRACE]%s  CAMetalLayer device=%p pixelFormat=%lu "
+                    "framebufferOnly=%d presentsWithTransaction=%d "
+                    "colorspace=%s drawableSize=%.0fx%.0f\n",
+                    pad,
+                    (void *)[ml device],
+                    (unsigned long)[ml pixelFormat],
+                    (int)[ml framebufferOnly],
+                    (int)[ml presentsWithTransaction],
+                    csName ? [(NSString *)csName UTF8String] : "(null)",
+                    (double)ds.width, (double)ds.height);
+            if (csName) CFRelease(csName);
+        }
+
+        if (depth + 1 >= PROTON_FOCUS_TRACE_LAYER_DEPTH) return;
+        for (CALayer *sub in subs)
+            proton_focus_trace_layer(sub, layer, depth + 1);
+    }
+
+    static void proton_focus_trace_view(NSView *view, NSUInteger depth)
+    {
+        if (!view) return;
+        const char *pad = proton_focus_trace_indent(depth);
+        NSRect vf = [view frame];
+        CALayer *vlayer = [view layer];
+        NSView *sup = [view superview];
+        CALayer *suplayer = sup ? [sup layer] : nil;
+        fprintf(stderr,
+                "[FOCUS-TRACE]%sview[d=%lu]=%p class=%s frame=%.0fx%.0f@%.0f,%.0f "
+                "hidden=%d wantsLayer=%d layer=%p\n",
+                pad, (unsigned long)depth, (void *)view,
+                object_getClassName(view),
+                (double)vf.size.width, (double)vf.size.height,
+                (double)vf.origin.x, (double)vf.origin.y,
+                (int)[view isHidden], (int)[view wantsLayer],
+                (void *)vlayer);
+
+        /* If this view owns a layer distinct from its superview's,
+         * descend into its layer subtree so we cover sibling-view
+         * layers (the CAMetalLayer is most likely down one of these
+         * branches). Skip the contentView itself to avoid double-
+         * logging the layer tree we already walked from the top. */
+        if (vlayer && vlayer != suplayer && depth > 0)
+            proton_focus_trace_layer(vlayer, NULL, 0);
+
+        if (depth + 1 >= PROTON_FOCUS_TRACE_VIEW_DEPTH) return;
+        for (NSView *sub in [view subviews])
+            proton_focus_trace_view(sub, depth + 1);
+    }
+
+    static void proton_focus_trace_dump(NSWindow *win, void *hwnd, const char *event)
+    {
+        if (!proton_focus_trace_enabled()) return;
+
+        @autoreleasepool {
+            NSView *cv = [win contentView];
+            CALayer *layer = cv ? [cv layer] : nil;
+            NSArray *subs = layer ? [layer sublayers] : nil;
+            /* Filter EARLY: skip windows whose contentView.layer has
+             * zero sublayers. Wine spawns several bootstrap / desktop
+             * / tooltip windows that receive key transitions; only
+             * windows with at least one sublayer are part of the H5
+             * (visible-until-focus) population. Filtering before any
+             * logging keeps the trace tight. */
+            if (![subs count]) return;
+
+            double t = CACurrentMediaTime();
+            NSRect cvFrame = cv ? [cv frame] : NSZeroRect;
+            NSScreen *screen = [win screen];
+            NSRect screenFrame = screen ? [screen frame] : NSZeroRect;
+
+            fprintf(stderr,
+                    "[FOCUS-TRACE] t=%.6f event=%s win=%p hwnd=%p "
+                    "isVisible=%d isMiniaturized=%d isOnActiveSpace=%d isKey=%d "
+                    "alpha=%.3f occlusion=0x%lx screen=%p screenFrame=%.0fx%.0f@%.0f,%.0f\n",
+                    t, event, (void *)win, hwnd,
+                    (int)[win isVisible], (int)[win isMiniaturized],
+                    (int)[win isOnActiveSpace], (int)[win isKeyWindow],
+                    (double)[win alphaValue], (unsigned long)[win occlusionState],
+                    (void *)screen,
+                    (double)screenFrame.size.width, (double)screenFrame.size.height,
+                    (double)screenFrame.origin.x, (double)screenFrame.origin.y);
+
+            fprintf(stderr,
+                    "[FOCUS-TRACE]   contentView=%p frame=%.0fx%.0f@%.0f,%.0f hidden=%d "
+                    "wantsLayer=%d layer=%p\n",
+                    (void *)cv,
+                    (double)cvFrame.size.width, (double)cvFrame.size.height,
+                    (double)cvFrame.origin.x, (double)cvFrame.origin.y,
+                    cv ? (int)[cv isHidden] : -1,
+                    cv ? (int)[cv wantsLayer] : -1,
+                    (void *)layer);
+
+            CGRect lb = [layer bounds];
+            fprintf(stderr,
+                    "[FOCUS-TRACE]   layer.bounds=%.0fx%.0f hidden=%d opaque=%d "
+                    "opacity=%.3f sublayers=%lu (recursing to depth %d)\n",
+                    (double)lb.size.width, (double)lb.size.height,
+                    (int)[layer isHidden], (int)[layer isOpaque],
+                    (double)[layer opacity],
+                    (unsigned long)[subs count],
+                    PROTON_FOCUS_TRACE_LAYER_DEPTH);
+
+            /* Recursive layer walk from contentView.layer, depth 1..N. */
+            for (CALayer *sub in subs)
+                proton_focus_trace_layer(sub, layer, 1);
+
+            /* NSView subtree walk from contentView, depth 0..M. */
+            fprintf(stderr,
+                    "[FOCUS-TRACE]   view-tree (recursing to depth %d):\n",
+                    PROTON_FOCUS_TRACE_VIEW_DEPTH);
+            proton_focus_trace_view(cv, 0);
+            fflush(stderr);
+        }
+    }
+
     - (void)windowDidBecomeKey:(NSNotification *)notification
     {
         WineApplicationController* controller = [WineApplicationController sharedController];
         NSEvent* event = [controller lastFlagsChanged];
         if (event)
             [self flagsChanged:event];
+
+        if (causing_becomeKeyWindow != self)
+            proton_focus_trace_dump(self, self.hwnd, "didBecomeKey");
 
         if (causing_becomeKeyWindow == self) return;
 
@@ -3085,6 +3313,9 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
     - (void)windowDidResignKey:(NSNotification *)notification
     {
         macdrv_event* event;
+
+        if (!causing_becomeKeyWindow)
+            proton_focus_trace_dump(self, self.hwnd, "didResignKey");
 
         if (causing_becomeKeyWindow) return;
 

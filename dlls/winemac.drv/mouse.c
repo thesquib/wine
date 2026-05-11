@@ -158,6 +158,31 @@ static void send_mouse_input(HWND hwnd, macdrv_window cocoa_window, UINT flags, 
     input.mi.time           = time;
     input.mi.dwExtraInfo    = 0;
 
+    /* PROTON_MOUSE_TRACE: log every mouse input delivered to the server.
+     * Throttled to first 8 + every Nth (default 60) to avoid log explosion. */
+    {
+        static int trace_cached = -1;
+        static unsigned long trace_n = 0;
+        if (trace_cached < 0)
+        {
+            const char *v = getenv("PROTON_MOUSE_TRACE");
+            trace_cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+        }
+        if (trace_cached)
+        {
+            unsigned long n = ++trace_n;
+            if (n <= 8 || (n % 60) == 0)
+            {
+                fprintf(stderr, "winemac:[MOUSE-TRACE #%lu] flags=0x%x dx=%d dy=%d data=0x%x %s%s%s\n",
+                        n, flags, x, y, mouse_data,
+                        (flags & MOUSEEVENTF_MOVE) ? "MOVE " : "",
+                        (flags & MOUSEEVENTF_ABSOLUTE) ? "ABS " : "REL ",
+                        drag ? "DRAG" : "");
+                fflush(stderr);
+            }
+        }
+    }
+
     NtUserSendHardwareInput(top_level_hwnd, 0, &input, 0);
 }
 
