@@ -964,6 +964,7 @@ void *get_builtin_so_handle( void *module )
 
 static void load_steam_overlay(const char *unix_lib_path)
 {
+#ifdef __linux__
     const char *preload, *p;
     char path[PATH_MAX];
     unsigned int len;
@@ -985,6 +986,17 @@ static void load_steam_overlay(const char *unix_lib_path)
         handle = dlopen( path, RTLD_NOW | RTLD_GLOBAL );
         FIXME( "HACK: tried to load %s, handle %p.\n", debugstr_a(path), handle );
     }
+#else
+    /* PROTON_DARWIN: load_steam_overlay is a Linux-Steam-overlay hack
+     * (looks for winex11.so, reads LD_PRELOAD, dlopen()s
+     * gameoverlayrenderer.so). None of those concepts exist on macOS,
+     * and strchrnul() is GLIBC-only. Guard the body so the function
+     * compiles cleanly on non-Linux hosts (Proton 11.0 Valve patch
+     * f6c2e0d630f originally Linux-targeted). The function is still
+     * called from get_builtin_unix_funcs / load_builtin_unixlib but
+     * is now a no-op on non-Linux. */
+    (void)unix_lib_path;
+#endif
 }
 
 /***********************************************************************
