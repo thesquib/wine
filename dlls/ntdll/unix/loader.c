@@ -2287,6 +2287,7 @@ BOOL localsystem_sid;
 BOOL simulate_writecopy;
 BOOL wine_allocs_2g_limit;
 SIZE_T kernel_stack_size = 0x100000;
+SIZE_T min_thread_stack_size = 0;
 long long ram_reporting_bias;
 char *release_reserved_memory_low_bound;
 BOOL alert_simulate_sched_quantum;
@@ -2412,6 +2413,14 @@ static void hacks_init(void)
         kernel_stack_size = 200 * 1024;
     if (kernel_stack_size != 0x100000)
         ERR( "HACK: setting kernel_stack_size to %luKB.\n", (long)(kernel_stack_size / 1024) );
+
+    if ((env_str = getenv( "WINE_MIN_THREAD_STACK_KB" )))
+    {
+        min_thread_stack_size = atoll( env_str ) * 1024;
+        if (min_thread_stack_size)
+            ERR( "HACK: flooring PE thread stack reserve to %luKB.\n",
+                 (long)(min_thread_stack_size / 1024) );
+    }
 
     if (sgi && (0
         || !strcmp(sgi, "1364780") || !strcmp(sgi, "1952120") || !strcmp(sgi, "2154900") /* Street Fighter 6 */
