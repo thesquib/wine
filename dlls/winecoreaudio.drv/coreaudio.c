@@ -107,8 +107,68 @@ static const REFERENCE_TIME min_period = 50000;
 
 static ULONG_PTR zero_bits = 0;
 
+/* Track active streams so unix_process_detach can stop their AudioUnits
+ * when the wine process exits without going through IAudioClient::Release.
+ * Without this, coreaudiod keeps the unit running against soon-to-be-
+ * freed wine memory and the last 50ms buffer loops audibly until
+ * something kills wineserver. Symptom on ABZU + Hades (in-game Quit
+ * hides UI but skips Release); Skyrim is fine because its quit flow
+ * drives Release before exit. (Proton macOS) */
+#define COREAUDIO_MAX_STREAMS 32
+static struct coreaudio_stream *active_streams[COREAUDIO_MAX_STREAMS];
+static os_unfair_lock active_streams_lock = OS_UNFAIR_LOCK_INIT;
+
+static void register_active_stream(struct coreaudio_stream *stream)
+{
+    int i;
+    os_unfair_lock_lock(&active_streams_lock);
+    for (i = 0; i < COREAUDIO_MAX_STREAMS; i++) {
+        if (!active_streams[i]) {
+            active_streams[i] = stream;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&active_streams_lock);
+}
+
+static void unregister_active_stream(struct coreaudio_stream *stream)
+{
+    int i;
+    os_unfair_lock_lock(&active_streams_lock);
+    for (i = 0; i < COREAUDIO_MAX_STREAMS; i++) {
+        if (active_streams[i] == stream) {
+            active_streams[i] = NULL;
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&active_streams_lock);
+}
+
 static NTSTATUS unix_not_implemented(void *args)
 {
+    return STATUS_SUCCESS;
+}
+
+/* Replaces unix_not_implemented at dispatch slot 1 (process_detach).
+ * mmdevapi's DllMain DLL_PROCESS_DETACH path calls wine_unix_call(
+ * process_detach, NULL) on titles that go through normal shutdown.
+ * Stop every still-running AudioUnit so coreaudiod doesn't loop the
+ * last buffer. Deliberately don't Dispose - the unix-side .so is
+ * being unmapped and coreaudiod's client-disconnect cleanup handles
+ * release; calling Dispose here would risk racing the host RT thread
+ * currently inside our render callback. Stop is enough to silence the
+ * loop. (Proton macOS) */
+static NTSTATUS unix_process_detach(void *args)
+{
+    int i;
+    os_unfair_lock_lock(&active_streams_lock);
+    for (i = 0; i < COREAUDIO_MAX_STREAMS; i++) {
+        if (active_streams[i] && active_streams[i]->unit) {
+            AudioOutputUnitStop(active_streams[i]->unit);
+            active_streams[i] = NULL;
+        }
+    }
+    os_unfair_lock_unlock(&active_streams_lock);
     return STATUS_SUCCESS;
 }
 
@@ -814,6 +874,7 @@ end:
     } else {
         *params->channel_count = params->fmt->nChannels;
         *params->stream = (stream_handle)(UINT_PTR)stream;
+        register_active_stream(stream);
     }
 
     return STATUS_SUCCESS;
@@ -824,6 +885,8 @@ static NTSTATUS unix_release_stream( void *args )
     struct release_stream_params *params = args;
     struct coreaudio_stream *stream = handle_get_stream(params->stream);
     SIZE_T size;
+
+    unregister_active_stream(stream);
 
     if(params->timer_thread){
         stream->please_quit = TRUE;
@@ -1781,7 +1844,7 @@ static NTSTATUS unix_set_event_handle(void *args)
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     unix_process_attach,
-    unix_not_implemented,
+    unix_process_detach,
     unix_main_loop,
     unix_get_endpoint_ids,
     unix_create_stream,
@@ -2237,7 +2300,7 @@ static NTSTATUS unix_wow64_get_prop_value(void *args)
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
     unix_process_attach,
-    unix_not_implemented,
+    unix_process_detach,
     unix_wow64_main_loop,
     unix_wow64_get_endpoint_ids,
     unix_wow64_create_stream,
