@@ -364,9 +364,20 @@ static WORD get_alt_machine( WORD machine )
 static void set_dll_path(void)
 {
     char *p, *path = getenv( "WINEDLLPATH" ), *be_runtime = getenv( "PROTON_BATTLEYE_RUNTIME" ), *eac_runtime = getenv( "PROTON_EAC_RUNTIME" );
+    /* PROTON_PREFIX_DLL_DIR: per-prefix builtin override that wins over
+     * dll_dir (wine_install/lib/wine/). Set per-bottle to a path
+     * containing replacement {x86_64,i386}-windows/<dll>.dll and
+     * x86_64-unix/<dll>.so. Use case: Apple GPTK D3DMetal opt-in for
+     * DX12 titles - drops d3d12.dll + dxgi.dll there so wine picks the
+     * D3DMetal shims over its own builtin (vkd3d-proton) for THIS
+     * bottle only. Other bottles unaffected. Inert if env unset. */
+    char *prefix_dll = getenv( "PROTON_PREFIX_DLL_DIR" );
     int i, count = 0;
 
     if (path) for (p = path, count = 1; *p; p++) if (*p == ':') count++;
+
+    if (prefix_dll && *prefix_dll)
+        count++;
 
     if (be_runtime)
         count += 2;
@@ -376,6 +387,12 @@ static void set_dll_path(void)
 
     dll_paths = malloc( (count + 2) * sizeof(*dll_paths) );
     count = 0;
+
+    if (prefix_dll && *prefix_dll)
+    {
+        ERR( "HACK: PROTON_PREFIX_DLL_DIR=%s (prepends to builtin search).\n", prefix_dll );
+        dll_paths[count++] = strdup( prefix_dll );
+    }
 
     if (!build_dir) dll_paths[count++] = dll_dir;
 
