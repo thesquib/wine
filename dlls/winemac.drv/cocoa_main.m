@@ -19,13 +19,76 @@
  */
 
 #import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <signal.h>
+#include <unistd.h>
 
 #include "macdrv_cocoa.h"
 #import "cocoa_app.h"
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
+
+
+/* PROTON_AUTO_EXIT_ON_LAST_WINDOW=1 - Carbon system-level Cmd+Shift+Q
+ * force-quit hotkey. Paired with step B's kAEQuit -> SIGTERM route in
+ * cocoa_app.m's applicationShouldTerminate. The kAEQuit hook covers
+ * Dock-Quit / menu Cmd-Q. This hotkey covers fullscreen gameplay
+ * where Dock and menu bar are unreachable, by installing a system-
+ * level RegisterEventHotKey that fires regardless of which app has
+ * keyboard focus. Both paths SIGTERM self so wine's signal handler
+ * runs the normal exit and step A (winecoreaudio process_detach)
+ * stops AudioUnits cleanly. (Proton macOS) */
+static OSStatus proton_force_quit_hotkey_handler(EventHandlerCallRef nextHandler,
+                                                  EventRef event, void *userData)
+{
+    EventHotKeyID hkID;
+    OSStatus s = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+                                    NULL, sizeof(hkID), NULL, &hkID);
+    if (s == noErr && hkID.signature == 'PMW1' && hkID.id == 1) {
+        fprintf(stderr,
+                "winemac: PROTON_AUTO_EXIT - Cmd+Shift+Q force-quit hotkey, SIGTERM self (pid=%d)\n",
+                getpid());
+        kill(getpid(), SIGTERM);
+    }
+    return noErr;
+}
+
+static void install_proton_force_quit_hotkey(void)
+{
+    static int installed = 0;
+    if (installed) return;
+
+    const char *env = getenv("PROTON_AUTO_EXIT_ON_LAST_WINDOW");
+    if (!env || env[0] == '\0' || env[0] == '0') return;
+
+    EventTypeSpec eventType;
+    eventType.eventClass = kEventClassKeyboard;
+    eventType.eventKind  = kEventHotKeyPressed;
+    OSStatus s = InstallApplicationEventHandler(&proton_force_quit_hotkey_handler,
+                                                 1, &eventType, NULL, NULL);
+    if (s != noErr) {
+        fprintf(stderr, "winemac: failed to install Cmd+Shift+Q event handler (status=%d)\n", (int)s);
+        return;
+    }
+
+    EventHotKeyID hkID;
+    hkID.signature = 'PMW1';
+    hkID.id = 1;
+    EventHotKeyRef hkRef;
+    /* keyCode 0x0C = physical Q on every Mac keyboard layout.
+     * cmdKey | shiftKey selects modifier flags. */
+    s = RegisterEventHotKey(0x0C, cmdKey | shiftKey, hkID,
+                            GetApplicationEventTarget(), 0, &hkRef);
+    if (s != noErr) {
+        fprintf(stderr, "winemac: failed to register Cmd+Shift+Q hotkey (status=%d)\n", (int)s);
+        return;
+    }
+
+    installed = 1;
+    fprintf(stderr, "winemac: PROTON_AUTO_EXIT - Cmd+Shift+Q hotkey installed (pid=%d)\n", getpid());
+}
 
 
 /* Condition values for an NSConditionLock. Used to signal between run_cocoa_app
@@ -94,6 +157,7 @@ static void run_cocoa_app(void* info)
     {
         @autoreleasepool
         {
+            install_proton_force_quit_hotkey();
             /* Never returns */
             [NSApp run];
         }
