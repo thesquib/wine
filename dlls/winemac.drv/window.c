@@ -34,10 +34,6 @@
 #undef GetCurrentThread
 #undef LoadResource
 
-#include <dispatch/dispatch.h>
-#include <signal.h>
-#include <unistd.h>
-
 #include "macdrv.h"
 #include "wine/server.h"
 
@@ -1463,92 +1459,6 @@ LRESULT macdrv_DesktopWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 }
 
 /***********************************************************************
- *              count_on_screen_top_windows
- *
- * Best-effort count of top-level windows that are currently on_screen
- * (ordered in, not minimized) AND large enough to be the game's main
- * window. Used by the PROTON_AUTO_EXIT_ON_LAST_WINDOW watchdog to
- * decide whether the wine process has nothing left to render.
- */
-/* Sticky flag: set once we've seen at least one real (>=200x200 on_screen)
- * window. Without this, the auto-exit watchdog fires during the
- * pre-main-window startup phase when no window exists yet, false-
- * triggering SIGTERM before the game even has its UI up. */
-static int proton_have_seen_real_window = 0;
-
-static int count_on_screen_top_windows(void)
-{
-    int n = 0;
-    pthread_mutex_lock(&win_data_mutex);
-    if (win_datas) {
-        CFIndex count = CFDictionaryGetCount(win_datas);
-        if (count > 0) {
-            const void **vals = malloc(sizeof(void *) * count);
-            CFDictionaryGetKeysAndValues(win_datas, NULL, vals);
-            for (CFIndex i = 0; i < count; i++) {
-                struct macdrv_win_data *d = (struct macdrv_win_data *)vals[i];
-                if (!d || !d->on_screen) continue;
-                int w = d->rects.window.right - d->rects.window.left;
-                int h = d->rects.window.bottom - d->rects.window.top;
-                /* Skip tray-sized stubs (Wine internal helper windows are
-                 * typically 1x1 to 119x34). Real game windows are full-screen
-                 * or near it; 200x200 is a generous floor that lets us not
-                 * count helper-class windows. */
-                if (w * h < 40000) continue;
-                n++;
-                if (!proton_have_seen_real_window) proton_have_seen_real_window = 1;
-            }
-            free(vals);
-        }
-    }
-    pthread_mutex_unlock(&win_data_mutex);
-    return n;
-}
-
-int macdrv_proton_auto_exit_enabled(void)
-{
-    static const char *env_var = NULL;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ env_var = getenv("PROTON_AUTO_EXIT_ON_LAST_WINDOW"); });
-    return env_var && env_var[0] && env_var[0] != '0';
-}
-
-/***********************************************************************
- *              maybe_arm_auto_exit_watchdog
- *
- * If PROTON_AUTO_EXIT_ON_LAST_WINDOW is set, schedule a deferred check
- * on the GCD main queue: when it fires, if no large on_screen window
- * exists, SIGTERM the wine process. This catches UE4-style "engine
- * quit hangs but window was destroyed" patterns where the game's Quit
- * menu destroys the main window but a worker thread keeps the process
- * alive. The 3s grace lets a successor window appear (loading-screen
- * swaps etc.) before we conclude the process is done.
- *
- * Guarded by proton_have_seen_real_window so the pre-main-window
- * startup phase (where count is legitimately zero) doesn't trigger.
- *
- * Re-firing is safe: each call schedules a separate check; if any
- * fires while a window exists, it no-ops. SIGTERM runs wine's normal
- * exit path which closes audio cleanly.
- */
-static void maybe_arm_auto_exit_watchdog(void)
-{
-    if (!macdrv_proton_auto_exit_enabled()) return;
-    if (!proton_have_seen_real_window) return;
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC),
-                   dispatch_get_main_queue(), ^{
-        int n = count_on_screen_top_windows();
-        fprintf(stderr, "winemac: PROTON_AUTO_EXIT_ON_LAST_WINDOW watchdog fired, on-screen count=%d (seen_real=%d)\n",
-                n, proton_have_seen_real_window);
-        if (n == 0 && proton_have_seen_real_window) {
-            fprintf(stderr, "winemac: PROTON_AUTO_EXIT_ON_LAST_WINDOW - sending SIGTERM to self (pid=%d)\n", getpid());
-            kill(getpid(), SIGTERM);
-        }
-    });
-}
-
-/***********************************************************************
  *              DestroyWindow   (MACDRV.@)
  */
 void macdrv_DestroyWindow(HWND hwnd)
@@ -1567,8 +1477,6 @@ void macdrv_DestroyWindow(HWND hwnd)
     CFDictionaryRemoveValue(win_datas, hwnd);
     release_win_data(data);
     free(data);
-
-    maybe_arm_auto_exit_watchdog();
 }
 
 
