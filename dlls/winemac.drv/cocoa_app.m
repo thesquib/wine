@@ -105,10 +105,7 @@ extern CGSConnectionID CGSMainConnectionID(void);
  * required. */
 static NSMutableSet *s_e1AttachedHwnds = nil;
 
-/* Build-fixup (NOT part of 0041): queued patch 0036 declared this symbol
- * extern in vulkan.c without ever landing a definition; tree was un-linkable
- * until 0041 made the linker actually re-evaluate winemac.so. Stub keeps
- * the build alive while 0036 is fixed in its own session. */
+/* Build-fixup (proton-darwin DOOM-bisect 2026-05-16): see .parked/README.md */
 void macdrv_remove_orphan_views_for_view(void *opaque_view, const char *call_site)
 {
     (void)opaque_view; (void)call_site;
@@ -1381,14 +1378,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
             {
                 lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
 
-                /* PROTON_FORCE_FPS_MOUSE: when disassociation is engaged
-                 * (FPS mode on), the game is calling SetCursorPos every
-                 * frame to recenter the cursor for raw input. Re-associating
-                 * here on every warp undoes the disassociation and causes
-                 * the cursor to track mouse → motion deltas get trampled
-                 * by the next recenter warp. Keep disassociation sticky. */
-                if (!macdrv_mouse_disassociated)
-                    CGAssociateMouseAndMouseCursorPosition(true);
+                CGAssociateMouseAndMouseCursorPosition(true);
             }
         }
 
@@ -1610,25 +1600,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
                               || (cursor_clipping_locks_windows
                                   && [(WineWindow*)targetWindow respondsToSelector:@selector(fullscreen)]
                                   && [(WineWindow*)targetWindow fullscreen]);
-            /* PROTON_FORCE_FPS_MOUSE=1: force fpsModeActive on any
-             * fullscreen target window, regardless of clippingCursor /
-             * mouseCaptureWindow / cursor_clipping_locks_windows. Fix
-             * for titles (DOOM Eternal) whose detection criteria don't
-             * match Wine's heuristic but which still need cursor
-             * disassociation for mouse-look. */
-            static int force_cached = -1;
-            if (force_cached < 0) {
-                const char *v = getenv("PROTON_FORCE_FPS_MOUSE");
-                force_cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
-            }
-            /* When PROTON_FORCE_FPS_MOUSE is on, force fpsModeActive=YES
-             * unconditionally (skipping the [WineWindow fullscreen] gate).
-             * Wine treats borderless-sized-to-screen as not its native
-             * fullscreen, so titles like DOOM Eternal whose window doesn't
-             * match the heuristic still need cursor disassociation. The
-             * env is recipe-opt-in so the user explicitly asked for it. */
-            if (force_cached && targetWindow)
-                fpsModeActive = YES;
             if (fpsModeActive != macdrv_mouse_disassociated) {
                 CGAssociateMouseAndMouseCursorPosition(!fpsModeActive);
                 macdrv_mouse_disassociated = fpsModeActive;
@@ -1645,16 +1616,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 /* FPS-mode override: app is recentering cursor every frame,
                  * so it wants relative motion deltas. Skip the
                  * "in interior of range = send absolute" heuristic. */
-                absolute = FALSE;
-            }
-            else if (force_cached)
-            {
-                /* PROTON_FORCE_FPS_MOUSE: opt-in to relative motion deltas
-                 * regardless of fullscreen detection or fpsModeActive
-                 * heuristic. Recipes set this for titles (DOOM Eternal)
-                 * whose RIDEV_NOLEGACY raw-input path expects relative
-                 * deltas, and whose window state may not match Wine's
-                 * fpsModeActive triggers. */
                 absolute = FALSE;
             }
             else
@@ -2417,15 +2378,17 @@ static NSString* WineLocalizedString(unsigned int stringID)
                             fallback.width, fallback.height);
                 }
             }
-            /* Bug (Proton macOS) 2026-05-05: wrap layer property mutations
+            /* Bug (Proton macOS) 2026-05-05: wrap all layer property mutations
              * in a CATransaction with implicit actions disabled. Setting
              * .frame / .contentsScale / .autoresizingMask on an already-
              * attached CALayer would otherwise fire CA's default 0.25s
-             * implicit animation. Each E.1 broadcast re-sets these
-             * properties, so without this the user sees a flicker every
-             * time DXMT/winevulkan re-broadcasts. Cmd-Tab "fixes" the
-             * flicker because windowDidBecomeKey forces a synchronous
-             * layout that skips past the in-flight animation. */
+             * implicit animation (kCAOnOrderInAnimation et al). Each E.1
+             * broadcast re-sets these properties, so without this the user
+             * sees a flicker every time DXMT/winevulkan re-broadcasts
+             * (which happens repeatedly during normal rendering as well as
+             * on focus / resize events). Cmd-Tab "fixes" the flicker
+             * because windowDidBecomeKey forces a synchronous layout that
+             * skips past the in-flight animation. */
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
 
@@ -2867,30 +2830,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
             && quitReason != kAEShowRestartDialog
             && quitReason != kAEShowShutdownDialog)
         {
-            /* PROTON_AUTO_EXIT_ON_LAST_WINDOW=1: the user is explicitly
-             * asking the game to exit via Dock-Quit / Cmd-Q / the
-             * Dock-unresponsive timeout. The legacy path of
-             * NSTerminateCancel just refuses to exit, leaving the user
-             * with no clean shutdown. With the env opt-in, route the
-             * cancel through SIGTERM to self: that runs wine's normal
-             * exit handlers including audio teardown, so the process
-             * actually dies and the dock icon goes away. */
-            extern int macdrv_proton_auto_exit_enabled(void);
-            if (macdrv_proton_auto_exit_enabled())
-            {
-                fprintf(stderr,
-                        "winemac: kAEQuit (reason=%d) + PROTON_AUTO_EXIT_ON_LAST_WINDOW=1 - SIGTERM self (pid=%d)\n",
-                        (int)quitReason, getpid());
-                kill(getpid(), SIGTERM);
-                ret = NSTerminateCancel;
-            }
-            else
-            {
-                fprintf(stderr,
-                        "winemac: ignoring unsolicited kAEQuit (reason=%d) - returning NSTerminateCancel\n",
-                        (int)quitReason);
-                ret = NSTerminateCancel;
-            }
+            fprintf(stderr,
+                    "winemac: ignoring unsolicited kAEQuit (reason=%d) - returning NSTerminateCancel\n",
+                    (int)quitReason);
+            ret = NSTerminateCancel;
         }
 
         return ret;
