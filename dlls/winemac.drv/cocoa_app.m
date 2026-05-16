@@ -23,6 +23,9 @@
 #import "cocoa_event.h"
 #import "cocoa_window.h"
 
+#include <signal.h>   /* kill() - used by the PROTON_AUTO_EXIT_ON_LAST_WINDOW
+                       * kAEQuit -> SIGTERM hook in applicationShouldTerminate */
+
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
 
@@ -2830,10 +2833,33 @@ static NSString* WineLocalizedString(unsigned int stringID)
             && quitReason != kAEShowRestartDialog
             && quitReason != kAEShowShutdownDialog)
         {
-            fprintf(stderr,
-                    "winemac: ignoring unsolicited kAEQuit (reason=%d) - returning NSTerminateCancel\n",
-                    (int)quitReason);
-            ret = NSTerminateCancel;
+            /* PROTON_AUTO_EXIT_ON_LAST_WINDOW=1: the user is explicitly
+             * asking the game to exit via Dock-Quit / menu Cmd-Q. The
+             * legacy NSTerminateCancel path refuses to exit, leaving
+             * the user with no clean shutdown when in-game Quit hides
+             * UI but doesn't drive ExitProcess (UE4-style: ABZU, Hades).
+             * With the env opt-in, route the cancel through SIGTERM to
+             * self: wine's signal handler runs the normal exit including
+             * winecoreaudio's process_detach so the audio loop stops
+             * and the process actually dies. Without the env, fall
+             * through to the original cancel-only behaviour.
+             * (Proton macOS) */
+            const char *auto_exit = getenv("PROTON_AUTO_EXIT_ON_LAST_WINDOW");
+            if (auto_exit && auto_exit[0] && auto_exit[0] != '0')
+            {
+                fprintf(stderr,
+                        "winemac: kAEQuit (reason=%d) + PROTON_AUTO_EXIT_ON_LAST_WINDOW=1 - SIGTERM self (pid=%d)\n",
+                        (int)quitReason, getpid());
+                kill(getpid(), SIGTERM);
+                ret = NSTerminateCancel;
+            }
+            else
+            {
+                fprintf(stderr,
+                        "winemac: ignoring unsolicited kAEQuit (reason=%d) - returning NSTerminateCancel\n",
+                        (int)quitReason);
+                ret = NSTerminateCancel;
+            }
         }
 
         return ret;
