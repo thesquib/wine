@@ -1583,9 +1583,30 @@ static NTSTATUS create_logical_proc_info(void)
     if (sysctlbyname("hw.physicalcpu", &cores_no, &size, NULL, 0))
         cores_no = lcpu_no;
 
+    {
+        /* PROTON_CPU_NUM_CORES: override physical-core count to keep
+         * "Number of Processor Cores" honest when PROTON_CPU_NUM_LOGICAL is set
+         * above the host's real physical core count. Without this, lcpu_per_core
+         * computes as N/1 = N and every logical thread reports the same single
+         * physical core — visible in CryEngine's "Number of Processor Cores: 1"
+         * log line. Clamp at PROTON_CPU_NUM_LOGICAL to keep the ratio sane. */
+        const char *env_cores = getenv("PROTON_CPU_NUM_CORES");
+        int forced_cores = env_cores ? atoi(env_cores) : 0;
+        if (forced_cores > 0 && forced_cores <= 256)
+        {
+            unsigned int capped = (unsigned int)forced_cores;
+            if (capped > lcpu_no) capped = lcpu_no;
+            TRACE("PROTON_CPU_NUM_CORES: overriding hw.physicalcpu %u -> %u\n",
+                    cores_no, capped);
+            cores_no = capped;
+        }
+    }
+
     TRACE("%u logical CPUs from %u physical cores across %u packages\n",
             lcpu_no, cores_no, pkgs_no);
 
+    if (!cores_no) cores_no = 1;
+    if (!pkgs_no)  pkgs_no  = 1;
     lcpu_per_core = lcpu_no / cores_no;
     cores_per_package = cores_no / pkgs_no;
 
@@ -1977,9 +1998,54 @@ void init_cpu_info(void)
     FIXME("Detecting the number of processors is not supported.\n");
 #endif
 
-    peb->NumberOfProcessors = cpu_override.mapping.cpu_count
-            ? cpu_override.mapping.cpu_count : num;
+    {
+        /* WINE_FORCE_NUM_PROCESSORS / PROTON_CPU_NUM_LOGICAL: testing knob for
+         * apps that refuse to start their renderer/worker pools when the host
+         * reports too few logical CPUs (e.g. CryEngine 5.5 in KCD2 on Rosetta
+         * where VirtualApple CPUID returns 1). PROTON_CPU_NUM_LOGICAL is the
+         * recipe-facing name; WINE_FORCE_NUM_PROCESSORS kept for back-compat.
+         * Capped at 256 to prevent garbage values. */
+        const char *env_proton = getenv("PROTON_CPU_NUM_LOGICAL");
+        const char *env_force  = getenv("WINE_FORCE_NUM_PROCESSORS");
+        const char *env_pick   = (env_proton && *env_proton) ? env_proton : env_force;
+        int forced = env_pick ? atoi(env_pick) : 0;
+        if (forced > 0 && forced <= 256)
+        {
+            ERR("PROTON_CPU_NUM_LOGICAL/WINE_FORCE_NUM_PROCESSORS: forcing peb->NumberOfProcessors = %u (was %ld from %s)\n",
+                (UINT)forced, num, cpu_override.mapping.cpu_count ? "cpu_override" : "sysctl");
+            peb->NumberOfProcessors = (UINT)forced;
+        }
+        else
+        {
+            peb->NumberOfProcessors = cpu_override.mapping.cpu_count
+                    ? cpu_override.mapping.cpu_count : num;
+        }
+    }
     init_cpu_model();
+    {
+        /* PROTON_CPU_BRAND_STRING: overrides the CPU brand string visible to
+         * Windows callers via NtQuerySystemInformation(SystemProcessorBrandString)
+         * and indirectly the registry HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0
+         * ProcessorNameString. Used by titles (KCD2) that gate vendor branches on
+         * the brand string. Rosetta normally returns "VirtualApple @ 2.50GHz"
+         * which is an unmistakable Apple tell. Limitation: only affects the
+         * Windows API surface — if the game invokes __cpuid leaf 0x80000002-4
+         * inline, this patch is invisible to it (Rosetta owns CPUID translation). */
+        static int brand_init_done = 0;
+        if (!brand_init_done)
+        {
+            const char *env_brand = getenv("PROTON_CPU_BRAND_STRING");
+            brand_init_done = 1;
+            if (env_brand && *env_brand)
+            {
+                size_t blen = strlen(env_brand);
+                if (blen >= sizeof(cpu_name)) blen = sizeof(cpu_name) - 1;
+                memcpy(cpu_name, env_brand, blen);
+                cpu_name[blen] = '\0';
+                ERR("PROTON_CPU_BRAND_STRING: overriding cpu brand to \"%s\"\n", cpu_name);
+            }
+        }
+    }
     get_random( &process_cookie, sizeof(process_cookie) );
 }
 
