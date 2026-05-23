@@ -1010,7 +1010,37 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         CAMetalLayer *layer = [CAMetalLayer layer];
         layer.device = _device;
         layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-        layer.framebufferOnly = YES;
+        /* [KCD2-TEST] PROTON_LAYER_FRAMEBUFFER_ONLY=0 enables screencapture
+         * to read the layer's contents and Metal's debug captures.
+         * Default YES (perf). Cost: ~5% on render perf when sampled. */
+        {
+            static int cached_fbo = -1;
+            if (cached_fbo < 0) {
+                const char *v = getenv("PROTON_LAYER_FRAMEBUFFER_ONLY");
+                cached_fbo = (v && *v && strcmp(v, "0") == 0) ? 0 : 1;
+            }
+            layer.framebufferOnly = cached_fbo ? YES : NO;
+            if (!cached_fbo)
+                fprintf(stderr, "winemac: [KCD2-TEST] CAMetalLayer.framebufferOnly=NO\n");
+        }
+        /* [KCD2-TEST] Force opaque compositing — CryEngine via vkd3d-proton +
+         * MoltenVK on Apple Silicon writes alpha=0 to swapchain pixels (engine
+         * doesn't write the alpha channel; clear is alpha=0). With CAMetalLayer's
+         * default opaque=NO, WindowServer composites the layer's contents as
+         * fully transparent → user sees only the layer's backgroundColor
+         * (black) regardless of RGB content. Verified via screencapture-window:
+         * pixels = (R,G,B,0). Gated by PROTON_FORCE_LAYER_OPAQUE=1. */
+        {
+            static int cached_opaque = -1;
+            if (cached_opaque < 0) {
+                const char *v = getenv("PROTON_FORCE_LAYER_OPAQUE");
+                cached_opaque = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+            }
+            if (cached_opaque) {
+                layer.opaque = YES;
+                fprintf(stderr, "winemac: [KCD2-TEST] CAMetalLayer.opaque=YES via PROTON_FORCE_LAYER_OPAQUE\n");
+            }
+        }
         if (proton_presents_with_transaction_enabled())
             layer.presentsWithTransaction = YES;
         else
