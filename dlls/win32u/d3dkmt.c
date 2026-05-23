@@ -742,7 +742,14 @@ NTSTATUS WINAPI NtGdiDdDDIQueryAdapterInfo( D3DKMT_QUERYADAPTERINFO *desc )
         data = desc->pPrivateDriverData;
         memset( data, 0, sizeof(*data) );
         e = getenv( "WINE_DISABLE_HARDWARE_SCHEDULING" );
-        if ((!e || *e == '\0' || *e == '0') && (driverProperties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY))
+        /* CrossOver Hack #24905 (proton-darwin 2026-05-18 port): also
+         * advertise HwSchEnabled when running on MoltenVK. CryEngine 5.x
+         * branches on D3DKMT_WDDM_2_7_CAPS.HwSchSupported and enters a
+         * "skip render" defensive path when it reads zero. CrossOver
+         * lies when D3DMetal active; we lie when MoltenVK is the driver. */
+        if ((!e || *e == '\0' || *e == '0') &&
+            (driverProperties.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY ||
+             driverProperties.driverID == VK_DRIVER_ID_MOLTENVK))
         {
             data->HwSchEnabled = 1;
             data->HwSchSupported = 1;
