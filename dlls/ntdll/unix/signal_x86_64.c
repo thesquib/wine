@@ -2111,6 +2111,112 @@ static inline BOOL handle_cet_nop( ucontext_t *sigcontext, CONTEXT *context )
 }
 
 /***********************************************************************
+ *           handle_rosetta_prefetch_fault  (PROTON_DARWIN 2026-05-18)
+ *
+ * x86 PREFETCH{T0,T1,T2,NTA,W,WT1} instructions are *architecturally
+ * non-faulting* on real hardware - a prefetch of an unmapped or invalid
+ * address must silently do nothing per Intel SDM Vol 2 PREFETCHh /
+ * PREFETCHW.
+ *
+ * Rosetta 2 translates these as ordinary loads in at least some
+ * scenarios, and an unmapped target raises EXC_BAD_ACCESS which surfaces
+ * as a Mach-O segfault and ultimately STATUS_ACCESS_VIOLATION in the
+ * guest. AAA titles compiled with modern auto-vectorisers contain
+ * hundreds of these in inner loops (KCD2 has 531 in WHGame.dll alone),
+ * and once one fires the entire title becomes unplayable on our stack.
+ *
+ * Workaround: when we see a page-fault whose RIP points at a prefetch
+ * encoding, decode the instruction length and skip past it. The semantic
+ * effect matches what real hardware does (nothing), so we're not
+ * hiding a real bug.
+ *
+ * Encodings handled:
+ *   0F 18 /0       PREFETCHNTA
+ *   0F 18 /1       PREFETCHT0
+ *   0F 18 /2       PREFETCHT1
+ *   0F 18 /3       PREFETCHT2
+ *   0F 18 /4..7    reserved-NOP (Intel treats as PREFETCH on most CPUs)
+ *   0F 0D /1       PREFETCHW
+ *   0F 0D /2       PREFETCHWT1
+ *
+ * Plus the usual REX / legacy-prefix prologue, ModR/M, optional SIB,
+ * and 0/1/4-byte displacement. mod=11 (register form) is rejected -
+ * the encoding is illegal for prefetch and would indicate the fault
+ * is on a different instruction entirely.
+ *
+ * Gated on is_rosetta2 so native x86_64 wine never enters this path.
+ */
+static inline BOOL handle_rosetta_prefetch_fault( ucontext_t *sigcontext, CONTEXT *context )
+{
+    BYTE instr[16];
+    unsigned int i, prefix_count = 0, total;
+    unsigned int len;
+    BYTE op2, modrm, mod, reg_field, rm;
+    unsigned int extra = 0;
+
+    if (!is_rosetta2) return FALSE;
+
+    len = virtual_uninterrupted_read_memory( (BYTE *)context->Rip, instr, sizeof(instr) );
+
+    for (i = 0; i < len && prefix_count < 14; i++)
+    {
+        BYTE b = instr[i];
+        if (b == 0x2e || b == 0x36 || b == 0x3e || b == 0x26 ||
+            (b >= 0x40 && b <= 0x4f) ||
+            b == 0x64 || b == 0x65 || b == 0x66 || b == 0x67 ||
+            b == 0xf0 || b == 0xf2 || b == 0xf3)
+        {
+            prefix_count++;
+            continue;
+        }
+        break;
+    }
+
+    /* need at least 0F + opcode + ModR/M */
+    if (i + 2 >= len) return FALSE;
+    if (instr[i] != 0x0f) return FALSE;
+
+    op2 = instr[i + 1];
+    modrm = instr[i + 2];
+    mod = (modrm >> 6) & 3;
+    reg_field = (modrm >> 3) & 7;
+    rm = modrm & 7;
+
+    if (op2 == 0x18) {
+        /* PREFETCH{NTA,T0,T1,T2} + reserved-NOP forms /4../7 */
+    } else if (op2 == 0x0d) {
+        /* PREFETCHW (/1), PREFETCHWT1 (/2) */
+        if (reg_field != 1 && reg_field != 2) return FALSE;
+    } else {
+        return FALSE;
+    }
+
+    /* register form is not a legal prefetch encoding */
+    if (mod == 3) return FALSE;
+
+    /* ModR/M-only is already counted; add SIB + displacement bytes */
+    if (mod != 3 && rm == 4)
+    {
+        BYTE sib;
+        extra++;  /* SIB */
+        if (i + 3 >= len) return FALSE;
+        sib = instr[i + 3];
+        if (mod == 0 && (sib & 7) == 5) extra += 4;
+    }
+    if (mod == 0 && rm == 5) extra += 4;  /* RIP-relative disp32 */
+    else if (mod == 1) extra += 1;
+    else if (mod == 2) extra += 4;
+
+    total = prefix_count + 3 + extra;
+    if (total > 15) return FALSE;
+
+    RIP_sig(sigcontext) += total;
+    TRACE_(seh)( "skipped Rosetta-faulting PREFETCH instruction (%u bytes, RIP advanced to %p)\n",
+                 total, (void *)RIP_sig(sigcontext) );
+    return TRUE;
+}
+
+/***********************************************************************
  *           emulate_xgetbv  (CW HACK 23427)
  *
  * XGETBV (0F 01 D0) reads xcr0 / xstate-feature mask. Real Intel HW
@@ -3420,6 +3526,13 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         }
         break;
     case TRAP_x86_PAGEFLT:  /* Page fault */
+#ifdef __APPLE__
+        /* PROTON_DARWIN 2026-05-18: Rosetta 2 translates x86 PREFETCH as
+         * a faulting load; native HW treats it as non-faulting. Skip past
+         * the instruction so AAA titles with heavy auto-vectorised inner
+         * loops (KCD2 CryEngine has 531 prefetch sites) don't crash. */
+        if (handle_rosetta_prefetch_fault( ucontext, &context.c )) return;
+#endif
         if ((steamclient_addr = steamclient_handle_fault( siginfo->si_addr, (ERROR_sig(ucontext) >> 1) & 0x09 )))
         {
             RIP_sig(ucontext) = (intptr_t)steamclient_addr;
