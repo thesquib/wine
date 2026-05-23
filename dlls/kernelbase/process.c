@@ -662,6 +662,23 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
             if (options[i].steamgameid && !(GetEnvironmentVariableA( "SteamGameId", sgi, sizeof(sgi) )
                 && !strcmp( sgi, options[i].steamgameid )))
                 continue;
+            /* Bug #74 (Proton macOS): the CEF flag injection for
+             * steamwebhelper.exe was added to fix Mode A UI bugs
+             * (#11 cross-process winemac swapchain, #15 winsock init
+             * race). With Mode B (real Steam-in-bottle) the injection
+             * blocks parent steam.exe from reaching [Logged On] - the
+             * 0x17a0b00 stack overflow in webhelper subprocess threads
+             * propagates back through the in-process renderer. Default
+             * OFF restores [Logged On]; set PROTON_INJECT_CEF_FLAGS=1
+             * to opt back in for UI experiments. Non-Steam entries in
+             * this table are unaffected. */
+            if (!wcscmp( options[i].exe_name, L"steamwebhelper.exe" ))
+            {
+                char gate[8];
+                if (!GetEnvironmentVariableA( "PROTON_INJECT_CEF_FLAGS", gate, sizeof(gate) )
+                    || strcmp( gate, "1" ))
+                    continue;
+            }
             FIXME( "HACK: appending %s to command line.\n", debugstr_w(options[i].append) );
             return options[i].append;
         }
