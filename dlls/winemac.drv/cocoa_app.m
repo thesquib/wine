@@ -114,6 +114,37 @@ void macdrv_remove_orphan_views_for_view(void *opaque_view, const char *call_sit
     (void)opaque_view; (void)call_site;
 }
 
+/* Bug (Proton macOS) 2026-05-18 queued 0052: PROTON_E1_DIAG.
+ * Cached single getenv. Log-only, default off. Discriminates among the
+ * four KCD2-class failure modes for the E.1 cross-process layer-host
+ * path (see patch commit message for the (A)-(D) classification). */
+static int proton_e1_diag_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_E1_DIAG");
+        cached = (v && *v && strcmp(v, "0") != 0) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Bug (Proton macOS) 2026-05-23 overlay 0050 (v2): per-appid skip.
+ * DOOM Eternal (782330) hit kIOGPUCommandBufferCallbackErrorInnocentVictim
+ * with the original setPresentationOptions-based 0050 (2026-05-14 regression,
+ * commit 603bf61). The v2 patch uses [NSMenu setMenuBarVisible:] which is
+ * hypothesised safer, but as a safety belt we hard-skip Eternal so even if
+ * the API turns out to be equivalent under the hood, Eternal is unaffected.
+ * Cached single getenv to keep the hot path free of repeat string compares. */
+static int proton_menubar_hide_skip_appid(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *id = getenv("SteamAppId");
+        cached = (id && !strcmp(id, "782330")) ? 1 : 0;
+    }
+    return cached;
+}
+
 __attribute__((visibility("default")))
 void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer)
 {
@@ -205,6 +236,13 @@ void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer)
         doBroadcast();
         fprintf(stderr, "winemac:E.1-vulkan - broadcast hwnd=%p ctxId=%u pid=%d layer=%p (firstTime=%d)\n",
                 hwnd, contextId, getpid(), metal_layer, firstTime);
+
+        /* Queued 0052 [E1-DIAG]: anchor publish timing for receive correlation. */
+        if (proton_e1_diag_enabled()) {
+            fprintf(stderr, "winemac:[E1-DIAG] publish pid=%d hwnd=%p layer=%p firstTime=%d ctxId=%u\n",
+                    getpid(), hwnd, metal_layer, (int)firstTime, contextId);
+            fflush(stderr);
+        }
 
         /* On the first broadcast, arm the same retry pattern as DXMT - the
          * target NSWindow may not be on_screen yet when surface_create
@@ -311,6 +349,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
+    - (void) updateMenuBarHiding;
     - (void) handleDXMTRemoteLayerHostRequest:(NSNotification *)note;
 
     static void PerformRequest(void *info);
@@ -931,6 +970,62 @@ static NSString* WineLocalizedString(unsigned int stringID)
                     displaysCapturedForFullscreen = FALSE;
             }
         }
+
+        /* PROTON_NO_LEVEL_ELEVATION suppresses the captured-display /
+         * NSStatusWindowLevel elevation that would otherwise hide the
+         * menubar via window level. Compensate by toggling
+         * +[NSMenu setMenuBarVisible:] so fullscreen wine windows
+         * appear edge-to-edge. setMenuBarVisible: does NOT alter
+         * NSScreen.visibleFrame (unlike setPresentationOptions), so
+         * in-flight IOSurfaces in the compositor lane are not
+         * invalidated. See patch header for the Eternal regression
+         * that motivated the API swap. */
+        [self updateMenuBarHiding];
+    }
+
+    - (void) updateMenuBarHiding
+    {
+        static int gate_cached = -1;
+        BOOL anyFullscreenActive = FALSE;
+        BOOL desiredVisible;
+
+        if (gate_cached < 0)
+        {
+            const char *v = getenv("PROTON_NO_LEVEL_ELEVATION");
+            gate_cached = (v && *v && *v != '0') ? 1 : 0;
+        }
+        if (!gate_cached) return;
+
+        /* Per-appid safety belt. DOOM Eternal (782330) bails out
+         * regardless of which AppKit hide API we use. 2026-05-23
+         * empirical confirmation: even with setMenuBarVisible: (not
+         * setPresentationOptions:), removing this skip black-screens
+         * Eternal's main menu. Keep the skip. */
+        if (proton_menubar_hide_skip_appid()) return;
+
+        if ([NSApp isActive])
+        {
+            for (NSNumber* windowNumber in [NSWindow windowNumbersWithOptions:0])
+            {
+                WineWindow* window = (WineWindow*)[NSApp windowWithWindowNumber:[windowNumber integerValue]];
+                if ([window isKindOfClass:[WineWindow class]] && window.fullscreen)
+                {
+                    anyFullscreenActive = TRUE;
+                    break;
+                }
+            }
+        }
+
+        /* Deployment verification marker. The literal "[PROTON-MENUBAR-HIDE]"
+         * is unique enough to survive into `strings winemac.so` output, which
+         * lets us confirm a built binary actually picked up this overlay
+         * (ObjC selector names do not reliably show up in strings). */
+        fprintf(stderr, "winemac: [PROTON-MENUBAR-HIDE] anyFullscreen=%d skip_appid=%d\n",
+                (int)anyFullscreenActive, proton_menubar_hide_skip_appid());
+
+        desiredVisible = anyFullscreenActive ? NO : YES;
+        if ([NSMenu menuBarVisible] != desiredVisible)
+            [NSMenu setMenuBarVisible:desiredVisible];
     }
 
     - (void) activeSpaceDidChange
@@ -1381,7 +1476,14 @@ static NSString* WineLocalizedString(unsigned int stringID)
             {
                 lastSetCursorPositionTime = [[NSProcessInfo processInfo] systemUptime];
 
-                CGAssociateMouseAndMouseCursorPosition(true);
+                /* PROTON_FORCE_FPS_MOUSE: when disassociation is engaged
+                 * (FPS mode on), the game is calling SetCursorPos every
+                 * frame to recenter the cursor for raw input. Re-associating
+                 * here on every warp undoes the disassociation and causes
+                 * the cursor to track mouse → motion deltas get trampled
+                 * by the next recenter warp. Keep disassociation sticky. */
+                if (!macdrv_mouse_disassociated)
+                    CGAssociateMouseAndMouseCursorPosition(true);
             }
         }
 
@@ -1603,6 +1705,19 @@ static NSString* WineLocalizedString(unsigned int stringID)
                               || (cursor_clipping_locks_windows
                                   && [(WineWindow*)targetWindow respondsToSelector:@selector(fullscreen)]
                                   && [(WineWindow*)targetWindow fullscreen]);
+            /* PROTON_FORCE_FPS_MOUSE=1: force fpsModeActive on any
+             * target window, ignoring the [fullscreen] gate. Fix for
+             * titles (DOOM Eternal) whose RIDEV_NOLEGACY raw input
+             * path needs cursor disassociation but whose window state
+             * doesn't match Wine's heuristic (borderless-sized-to-
+             * screen vs Wine's [fullscreen] property). */
+            static int force_cached = -1;
+            if (force_cached < 0) {
+                const char *v = getenv("PROTON_FORCE_FPS_MOUSE");
+                force_cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+            }
+            if (force_cached && targetWindow)
+                fpsModeActive = YES;
             if (fpsModeActive != macdrv_mouse_disassociated) {
                 CGAssociateMouseAndMouseCursorPosition(!fpsModeActive);
                 macdrv_mouse_disassociated = fpsModeActive;
@@ -1619,6 +1734,16 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 /* FPS-mode override: app is recentering cursor every frame,
                  * so it wants relative motion deltas. Skip the
                  * "in interior of range = send absolute" heuristic. */
+                absolute = FALSE;
+            }
+            else if (force_cached)
+            {
+                /* PROTON_FORCE_FPS_MOUSE: opt-in to relative motion deltas
+                 * regardless of fullscreen detection or fpsModeActive
+                 * heuristic. Recipes set this for titles (DOOM Eternal)
+                 * whose RIDEV_NOLEGACY raw-input path expects relative
+                 * deltas, and whose window state may not match Wine's
+                 * fpsModeActive triggers. */
                 absolute = FALSE;
             }
             else
@@ -2286,12 +2411,32 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 getpid(), hwnd, contextId, senderPid);
         (void)senderPid; /* same-process is fine: game and DXMT live together */
 
+        /* Queued 0052 [E1-DIAG]: discriminate failure-mode (A) "broadcast not received". */
+        if (proton_e1_diag_enabled()) {
+            fprintf(stderr, "winemac:[E1-DIAG] receive pid=%d hwnd=%p ctxId=%u senderPid=%d sameProc=%d\n",
+                    getpid(), hwnd, contextId, senderPid, (int)(senderPid == getpid()));
+            fflush(stderr);
+        }
+
         void *outHwnd = NULL;
         int isWindow = 0;
         void *target = macdrv_resolve_hwnd_for_hosting(hwnd, &outHwnd, &isWindow);
         fprintf(stderr, "winemac:E.1 - pid=%d resolver returned hwnd=%p target=%p isWindow=%d\n",
                 getpid(), outHwnd, target, isWindow);
-        if (!target) return;
+        /* Queued 0052 [E1-DIAG]: discriminate failure-mode (B) "owner also empty win_data". */
+        if (proton_e1_diag_enabled()) {
+            fprintf(stderr, "winemac:[E1-DIAG] resolve pid=%d target=%p outHwnd=%p isWindow=%d\n",
+                    getpid(), target, outHwnd, isWindow);
+            fflush(stderr);
+        }
+        if (!target) {
+            if (proton_e1_diag_enabled()) {
+                fprintf(stderr, "winemac:[E1-DIAG] receiveAbort reason=noTarget pid=%d hwnd=%p\n",
+                        getpid(), hwnd);
+                fflush(stderr);
+            }
+            return;
+        }
 
         BOOL sameProcess = (senderPid == getpid());
         uintptr_t layerPtrVal = [(NSNumber *)info[@"layerPtr"] unsignedLongLongValue];
@@ -2307,13 +2452,34 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             if (!view) {
                 fprintf(stderr, "winemac:E.1 - no view available\n");
+                if (proton_e1_diag_enabled()) {
+                    fprintf(stderr, "winemac:[E1-DIAG] receiveAbort reason=noView pid=%d hwnd=%p\n",
+                            getpid(), hwnd);
+                    fflush(stderr);
+                }
                 return;
             }
             [view setWantsLayer:YES];
             CALayer *parentLayer = [view layer];
             if (!parentLayer) {
                 fprintf(stderr, "winemac:E.1 - view=%p has no layer (after wantsLayer)\n", (void *)view);
+                if (proton_e1_diag_enabled()) {
+                    fprintf(stderr, "winemac:[E1-DIAG] receiveAbort reason=noParentLayer pid=%d hwnd=%p view=%p\n",
+                            getpid(), hwnd, (void *)view);
+                    fflush(stderr);
+                }
                 return;
+            }
+
+            /* Queued 0052 [E1-DIAG]: discriminate failure-mode (C) "view hidden / unparented / 0x0 frame". */
+            if (proton_e1_diag_enabled()) {
+                NSRect winFrame = view.window ? [view.window frame] : NSZeroRect;
+                fprintf(stderr,
+                        "winemac:[E1-DIAG] view pid=%d view=%p layer=%p viewHidden=%d windowVisible=%d windowKey=%d viewSuperview=%p windowFrame=%gx%g\n",
+                        getpid(), (void *)view, (void *)parentLayer,
+                        (int)[view isHidden], (int)[view.window isVisible], (int)[view.window isKeyWindow],
+                        (void *)[view superview], winFrame.size.width, winFrame.size.height);
+                fflush(stderr);
             }
 
             CALayer *child = nil;
@@ -2462,6 +2628,15 @@ static NSString* WineLocalizedString(unsigned int stringID)
                     parentLayer.bounds.size.width, parentLayer.bounds.size.height,
                     parentLayer.contentsScale, (unsigned long)parentLayer.sublayers.count, sameProcess,
                     [view isHidden], [view.window isVisible]);
+
+            /* Queued 0052 [E1-DIAG]: confirm attach committed; correlates with publish on senderPid. */
+            if (proton_e1_diag_enabled()) {
+                fprintf(stderr,
+                        "winemac:[E1-DIAG] attach ok pid=%d child=%p childFrame=%gx%g childContents=%p parentSublayers=%lu sameProc=%d\n",
+                        getpid(), (void *)child, child.frame.size.width, child.frame.size.height,
+                        (void *)child.contents, (unsigned long)parentLayer.sublayers.count, (int)sameProcess);
+                fflush(stderr);
+            }
         });
     }
 
@@ -2743,6 +2918,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_release_event(event);
 
         [self releaseMouseCapture];
+        [self updateMenuBarHiding];
     }
 
     - (void) applicationDidUnhide:(NSNotification*)aNotification
