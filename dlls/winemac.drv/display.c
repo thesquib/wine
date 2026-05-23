@@ -90,10 +90,38 @@ static int display_mode_bits_per_pixel(CGDisplayModeRef display_mode)
 }
 
 
+/* CrossOver Hack #18576 (proton-darwin 2026-05-18): under Rosetta on
+ * Apple Silicon, many display modes lack kDisplayModeSafeFlag (retina-
+ * scaled resolutions in particular). Without this relaxation, those
+ * modes are filtered out of EnumDisplaySettings and CryEngine 5.5
+ * games (e.g. KCD2) see zero usable display modes, then their renderer
+ * enters a defensive "no valid display, skip draw" path. Source:
+ * CrossOver Preview 27 wine/dlls/winemac.drv/display.c (CW Hack 18576). */
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#include <pthread.h>
+static int proton_apple_silicon_status;
+static void proton_init_is_apple_silicon(void)
+{
+    int ret = 0;
+    size_t size = sizeof(ret);
+    if (sysctlbyname("sysctl.proc_translated", &ret, &size, NULL, 0) == -1)
+        proton_apple_silicon_status = 0;
+    else
+        proton_apple_silicon_status = ret;
+}
+static int proton_is_apple_silicon(void)
+{
+    static pthread_once_t init_once = PTHREAD_ONCE_INIT;
+    pthread_once(&init_once, proton_init_is_apple_silicon);
+    return proton_apple_silicon_status;
+}
+
 static BOOL display_mode_is_supported(CGDisplayModeRef display_mode)
 {
     uint32_t io_flags = CGDisplayModeGetIOFlags(display_mode);
-    return (io_flags & kDisplayModeValidFlag) && (io_flags & kDisplayModeSafeFlag);
+    return (io_flags & kDisplayModeValidFlag) &&
+           ((io_flags & kDisplayModeSafeFlag) || proton_is_apple_silicon());
 }
 
 
