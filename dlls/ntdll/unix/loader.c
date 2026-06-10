@@ -93,6 +93,9 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "unix_private.h"
+#ifdef __APPLE__
+#include "msync.h"
+#endif
 #include "wine/list.h"
 #include "ntsyscalls.h"
 #include "wine/debug.h"
@@ -2470,6 +2473,9 @@ static void start_main_thread(void)
     dbg_init();
     startup_info_size = server_init_process();
     hacks_init();
+#ifdef __APPLE__
+    msync_init();
+#endif
     virtual_map_user_shared_data();
     init_cpu_info();
     init_files();
