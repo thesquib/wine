@@ -21,6 +21,7 @@ SOURCES = \
 	inproc_sync.c \
 	mach.c \
 	mailslot.c \
+	msync.c \
 	main.c \
 	mapping.c \
 	mutex.c \
