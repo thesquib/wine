@@ -75,6 +75,9 @@
 #include "unix_private.h"
 
 #include "fsync.h"
+#ifdef __APPLE__
+#include "msync.h"
+#endif
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -482,6 +485,60 @@ static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_
     return errno_to_status( errno );
 }
 
+#elif defined(__APPLE__) /* NTSYNC_IOC_EVENT_READ */
+
+/* Proton macOS (msync unify 2026-06-03): on Apple Silicon there is no
+ * /dev/ntsync, so the in-process inproc_sync backend routes its low-level
+ * object ops to the Mach-port msync implementation (dlls/ntdll/unix/msync.c).
+ * This is the same seam CrossOver uses; it keeps proton's inproc_sync caching
+ * and server protocol intact while substituting the macOS fast-sync engine. */
+
+static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
+{
+    return msync_release_semaphore_obj( obj, count, prev_count );
+}
+
+static NTSTATUS linux_query_semaphore_obj( int obj, SEMAPHORE_BASIC_INFORMATION *info )
+{
+    return msync_query_semaphore_obj( obj, info );
+}
+
+static NTSTATUS linux_set_event_obj( int obj, LONG *prev_state )
+{
+    return msync_set_event_obj( obj, prev_state );
+}
+
+static NTSTATUS linux_reset_event_obj( int obj, LONG *prev_state )
+{
+    return msync_reset_event_obj( obj, prev_state );
+}
+
+static NTSTATUS linux_pulse_event_obj( int obj, LONG *prev_state )
+{
+    return msync_pulse_event_obj( obj, prev_state );
+}
+
+static NTSTATUS linux_query_event_obj( int obj, EVENT_BASIC_INFORMATION *info )
+{
+    return msync_query_event_obj( obj, info );
+}
+
+static NTSTATUS linux_release_mutex_obj( int obj, LONG *prev_count )
+{
+    return msync_release_mutex_obj( obj, prev_count );
+}
+
+static NTSTATUS linux_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
+{
+    return msync_query_mutex_obj( obj, info );
+}
+
+static NTSTATUS linux_wait_objs( int device, DWORD count, const int *objs, WAIT_TYPE type,
+                                 int alert_fd, const LARGE_INTEGER *timeout )
+{
+    return msync_wait_objs( count, objs, type != WaitAll, alert_fd, timeout );
+}
+
 #else /* NTSYNC_IOC_EVENT_READ */
 
 static NTSTATUS linux_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
@@ -667,7 +724,15 @@ static void release_inproc_sync( struct inproc_sync *sync )
     LONG ref = InterlockedDecrement( &sync->refcount );
 
     assert( ref >= 0 );
-    if (!ref) close( fd );
+    if (!ref)
+    {
+#ifdef __APPLE__
+        if (do_msync())
+            msync_close( fd );
+        else
+#endif
+            close( fd );
+    }
 }
 
 static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
@@ -708,8 +773,19 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
         {
             obj_handle_t fd_handle;
             sync->refcount = 1;
-            sync->fd = wine_server_receive_fd( &fd_handle );
-            assert( wine_server_ptr_handle(fd_handle) == handle );
+#ifdef __APPLE__
+            if (do_msync())
+            {
+                /* msync uses an index into the shared-memory ring, not a real
+                 * fd; reuse proton's existing fsync_shm_idx reply field. */
+                sync->fd = reply->fsync_shm_idx;
+            }
+            else
+#endif
+            {
+                sync->fd = wine_server_receive_fd( &fd_handle );
+                assert( wine_server_ptr_handle(fd_handle) == handle );
+            }
             sync->access = reply->access;
             sync->type = reply->type;
             sync->closed = 0;
@@ -939,6 +1015,9 @@ int get_inproc_alert_fd(void)
             if (!server_call_unlocked( req ))
             {
                 if (do_fsync()) data->alert_fd = fd = reply->fsync_shm_idx;
+#ifdef __APPLE__
+                else if (do_msync()) data->alert_fd = fd = reply->fsync_shm_idx;
+#endif
                 else
                 {
                     data->alert_fd = fd = wine_server_receive_fd( &token );
@@ -2519,6 +2598,21 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
             if (ret != STATUS_NOT_IMPLEMENTED)
                 return ret;
         }
+#ifdef __APPLE__
+        /* C0/C1: under msync, route the alertable delay through the in-process
+         * fast-path (a zero-object wait on the alert object) instead of storming
+         * the server with NtWaitForAlertByThreadId. Returns STATUS_USER_APC if an
+         * APC is pending, STATUS_TIMEOUT (-> STATUS_SUCCESS) when the delay
+         * elapses. The C1 alert re-check lives in msync_wait_objs(). */
+        if (do_msync() && inproc_device_fd >= 0)
+        {
+            int alert_fd = get_inproc_alert_fd();
+
+            status = linux_wait_objs( inproc_device_fd, 0, NULL, WaitAny, alert_fd, timeout );
+            if (status == STATUS_TIMEOUT) status = STATUS_SUCCESS;
+            return status;
+        }
+#endif
         /* Since server_wait will result in an unconditional implicit yield,
            we never return STATUS_NO_YIELD_PERFORMED */
         if ((status = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, timeout )) == STATUS_TIMEOUT)

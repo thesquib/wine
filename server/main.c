@@ -43,6 +43,9 @@
 #include "security.h"
 
 #include "fsync.h"
+#ifdef __APPLE__
+#include "msync.h"
+#endif
 
 /* command-line options */
 int debug_level = 0;
@@ -260,10 +263,16 @@ int main( int argc, char *argv[] )
     init_limits();
 
     sock_init();
+#ifdef __APPLE__
+    msync_init_shm();
+#endif
     open_master_socket();
 
     if (do_fsync())
         fsync_init();
+#ifdef __APPLE__
+    msync_init();
+#endif
 
     if (debug_level) fprintf( stderr, "wineserver: starting (pid=%ld)\n", (long) getpid() );
     set_current_time();
