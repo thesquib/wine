@@ -740,6 +740,42 @@ static inline int get_queue_status( struct msg_queue *queue )
             queue_shm->internal_bits;
 }
 
+/* Detroit ring-freeze probe cycle 4 (queue signal path, throwaway diag):
+ * cycle 3 proved the orphan sync tid 0914 blocks on forever is a msg_queue->sync
+ * (create_internal_sync at queue.c:340). This probe answers the binary "why":
+ * during the freeze, is signal_sync(queue->sync) still being CALLED for that
+ * queue (=> the macOS inproc/msync propagation for a MANUAL_SERVER queue sync is
+ * broken and the waiter never wakes) or is it NEVER called (=> producer-side gap:
+ * no posted message / input / timer sets a wake bit on that queue on macOS)?
+ * Logs each set_queue_bits with the queue's sync fd (= the obj# ntdll waits on),
+ * the bits, and whether it signaled, to /tmp/dtr-queue.log (separate file so it
+ * does not clobber cycle-3's /tmp/dtr-srv.log). At analysis: match the freeze
+ * orphan's obj# to fd here and grep the freeze-window tail for that fd. Lightweight
+ * (proven-safe cycle-3 pattern): cached enable + one line-buffered FILE, no per-call
+ * getenv/fopen; the non-signaled path is throttled 1/512 to bound the hot loop.
+ * Gated on PROTON_DTR_WAIT_TRACE. Remove after the Detroit (1222140) investigation. */
+static void proton_dtr_qsig( struct msg_queue *queue, unsigned int bits, int signaled )
+{
+    static int dtr = -1;
+    static FILE *f = NULL;
+    static unsigned int skipped = 0;
+
+    if (dtr < 0)
+    {
+        const char *e = getenv( "PROTON_DTR_WAIT_TRACE" );
+        dtr = (e && *e && *e != '0') ? 1 : 0;
+        if (dtr)
+        {
+            f = fopen( "/tmp/dtr-queue.log", "w" );
+            if (f) setvbuf( f, NULL, _IOLBF, 0 );
+        }
+    }
+    if (!dtr || !f || get_inproc_device_fd() < 0) return;
+    if (!signaled && (++skipped & 0x1ff)) return;   /* throttle the non-signaled hot path */
+    fprintf( f, "[DTR-QSIG] fd=%d bits=0x%x sig=%d\n",
+             get_inproc_sync_fd( (struct inproc_sync *)queue->sync ), bits, signaled );
+}
+
 /* set some queue bits */
 static inline void set_queue_bits( struct msg_queue *queue, unsigned int bits )
 {
@@ -762,7 +798,12 @@ static inline void set_queue_bits( struct msg_queue *queue, unsigned int bits )
     }
     SHARED_WRITE_END;
 
-    if (get_queue_status( queue )) signal_sync( queue->sync );
+    if (get_queue_status( queue ))
+    {
+        proton_dtr_qsig( queue, bits, 1 );
+        signal_sync( queue->sync );
+    }
+    else proton_dtr_qsig( queue, bits, 0 );
 }
 
 /* clear some queue bits */
@@ -3266,7 +3307,7 @@ DECL_HANDLER(set_queue_mask)
     SHARED_WRITE_END;
 
     if (!get_queue_status( queue )) reset_sync( queue->sync );
-    else signal_sync( queue->sync );
+    else { proton_dtr_qsig( queue, 0x10001, 1 ); signal_sync( queue->sync ); }
 }
 
 
@@ -3545,7 +3586,7 @@ DECL_HANDLER(get_message)
     SHARED_WRITE_END;
 
     if (!get_queue_status( queue )) reset_sync( queue->sync );
-    else signal_sync( queue->sync );
+    else { proton_dtr_qsig( queue, 0x10002, 1 ); signal_sync( queue->sync ); }
     set_error( STATUS_PENDING );  /* FIXME */
 }
 

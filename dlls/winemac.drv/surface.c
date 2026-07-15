@@ -26,10 +26,49 @@
 
 #include "config.h"
 
+#include <stdio.h>
+#include <stdlib.h>
+
 #include "macdrv.h"
 #include "winuser.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(bitblt);
+
+/* PROTON_CEF_FLUSH: log-only window-surface flush probe (Steam-in-bottle CEF
+ * black-window investigation, 2026-06-21). Default off. Tag [CEF-FLUSH].
+ * Tunable throttle: PROTON_CEF_FLUSH_WARMUP (default 40), PROTON_CEF_FLUSH_PERIOD
+ * (default 120). Remove after the surface-vs-present hypothesis is split. */
+static int proton_cef_flush_enabled(void)
+{
+    static int cached = -1;
+    if (cached == -1) {
+        const char *v = getenv("PROTON_CEF_FLUSH");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+
+static unsigned long proton_cef_flush_warmup(void)
+{
+    static long cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_CEF_FLUSH_WARMUP");
+        cached = (v && v[0]) ? atol(v) : 40;
+        if (cached < 0) cached = 0;
+    }
+    return (unsigned long)cached;
+}
+
+static unsigned long proton_cef_flush_period(void)
+{
+    static long cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_CEF_FLUSH_PERIOD");
+        cached = (v && v[0]) ? atol(v) : 120;
+        if (cached < 1) cached = 1;
+    }
+    return (unsigned long)cached;
+}
 
 static inline int get_dib_stride(int width, int bpp)
 {
@@ -85,6 +124,58 @@ static BOOL macdrv_surface_flush(struct window_surface *window_surface, const RE
     CGImageAlphaInfo alpha_info = (window_surface->alpha_mask ? kCGImageAlphaPremultipliedFirst : kCGImageAlphaNoneSkipFirst);
     CGColorSpaceRef colorspace;
     CGImageRef image;
+
+    if (proton_cef_flush_enabled())
+    {
+        static unsigned long count = 0;
+        unsigned long n = __atomic_add_fetch(&count, 1, __ATOMIC_RELAXED);
+        if (n <= proton_cef_flush_warmup() || (n % proton_cef_flush_period()) == 0)
+        {
+            int w = color_info->bmiHeader.biWidth;
+            int h = abs(color_info->bmiHeader.biHeight);
+            int stride = h ? (int)(color_info->bmiHeader.biSizeImage / h) : 0;
+            const unsigned char *bits = color_bits;
+            unsigned int cpx = 0;
+            int nonblack = 0, sampled = 0, gx, gy;
+            if (bits && w > 0 && h > 0 && stride > 0)
+            {
+                int cx = w / 2, cy = h / 2;
+                cpx = *(const unsigned int *)(bits + (size_t)cy * stride + (size_t)cx * 4);
+                for (gy = 0; gy < 16; gy++)
+                    for (gx = 0; gx < 16; gx++)
+                    {
+                        int px = (w * gx) / 16, py = (h * gy) / 16;
+                        unsigned int v = *(const unsigned int *)(bits + (size_t)py * stride + (size_t)px * 4);
+                        sampled++;
+                        if (v & 0x00ffffff) nonblack++;   /* any non-zero RGB, ignore alpha byte */
+                    }
+            }
+            /* Compare the provider buffer (what the CGImage is built from) to
+             * color_bits (what wine just painted). If they differ, the image
+             * shows the stale black initial fill, not the content. */
+            unsigned int provpx = 0xdeadbeef; size_t provlen = 0;
+            if (surface && surface->provider && w > 0 && h > 0 && stride > 0)
+            {
+                CFDataRef pd = CGDataProviderCopyData(surface->provider);
+                if (pd)
+                {
+                    const unsigned char *pb = CFDataGetBytePtr(pd);
+                    provlen = CFDataGetLength(pd);
+                    size_t off = (size_t)(h/2) * stride + (size_t)(w/2) * 4;
+                    if (pb && off + 4 <= provlen)
+                        provpx = *(const unsigned int *)(pb + off);
+                    CFRelease(pd);
+                }
+            }
+            fprintf(stderr,
+                    "winemac: [CEF-FLUSH] hwnd=%p win=%p rect=%ld,%ld-%ld,%ld dim=%dx%d stride=%d "
+                    "centerBGRA=%08x providerCenter=%08x provlen=%zu nonblack=%d/%d alpha_mask=%u n=%lu\n",
+                    window_surface->hwnd, surface ? surface->window : NULL,
+                    (long)rect->left, (long)rect->top, (long)rect->right, (long)rect->bottom,
+                    w, h, stride, cpx, provpx, provlen, nonblack, sampled, window_surface->alpha_mask, n);
+            fflush(stderr);
+        }
+    }
 
     colorspace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     image = CGImageCreate(color_info->bmiHeader.biWidth, abs(color_info->bmiHeader.biHeight), 8, 32,

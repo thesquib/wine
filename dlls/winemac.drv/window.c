@@ -203,17 +203,24 @@ struct macdrv_win_data *get_win_data(HWND hwnd)
 
     /* DXMT-Mac debug: lookup miss. Dump dict size + a sample of keys so we
      * know whether win_datas is empty (winemac.drv hasn't created any yet)
-     * or just missing this HWND (timing/race). */
+     * or just missing this HWND (timing/race). Gated behind
+     * PROTON_WINEMAC_WINDATA_DIAG=1 (default OFF): this fprintf is immune to
+     * WINEDEBUG and, unbounded under Steam CEF's constant lookups, ballooned a
+     * bridge log to 28GB (2026-07-08). */
     {
-        CFIndex count = win_datas ? CFDictionaryGetCount(win_datas) : -1;
-        fprintf(stderr, "winemac:get_win_data MISS for hwnd=%p, win_datas=%p count=%ld\n",
-                hwnd, win_datas, (long)count);
-        if (win_datas && count > 0 && count < 20) {
-            const void **keys = malloc(sizeof(void*) * count);
-            CFDictionaryGetKeysAndValues(win_datas, keys, NULL);
-            for (CFIndex i = 0; i < count; i++)
-                fprintf(stderr, "  win_datas key[%ld]=%p\n", (long)i, keys[i]);
-            free(keys);
+        static int diag = -1;
+        if (diag < 0) diag = getenv("PROTON_WINEMAC_WINDATA_DIAG") ? 1 : 0;
+        if (diag) {
+            CFIndex count = win_datas ? CFDictionaryGetCount(win_datas) : -1;
+            fprintf(stderr, "winemac:get_win_data MISS for hwnd=%p, win_datas=%p count=%ld\n",
+                    hwnd, win_datas, (long)count);
+            if (win_datas && count > 0 && count < 20) {
+                const void **keys = malloc(sizeof(void*) * count);
+                CFDictionaryGetKeysAndValues(win_datas, keys, NULL);
+                for (CFIndex i = 0; i < count; i++)
+                    fprintf(stderr, "  win_datas key[%ld]=%p\n", (long)i, keys[i]);
+                free(keys);
+            }
         }
     }
 
@@ -1282,6 +1289,20 @@ static void macdrv_client_surface_detach(struct client_surface *client)
  * later WM_NCCREATE) can host the layer into a visible WineContentView. */
 extern void macdrv_broadcast_vulkan_layer_host_request(void *hwnd, void *metal_layer);
 
+/* Bug A diagnostic (CEF surface-lost): trace whether the per-surface
+ * cocoa_view for the CEF render-widget child window actually ends up shown
+ * and parented onto a visible login window. Log-only, gated PROTON_CEF_SURFACE_TRACE=1,
+ * tag [CEF-SURF]. Cached single getenv. Strip before ship. */
+static int proton_cef_surface_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached == -1) {
+        const char *v = getenv("PROTON_CEF_SURFACE_TRACE");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+
 static void macdrv_client_surface_update(struct client_surface *client)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
@@ -1311,10 +1332,15 @@ static void macdrv_client_surface_update(struct client_surface *client)
         if (surface->metal_view)
         {
             void *metal_layer = (void *)macdrv_view_get_metal_layer(surface->metal_view);
-            fprintf(stderr,
-                    "winemac:E.1-vulkan - surface_update MISS for hwnd=%p toplevel=%p, "
-                    "broadcasting metal_layer=%p\n",
-                    hwnd, toplevel, metal_layer);
+            {
+                static int diag = -1;
+                if (diag < 0) diag = getenv("PROTON_WINEMAC_WINDATA_DIAG") ? 1 : 0;
+                if (diag)
+                    fprintf(stderr,
+                            "winemac:E.1-vulkan - surface_update MISS for hwnd=%p toplevel=%p, "
+                            "broadcasting metal_layer=%p\n",
+                            hwnd, toplevel, metal_layer);
+            }
             if (metal_layer)
                 macdrv_broadcast_vulkan_layer_host_request((void *)toplevel, metal_layer);
         }
@@ -1322,6 +1348,19 @@ static void macdrv_client_surface_update(struct client_surface *client)
     }
     OffsetRect(&rect, data->rects.client.left - data->rects.visible.left, data->rects.client.top - data->rects.visible.top);
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(rect));
+    if (proton_cef_surface_trace_enabled())
+    {
+        fprintf(stderr,
+                "[CEF-SURF] update hwnd=%p toplevel=%p surface->cocoa_view=%p "
+                "set_superview(super=%p cocoa_window=%p) is_child=%d "
+                "frame=(%d,%d %dx%d)\n",
+                hwnd, toplevel, surface->cocoa_view,
+                (toplevel == hwnd) ? NULL : data->client_view, data->cocoa_window,
+                (toplevel != hwnd) ? 1 : 0,
+                (int)rect.left, (int)rect.top,
+                (int)(rect.right - rect.left), (int)(rect.bottom - rect.top));
+        fflush(stderr);
+    }
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
     release_win_data(data);
 }
@@ -1333,9 +1372,63 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (!(data = get_win_data(surface->client.hwnd))) return;
+    if (!(data = get_win_data(surface->client.hwnd)))
+    {
+        if (proton_cef_surface_trace_enabled())
+        {
+            fprintf(stderr,
+                    "[CEF-SURF] present hwnd=%p NO_WIN_DATA (surface->cocoa_view=%p) "
+                    "view not shown/parented this call\n",
+                    surface->client.hwnd, surface->cocoa_view);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (proton_cef_surface_trace_enabled())
+    {
+        macdrv_view content_view = data->cocoa_window ?
+                macdrv_window_get_content_view(data->cocoa_window) : NULL;
+        fprintf(stderr,
+                "[CEF-SURF] present hwnd=%p surface->cocoa_view=%p client_view=%p "
+                "cocoa_window=%p content_view=%p will_show=%d (chosen view becomes visible "
+                "subview of cocoa_window's content tree)\n",
+                surface->client.hwnd, surface->cocoa_view, data->client_view,
+                data->cocoa_window, content_view,
+                (data->client_view != surface->cocoa_view) ? 1 : 0);
+        fflush(stderr);
+    }
     if (data->client_view != surface->cocoa_view)
     {
+        /* Bug (Proton macOS 2026-06-22): Steam's CEF gpu-process creates a
+         * Vulkan swapchain surface -> an empty client cocoa_view parented
+         * NSWindowAbove the contentView -> but never presents a real GPU frame
+         * (web-views GPU disabled). That empty overlay has contents==nil, so it
+         * composites TRANSPARENT and hides the software-painted (GDI) content on
+         * the contentView underneath -> the window shows the desktop straight
+         * through it. Don't promote/show the overlay when this surface has no
+         * Metal frames AND the window's contentView is a live software paint
+         * target; leave the software content frontmost. Games are unaffected:
+         * their surface has a real metal_view (and their contentView has no
+         * software colorImage), so this guard never fires for them. */
+        if (!surface->metal_view)
+        {
+            macdrv_view content_view = data->cocoa_window ?
+                    macdrv_window_get_content_view(data->cocoa_window) : NULL;
+            if (content_view && macdrv_view_has_live_color_image(content_view))
+            {
+                if (proton_cef_surface_trace_enabled())
+                {
+                    fprintf(stderr,
+                            "[CEF-SURF] present hwnd=%p SUPPRESSED empty client overlay "
+                            "cocoa_view=%p (no metal_view + contentView has live software "
+                            "image) -> software content stays frontmost\n",
+                            surface->client.hwnd, surface->cocoa_view);
+                    fflush(stderr);
+                }
+                release_win_data(data);
+                return;
+            }
+        }
         /* Bug (Proton macOS) 2026-04-30: don't hide the previous
          * client_view when it IS the cocoa_window's actual contentView.
          * Hiding the contentView blanks the entire window subtree
@@ -1351,6 +1444,14 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
         }
         macdrv_set_view_hidden(surface->cocoa_view, FALSE);
         data->client_view = surface->cocoa_view;
+        if (proton_cef_surface_trace_enabled())
+        {
+            fprintf(stderr,
+                    "[CEF-SURF] present hwnd=%p set surface->cocoa_view=%p hidden=FALSE, "
+                    "now client_view; cocoa_window=%p\n",
+                    surface->client.hwnd, surface->cocoa_view, data->cocoa_window);
+            fflush(stderr);
+        }
     }
     release_win_data(data);
 }
@@ -1385,6 +1486,16 @@ struct macdrv_client_surface *macdrv_client_surface_create(HWND hwnd)
 
     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(rect));
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
+    if (proton_cef_surface_trace_enabled())
+    {
+        fprintf(stderr,
+                "[CEF-SURF] create hwnd=%p toplevel=%p surface->cocoa_view=%p "
+                "created HIDDEN; is_child=%d initial_rect=(%d,%d %dx%d)\n",
+                hwnd, toplevel, surface->cocoa_view, (toplevel != hwnd) ? 1 : 0,
+                (int)rect.left, (int)rect.top,
+                (int)(rect.right - rect.left), (int)(rect.bottom - rect.top));
+        fflush(stderr);
+    }
 
     macdrv_client_surface_update(&surface->client);
     macdrv_client_surface_present(&surface->client, 0);
@@ -1993,6 +2104,27 @@ void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event)
 }
 
 
+/* PROTON_KEEP_FULLSCREEN_MAPPED: when set, do NOT yank foreground to the
+ * desktop on focus loss / app-deactivate. The foreground-yank makes a
+ * fullscreen game issue SW_MINIMIZE -> the window orders out -> the
+ * fullscreen-cover flag flaps and the Vulkan surface is torn down and
+ * recreated against a 0x0 client rect (DOOM 2016 alt-tab crash/white-screen,
+ * and the "window invisible + cursor still grabbed" non-restore). Keeping the
+ * window mapped + foreground makes alt-tab a no-op for the surface; the cursor
+ * is still un-clipped on deactivate (below) so the mouse frees. Scope via the
+ * env (a recipe sets it per-title) so other titles are unaffected. Cached
+ * single getenv. Tag [KEEP-FS-MAPPED]. */
+static int proton_keep_fullscreen_mapped(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_KEEP_FULLSCREEN_MAPPED");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 /***********************************************************************
  *              macdrv_window_lost_focus
  *
@@ -2008,7 +2140,12 @@ void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
     {
         send_message(hwnd, WM_CANCELMODE, 0, 0);
         if (hwnd == NtUserGetForegroundWindow())
-            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        {
+            if (proton_keep_fullscreen_mapped())
+                fprintf(stderr, "winemac:[KEEP-FS-MAPPED] win %p: keeping foreground on focus loss (no desktop yank)\n", hwnd);
+            else
+                NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        }
     }
 }
 
@@ -2036,8 +2173,15 @@ void macdrv_app_deactivated(void)
 
     if (get_active_window() == NtUserGetForegroundWindow())
     {
-        TRACE("setting fg to desktop\n");
-        NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        if (proton_keep_fullscreen_mapped())
+        {
+            fprintf(stderr, "winemac:[KEEP-FS-MAPPED] app-deactivate: keeping foreground (no desktop yank)\n");
+        }
+        else
+        {
+            TRACE("setting fg to desktop\n");
+            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        }
     }
 }
 
@@ -2120,6 +2264,17 @@ done:
 void macdrv_window_brought_forward(HWND hwnd)
 {
     TRACE("win %p\n", hwnd);
+    /* Bug (Proton macOS) 2026-06-18: avoid a window-order feedback loop.
+     * Re-ordering an already-frontmost window makes Cocoa re-fire
+     * makeKeyAndOrderFront -> postBroughtForwardEvent, which during
+     * fullscreen window-level management (e.g. the menubar-hide
+     * WindowServer reconfigure) re-enters here forever, pegging the
+     * Cocoa main thread under user_lock and starving every other USER
+     * thread (Detroit: Become Human wedged with a user_lock convoy +
+     * silent window death). set_focus() already guards the identical
+     * NtUserSetWindowPos(HWND_TOP) call with is_all_the_way_front();
+     * this handler was simply missing the same guard. */
+    if (is_all_the_way_front(hwnd)) return;
     NtUserSetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 

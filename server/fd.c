@@ -2219,6 +2219,33 @@ struct object *default_fd_get_sync( struct object *obj )
 {
     struct fd *fd = get_obj_fd( obj );
     struct object *sync = get_obj_sync( &fd->obj );
+
+    /* Detroit ring-freeze cycle 6 (name the fd orphan): cycle 5 found the MAIN UI
+     * thread parked forever on an alloc_fd_object internal sync (fd 1155) that never
+     * signals on macOS. This logs, each time a thread takes an fd object's sync to
+     * wait on it, that sync's inproc fd (= the obj# the ntdll waiter blocks on)
+     * together with the fd's TYPE (1=FILE 2=DIR 3=SOCKET 4=SERIAL 5=CHAR 6=DEVICE)
+     * and unix path. Next run: re-find the orphan sync# via [DTR-PARK], then grep
+     * /tmp/dtr-fd.log for sync=<that#> to name exactly what the main thread awaits
+     * (file path vs socket vs pipe/device). Gated, open-once line-buffered. */
+    {
+        static int dtr = -1;
+        static FILE *f = NULL;
+        if (dtr < 0)
+        {
+            const char *e = getenv( "PROTON_DTR_WAIT_TRACE" );
+            dtr = (e && *e && *e != '0') ? 1 : 0;
+            if (dtr) { f = fopen( "/tmp/dtr-fd.log", "w" ); if (f) setvbuf( f, NULL, _IOLBF, 0 ); }
+        }
+        if (dtr && f && sync && get_inproc_device_fd() >= 0)
+        {
+            int type = (fd->fd_ops && fd->fd_ops->get_fd_type) ? (int)fd->fd_ops->get_fd_type( fd ) : -1;
+            fprintf( f, "[DTR-FD] sync=%d type=%d unix_fd=%d name=%s\n",
+                     get_inproc_sync_fd( (struct inproc_sync *)sync ), type, fd->unix_fd,
+                     fd->unix_name ? fd->unix_name : "(none)" );
+        }
+    }
+
     release_object( fd );
     return sync;
 }

@@ -195,6 +195,18 @@ static BOOL is_d3dkmt_global( D3DKMT_HANDLE handle )
     return (handle & 0xc0000000) && (handle & 0x3f) == 2;
 }
 
+/* Proton macOS 2026-06-28 diagnostic: identify which NtGdiDdDDIOpenResource(2)
+ * param check rejects DXVK's KMT shared-resource open of the Metal-backed
+ * resource — (a) hDevice not a valid D3DKMT_DEVICE, or (b) hGlobalShare not a
+ * d3dkmt global (the 0xc0000000 / &0x3f==2 format test). Gated by
+ * PROTON_KMT_OPENRES_TRACE (off by default); read once. */
+static BOOL kmt_openres_trace(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = getenv("PROTON_KMT_OPENRES_TRACE") != NULL;
+    return cached;
+}
+
 static D3DKMT_HANDLE index_to_handle( int index )
 {
     return (index << 6) | D3DKMT_HANDLE_BIT;
@@ -1270,8 +1282,27 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResource( D3DKMT_OPENRESOURCE *params )
     TRACE( "params %p\n", params );
 
     if (!params) return STATUS_INVALID_PARAMETER;
-    if (!(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
-    if (!is_d3dkmt_global( params->hGlobalShare )) return STATUS_INVALID_PARAMETER;
+    if (kmt_openres_trace())
+        ERR( "[KMT-OPENRES] hDevice=%#x hGlobalShare=%#x (glob: &0xc0000000=%#x &0x3f=%u) PrivDrvDataSize=%u NumAllocs=%u\n",
+             params->hDevice, params->hGlobalShare, params->hGlobalShare & 0xc0000000,
+             params->hGlobalShare & 0x3f, params->ResourcePrivateDriverDataSize, params->NumAllocations );
+    /* Proton macOS (0081): only validate the device when one was supplied. KK
+     * advertises no device LUID, so DXVK never opens a D3DKMT adapter/device
+     * (dxvk_adapter.cpp gates on deviceLUIDValid) and passes hDevice=0 on its
+     * KMT shared-resource open. 'device' is never used past this gate (the open
+     * resolves purely via hGlobalShare), and the NT-handle path
+     * (OpenResourceFromNtHandle) is already device-free — so accept hDevice==0
+     * here to bring the KMT path to parity. */
+    if (params->hDevice && !(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE )))
+    {
+        if (kmt_openres_trace()) ERR( "[KMT-OPENRES] FAIL check#1 hDevice %#x not a valid D3DKMT_DEVICE\n", params->hDevice );
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!is_d3dkmt_global( params->hGlobalShare ))
+    {
+        if (kmt_openres_trace()) ERR( "[KMT-OPENRES] FAIL check#2 hGlobalShare %#x not a d3dkmt global\n", params->hGlobalShare );
+        return STATUS_INVALID_PARAMETER;
+    }
     if (params->ResourcePrivateDriverDataSize) return STATUS_INVALID_PARAMETER;
 
     if (!params->NumAllocations) return STATUS_INVALID_PARAMETER;
@@ -1313,8 +1344,24 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResource2( D3DKMT_OPENRESOURCE *params )
     TRACE( "params %p\n", params );
 
     if (!params) return STATUS_INVALID_PARAMETER;
-    if (!(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
-    if (!is_d3dkmt_global( params->hGlobalShare )) return STATUS_INVALID_PARAMETER;
+    if (kmt_openres_trace())
+        ERR( "[KMT-OPENRES2] hDevice=%#x hGlobalShare=%#x (glob: &0xc0000000=%#x &0x3f=%u) PrivDrvDataSize=%u NumAllocs=%u\n",
+             params->hDevice, params->hGlobalShare, params->hGlobalShare & 0xc0000000,
+             params->hGlobalShare & 0x3f, params->ResourcePrivateDriverDataSize, params->NumAllocations );
+    /* Proton macOS (0081): only validate the device when one was supplied — see
+     * the matching note in NtGdiDdDDIOpenResource. KK has no device LUID so DXVK
+     * passes hDevice=0; 'device' is unused past this gate and the NT path is
+     * already device-free, so accept hDevice==0 to bring KMT to parity. */
+    if (params->hDevice && !(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE )))
+    {
+        if (kmt_openres_trace()) ERR( "[KMT-OPENRES2] FAIL check#1 hDevice %#x not a valid D3DKMT_DEVICE\n", params->hDevice );
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (!is_d3dkmt_global( params->hGlobalShare ))
+    {
+        if (kmt_openres_trace()) ERR( "[KMT-OPENRES2] FAIL check#2 hGlobalShare %#x not a d3dkmt global\n", params->hGlobalShare );
+        return STATUS_INVALID_PARAMETER;
+    }
     if (params->ResourcePrivateDriverDataSize) return STATUS_INVALID_PARAMETER;
 
     if (!params->NumAllocations) return STATUS_INVALID_PARAMETER;
@@ -1354,6 +1401,10 @@ NTSTATUS WINAPI NtGdiDdDDIOpenResourceFromNtHandle( D3DKMT_OPENRESOURCEFROMNTHAN
     UINT dummy = 0;
 
     FIXME( "params %p semi-stub!\n", params );
+
+    if (kmt_openres_trace())
+        ERR( "[KMT-CONSUMER] OpenResourceFromNtHandle hNtHandle=%p NumAllocs=%u (a consumer is opening a shared resource via NT handle)\n",
+             params ? params->hNtHandle : NULL, params ? params->NumAllocations : 0 );
 
     if (!params) return STATUS_INVALID_PARAMETER;
     if (!params->pPrivateRuntimeData) return STATUS_INVALID_PARAMETER;
@@ -1436,6 +1487,10 @@ NTSTATUS WINAPI NtGdiDdDDIQueryResourceInfo( D3DKMT_QUERYRESOURCEINFO *params )
 
     TRACE( "params %p\n", params );
 
+    if (kmt_openres_trace())
+        ERR( "[KMT-CONSUMER] QueryResourceInfo hDevice=%#x hGlobalShare=%#x (a consumer is querying a KMT shared resource)\n",
+             params ? params->hDevice : 0, params ? params->hGlobalShare : 0 );
+
     if (!params) return STATUS_INVALID_PARAMETER;
     if (!(device = get_d3dkmt_object( params->hDevice, D3DKMT_DEVICE ))) return STATUS_INVALID_PARAMETER;
     if (!is_d3dkmt_global( params->hGlobalShare )) return STATUS_INVALID_PARAMETER;
@@ -1458,6 +1513,10 @@ NTSTATUS WINAPI NtGdiDdDDIQueryResourceInfoFromNtHandle( D3DKMT_QUERYRESOURCEINF
     NTSTATUS status;
 
     TRACE( "params %p\n", params );
+
+    if (kmt_openres_trace())
+        ERR( "[KMT-CONSUMER] QueryResourceInfoFromNtHandle hNtHandle=%p (a consumer is querying a shared resource via NT handle)\n",
+             params ? params->hNtHandle : NULL );
 
     if ((status = d3dkmt_object_query( D3DKMT_RESOURCE, 0, params->hNtHandle,
                                        &params->PrivateRuntimeDataSize )))
