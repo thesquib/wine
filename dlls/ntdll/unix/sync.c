@@ -113,6 +113,26 @@ static inline int wait_trace_on(void)
         fprintf(stderr, "wait-trace " fmt "\n", ##__VA_ARGS__); \
 } while (0)
 
+/* Detroit ring-freeze probe (2026-07-14): the DTR trace in msync.c names the
+ * orphan wait object by shm-index only (e.g. obj=436); to identify what that
+ * object IS we need the handle<->fd(=obj) bridge (logged at the inproc_sync
+ * cache choke point) plus the create-time name. Gated on the SAME
+ * PROTON_DTR_WAIT_TRACE flag so a single env var lights the whole chain; logs
+ * land in the same "msync: [DTR-*]" stream. Low volume (once per handle /
+ * create), unlike the hot per-wait WAIT_TRACE above. */
+static int dtr_trace_enabled = -1;
+static inline int dtr_trace_on(void)
+{
+    int v = atomic_load_explicit((_Atomic int *)&dtr_trace_enabled, memory_order_relaxed);
+    if (v == -1)
+    {
+        const char *e = getenv("PROTON_DTR_WAIT_TRACE");
+        v = (e && *e && *e != '0') ? 1 : 0;
+        atomic_store_explicit((_Atomic int *)&dtr_trace_enabled, v, memory_order_relaxed);
+    }
+    return v;
+}
+
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
 {
     if (!timeout) return "(infinite)";
@@ -692,6 +712,12 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
     cache->access = sync->access;
     cache->type = sync->type;
     cache->closed = sync->closed;
+    /* Detroit ring-freeze probe: bridge the DTR trace's obj=fd to a Win32
+     * handle + inproc_sync type. Grep obj 436 (from [DTR-WAIT]) -> handle here
+     * -> name from [DTR-CREATE]. itype: 0=UNKNOWN 1=INTERNAL 2=EVENT 3=MUTEX 4=SEMAPHORE. */
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-OBJ] handle=%p fd=%d itype=%d\n",
+                 handle, sync->fd, sync->type );
     /* Make sure we set the other members before the refcount; this store needs
      * release semantics [paired with the load in get_cached_inproc_sync()].
      * Set the refcount to 2 (one for the handle, one for the caller). */
@@ -1258,6 +1284,12 @@ NTSTATUS WINAPI NtCreateEvent( HANDLE *handle, ACCESS_MASK access, const OBJECT_
 
     WAIT_TRACE("CreateEvent.RET handle=%p type=%u state=%u status=%#x",
                *handle, type, state, ret);
+    /* Detroit ring-freeze probe: log the real name so a [DTR-OBJ] handle can be
+     * resolved to what the event actually is. manual=1 => NotificationEvent. */
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-CREATE] evt handle=%p manual=%d name=%s\n",
+                 *handle, (type == NotificationEvent),
+                 (attr && attr->ObjectName) ? debugstr_us(attr->ObjectName) : "(anon)" );
     free( objattr );
     return ret;
 }
@@ -2926,6 +2958,11 @@ NTSTATUS WINAPI NtCreateIoCompletion( HANDLE *handle, ACCESS_MASK access, OBJECT
     }
     SERVER_END_REQ;
 
+    /* Detroit ring-freeze probe cycle 2: identify whether the orphan internal
+     * sync (obj 456) is a completion port. Log the port handle at create so it
+     * can be matched to the coordinator's stuck [DTR-RIOC]/[DTR-OBJ] handle. */
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-CONT] iocp handle=%p status=%#x\n", *handle, status );
     free( objattr );
     return status;
 }
@@ -2972,6 +3009,11 @@ NTSTATUS WINAPI NtSetIoCompletion( HANDLE handle, ULONG_PTR key, ULONG_PTR value
 
     TRACE( "(%p, %lx, %lx, %x, %lx)\n", handle, key, value, status, count );
     WAIT_TRACE("SetIOC handle=%p", handle);
+    /* Detroit ring-freeze probe cycle 2: the SIGNALER side. If the coordinator
+     * is stuck in RemoveIOC on port H, do producers post here (H) but it never
+     * wakes (delivery gap) — or is nobody posting (producers stuck upstream)? */
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-SIOC] tid=%04x handle=%p\n", (unsigned)GetCurrentThreadId(), handle );
 
     SERVER_START_REQ( add_completion )
     {
@@ -2999,6 +3041,9 @@ NTSTATUS WINAPI NtSetIoCompletionEx( HANDLE completion_handle, HANDLE completion
 
     TRACE( "(%p, %p, %lx, %lx, %x, %lx)\n", completion_handle, completion_reserve_handle,
            key, value, status, count );
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-SIOC] tid=%04x handle=%p ex=1\n",
+                 (unsigned)GetCurrentThreadId(), completion_handle );
 
     if (!completion_reserve_handle) return STATUS_INVALID_HANDLE;
 
@@ -3028,6 +3073,12 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
     TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
     WAIT_TRACE("RemoveIOC handle=%p timeout=%s", handle,
                timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
+    /* Detroit ring-freeze probe cycle 2: the WAITER side. If coordinator tid
+     * 0914 logs this for handle 0x5a4 (obj 456), the orphan IS a completion port. */
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-RIOC] tid=%04x handle=%p to=%s\n",
+                 (unsigned)GetCurrentThreadId(), handle,
+                 timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF" );
 
     if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {
@@ -3081,6 +3132,10 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
     ULONG i = 0;
 
     TRACE( "%p %p %u %p %p %u\n", handle, info, count, written, timeout, alertable );
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-RIOC] tid=%04x handle=%p to=%s ex=1\n",
+                 (unsigned)GetCurrentThreadId(), handle,
+                 timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF" );
 
     if (!count) return STATUS_INVALID_PARAMETER;
 

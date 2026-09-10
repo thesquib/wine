@@ -23,6 +23,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -461,6 +462,27 @@ static int inproc_sync_signal( struct object *obj, unsigned int access, int sign
 
     assert( sync->type == INPROC_SYNC_INTERNAL || sync->type == INPROC_SYNC_EVENT ); /* never called for mutex / semaphore */
     assert( signal == 0 || signal == 1 ); /* never called from signal_object */
+
+    /* Detroit ring-freeze cycle 5 (generic signal logger): the cycle-4 [DTR-QSIG]
+     * probe only saw message-queue signal_sync sites; this choke point fires for
+     * EVERY inproc internal/event sync signal+reset (all containers), so the freeze
+     * orphan's signal is visible whatever its container. Correlate fd here against
+     * the ntdll [DTR-PARK] orphan obj#: signaled during the freeze but the waiter
+     * stays parked => macOS inproc wake-propagation bug; never signaled => producer
+     * gap. /tmp/dtr-sig.log, gated PROTON_DTR_WAIT_TRACE, open-once line-buffered. */
+    {
+        static int dtr = -1;
+        static FILE *f = NULL;
+        if (dtr < 0)
+        {
+            const char *e = getenv( "PROTON_DTR_WAIT_TRACE" );
+            dtr = (e && *e && *e != '0') ? 1 : 0;
+            if (dtr) { f = fopen( "/tmp/dtr-sig.log", "w" ); if (f) setvbuf( f, NULL, _IOLBF, 0 ); }
+        }
+        if (dtr && f && sync->msync)
+            fprintf( f, "[DTR-SIG] fd=%d itype=%d sig=%d\n",
+                     (int)sync->msync->shm_idx, sync->type, signal );
+    }
 
     if (signal) signal_inproc_sync( sync );
     else reset_inproc_sync( sync );

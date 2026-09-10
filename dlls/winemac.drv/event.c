@@ -512,7 +512,20 @@ BOOL macdrv_ProcessEvents(DWORD mask)
         data->current_event->type != QUERY_EVENT_NO_PREEMPT_WAIT &&
         data->current_event->type != APP_QUIT_REQUESTED &&
         data->current_event->type != WINDOW_DRAG_BEGIN)
+    {
         event_mask = 0;  /* don't process nested events */
+        /* Detroit livelock probe (PROTON_DTR_WAIT_TRACE, throttled): a thread
+         * wedged INSIDE a Cocoa-event handler doing a blocking wait can't drain
+         * driver events here -> QS_DRIVER churn. Log WHICH event handler is
+         * nested to name the deadlock (the wine log prefix carries the tid). */
+        {
+            static int dtr = -1;
+            static unsigned int n;
+            if (dtr < 0) dtr = getenv( "PROTON_DTR_WAIT_TRACE" ) ? 1 : 0;
+            if (dtr && !(n++ & 0x3f))
+                ERR( "[DTR-CUREVT] nested=%s\n", dbgstr_event( data->current_event->type ) );
+        }
+    }
 
     while (macdrv_copy_event_from_queue(data->queue, event_mask, &event))
     {

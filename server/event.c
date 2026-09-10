@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <dlfcn.h>
 #include <sys/types.h>
 
 #include "ntstatus.h"
@@ -113,8 +114,40 @@ struct event_sync *create_server_internal_sync( int manual, int signaled )
 
 struct object *create_internal_sync( int manual, int signaled )
 {
-    if (get_inproc_device_fd() >= 0) return (struct object *)create_inproc_internal_sync( manual, signaled );
-    return (struct object *)create_server_internal_sync( manual, signaled );
+    struct object *ret;
+    if (get_inproc_device_fd() >= 0) ret = (struct object *)create_inproc_internal_sync( manual, signaled );
+    else ret = (struct object *)create_server_internal_sync( manual, signaled );
+
+    /* Detroit ring-freeze probe cycle 3 (server-side, throwaway diag): tag each
+     * internal sync's fd (= the shm_idx ntdll waits on as obj#) with its
+     * container's call site, logged as an ASLR-INDEPENDENT offset (ret - module
+     * base) so it survives wineserver restarts. Match the freeze orphan's obj#
+     * to fd here, then `atos -o wineserver -l 0 <off>` (or addr2line) to name the
+     * container (async/fd/timer/thread/...). LIGHTWEIGHT: file opened once
+     * (line-buffered), no per-call fopen/fclose (cycle-3a's per-call fopen was
+     * heavy enough to destabilise the game). Gated on PROTON_DTR_WAIT_TRACE. */
+    {
+        static int dtr = -1;
+        static FILE *f = NULL;
+        static uintptr_t fbase = 0;
+        if (dtr < 0)
+        {
+            const char *e = getenv( "PROTON_DTR_WAIT_TRACE" );
+            dtr = (e && *e && *e != '0') ? 1 : 0;
+            if (dtr)
+            {
+                Dl_info info;
+                if (dladdr( (void *)create_internal_sync, &info )) fbase = (uintptr_t)info.dli_fbase;
+                f = fopen( "/tmp/dtr-srv.log", "w" );
+                if (f) setvbuf( f, NULL, _IOLBF, 0 );
+            }
+        }
+        if (dtr && f && ret && get_inproc_device_fd() >= 0)
+            fprintf( f, "[DTR-SRV] fd=%d manual=%d off=0x%lx\n",
+                     get_inproc_sync_fd( (struct inproc_sync *)ret ), manual,
+                     (unsigned long)((uintptr_t)__builtin_return_address(0) - fbase) );
+    }
+    return ret;
 }
 
 static void event_sync_dump( struct object *obj, int verbose )
