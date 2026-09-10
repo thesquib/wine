@@ -740,7 +740,9 @@ BOOL macdrv_GetCursorPos(LPPOINT pos)
     if (!thread_data) return;
 
     thread_data->capture_window = cocoa_window;
-    macdrv_set_mouse_capture_window(cocoa_window);
+    /* Pass GUI_INMOVESIZE through: winemac must tell Wine's own caption-drag
+     * capture apart from an app capturing for mouse-look. */
+    macdrv_set_mouse_capture_window(cocoa_window, (flags & GUI_INMOVESIZE) != 0);
 }
 
 
