@@ -321,6 +321,8 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
             ns_timeleft = update_timeout( *end ) * 100;
             if (!ns_timeleft) return STATUS_TIMEOUT;
         }
+        if (!end)
+            proton_dtr_log_park( obj, ((struct event *)obj_shm)->msync_type, (unsigned)tid );
         ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
     } while (ret == -EINTR || ret == -EFAULT);
 
@@ -356,6 +358,27 @@ static inline int check_shm_contention( void **objs_shm, void *alert_obj_shm, in
     return 0;
 }
 
+/* MSYNC-ACK-BLOCK kill-switch: PROTON_MSYNC_ACK_SPIN=1 restores the pre-patch
+ * unbounded busy-spin while waiting for the server pump to acknowledge a
+ * multi-object wait registration (A/B lever; default is spin-then-block). */
+static inline int msync_ack_spin(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "PROTON_MSYNC_ACK_SPIN" );
+        cached = (v && *v && strcmp( v, "0" )) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Spin budget covering the idle-pump fast case (ack arrives within a few µs)
+ * before falling back to a kernel-block; block in 1ms chunks so the shm
+ * contention re-check stays live and a lost ack wake (e.g. a wineserver
+ * predating MSYNC-ACK-BLOCK) degrades to a 1kHz poll instead of a hang. */
+#define MSYNC_ACK_SPIN_LIMIT  500
+#define MSYNC_ACK_BLOCK_NS    1000000ull
+
 static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert_obj, void *alert_obj_shm,
                                      int count, ULONGLONG *end, int tid )
 {
@@ -365,6 +388,7 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     mach_msg_return_t mr;
     unsigned int msgh_id;
     int total_count = count + (alert_obj ? 1 : 0);
+    int ack_spins = 0;
 
     __atomic_store_n( addr, 2, __ATOMIC_RELEASE );
     msgh_id = (tid << 8) | total_count;
@@ -388,6 +412,21 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
             }
             return STATUS_PENDING;
         }
+        /* MSYNC-ACK-BLOCK: the server's mach_message_pump is a single thread;
+         * under heavy signal traffic (every signal_all on a multi-waited object
+         * is a Mach message through it) the ack can lag, and an unbounded spin
+         * here burns a core per multi-waiting thread for the whole queue delay.
+         * Spin briefly for the idle-pump fast case, then kernel-block on the
+         * ack transition (2 -> 1/0); the server wakes this address on ack. */
+        if (!msync_ack_spin() && ++ack_spins >= MSYNC_ACK_SPIN_LIMIT)
+            ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 2, MSYNC_ACK_BLOCK_NS );
+    }
+
+    if (!end)
+    {
+        int j;
+        for (j = 0; j < count; j++)
+            proton_dtr_log_park( objs[j], ((struct event *)objs_shm[j])->msync_type, (unsigned)tid );
     }
 
     do
@@ -680,6 +719,7 @@ NTSTATUS msync_release_semaphore_obj( int obj, ULONG count, ULONG *prev_count )
 
     if (prev_count) *prev_count = current;
 
+    proton_dtr_log_signal( "release_sem", obj );
     signal_all( (void *)semaphore, obj );
     return STATUS_SUCCESS;
 }
@@ -700,7 +740,10 @@ NTSTATUS msync_set_event_obj( int obj, LONG *prev_state )
     LONG current;
 
     if (!(current = __atomic_exchange_n( &event->signaled, 1, __ATOMIC_SEQ_CST )))
+    {
+        proton_dtr_log_signal( "set_event", obj );
         signal_all( (void *)event, obj );
+    }
 
     if (prev_state) *prev_state = current;
 
@@ -763,6 +806,7 @@ NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count )
     if (!--mutex->count)
     {
         __atomic_store_n( &mutex->tid, 0, __ATOMIC_SEQ_CST );
+        proton_dtr_log_signal( "release_mutex", obj );
         signal_all( (void *)mutex, obj );
     }
 
@@ -939,6 +983,7 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
                     goto userapc;
                 /* Unlike esync, we already know that we've timed out, so we
                  * can avoid a syscall. */
+                proton_dtr_log_timeout( current_tid, count, objs, objs_shm, wait_any, 1 );
                 return STATUS_TIMEOUT;
             }
 
@@ -949,7 +994,11 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
             else
                 ret = msync_wait_multiple( objs, objs_shm, alert_obj, alert_obj_shm, count, timeout ? &end : NULL, current_tid );
 
-            if (ret == STATUS_TIMEOUT) return STATUS_TIMEOUT;
+            if (ret == STATUS_TIMEOUT)
+            {
+                proton_dtr_log_timeout( current_tid, count, objs, objs_shm, wait_any, 0 );
+                return STATUS_TIMEOUT;
+            }
         } /* while (1) */
     }
     else
