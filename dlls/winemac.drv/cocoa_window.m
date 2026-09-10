@@ -47,6 +47,131 @@
 @end
 
 
+/* PROTON_CEF_PAIR: Steam-in-bottle CEF black-window probe (2026-06-21).
+ * The login webhelper creates a SAME-RECT PAIR of WineWindows (e.g.
+ * 0x40166 + 0x60166) where CrossOver creates exactly ONE. Hypothesis: the
+ * frontmost (composited) window of the pair is the EMPTY twin; the
+ * content-bearing one is occluded underneath -> black, and even force-red
+ * on the content view never reaches glass. This probe enumerates every
+ * WineWindow front-to-back (z-order via -[NSApp orderedWindows]) so the
+ * LOG alone reveals whether the frontmost window at the login rect has real
+ * layer contents. Default off. Tag [CEF-PAIR].
+ *
+ * PROTON_CEF_PAIR_PAINT: additionally tints each window's backing layer a
+ * distinct per-z-index color (z0=red z1=green z2=blue z3=yellow z4=magenta
+ * z5=cyan). backgroundColor only shows through where layer.contents==nil
+ * (i.e. an empty twin), so a solid color block on screen confirms WHICH
+ * window of the pair WindowServer actually composites. Content-bearing
+ * windows keep showing their image (their contents sit above backgroundColor).
+ * PROTON_CEF_PAIR_PERIOD: throttle (default 60; probe fires on call 1,
+ * period+1, ...). Tunable so we don't need a rebuild to retune. */
+static int proton_cef_pair_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_CEF_PAIR");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+
+static int proton_cef_pair_paint_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_CEF_PAIR_PAINT");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+
+/* PROTON_CEF_DIRECT_PRESENT: push CEF software content straight to the
+ * backing layer inside macdrv_window_set_color_image (which ALWAYS runs on
+ * flush), bypassing -updateLayer (which fires only unreliably for CEF
+ * webhelper windows -> content delivered but never composited -> black).
+ * PROTON_CEF_DIRECT_RED tints solid red instead of the image for an
+ * unambiguous "does this window reach glass" test. Tag [CEF-DIRECT]. */
+static int proton_cef_direct_present_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_CEF_DIRECT_PRESENT");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+
+static void proton_cef_pair_probe(void)
+{
+    if (!proton_cef_pair_enabled()) return;
+
+    static unsigned long calls = 0;
+    static long period = -1;
+    if (period < 0) {
+        const char *v = getenv("PROTON_CEF_PAIR_PERIOD");
+        period = (v && v[0]) ? strtol(v, NULL, 10) : 60;
+        if (period < 1) period = 1;
+    }
+    unsigned long n = __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED);
+    if ((n % (unsigned long)period) != 1) return;
+
+    @autoreleasepool {
+        int paint = proton_cef_pair_paint_enabled();
+        static const CGFloat palette[6][4] = {
+            {1,0,0,1}, {0,1,0,1}, {0,0,1,1}, {1,1,0,1}, {1,0,1,1}, {0,1,1,1}
+        };
+        NSArray *ordered = [NSApp orderedWindows];   /* front-to-back z-order */
+        const char *src = "ordered";
+        if (![ordered count]) { ordered = [NSApp windows]; src = "all"; }
+        fprintf(stderr, "winemac: [CEF-PAIR] enter pid=%d src=%s count=%lu paint=%d\n",
+                (int)getpid(), src, (unsigned long)[ordered count], paint);
+        NSUInteger z = 0;
+        for (NSWindow *win in ordered)
+        {
+            if (![win isKindOfClass:[WineWindow class]]) continue;
+            NSRect f = [win frame];
+            if (f.size.width < 100 || f.size.height < 100) continue;  /* skip tiny helpers */
+
+            void *hwnd = [win respondsToSelector:@selector(hwnd)] ?
+                         (void *)[(id)win performSelector:@selector(hwnd)] : NULL;
+            NSView *cv = [win contentView];
+            CALayer *layer = cv ? [cv layer] : nil;
+            NSArray *subs = layer ? [layer sublayers] : nil;
+            const char *sub0 = ([subs count] && [subs objectAtIndex:0]) ?
+                                object_getClassName([subs objectAtIndex:0]) : "(none)";
+
+            fprintf(stderr,
+                    "winemac: [CEF-PAIR] z=%lu hwnd=%p win=%p frame=%.0fx%.0f@%.0f,%.0f "
+                    "level=%ld visible=%d activeSpace=%d occl=0x%lx winNum=%ld "
+                    "cvLayer=%p contents=%p sublayers=%lu sub0=%s%s\n",
+                    (unsigned long)z, hwnd, (void *)win,
+                    (double)f.size.width, (double)f.size.height,
+                    (double)f.origin.x, (double)f.origin.y,
+                    (long)[win level], (int)[win isVisible], (int)[win isOnActiveSpace],
+                    (unsigned long)[win occlusionState], (long)[win windowNumber],
+                    (void *)layer, layer ? (void *)[layer contents] : NULL,
+                    (unsigned long)[subs count], sub0,
+                    (z == 0 ? "  <== FRONTMOST" : ""));
+
+            if (paint && layer)
+            {
+                CGColorSpaceRef csp = CGColorSpaceCreateDeviceRGB();
+                CGColorRef c = CGColorCreate(csp, palette[z % 6]);
+                [CATransaction begin];
+                [CATransaction setDisableActions:YES];
+                layer.contents = nil;        /* unmask: let backgroundColor show */
+                layer.backgroundColor = c;
+                [CATransaction commit];
+                CGColorRelease(c);
+                CGColorSpaceRelease(csp);
+            }
+            z++;
+        }
+        fflush(stderr);
+    }
+}
+
+
 static NSUInteger style_mask_for_features(const struct macdrv_window_features* wf)
 {
     NSUInteger style_mask;
@@ -525,6 +650,42 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         if (window.closing)
             return;
 
+        proton_cef_pair_probe();
+
+        /* Paint mode: the probe has tinted every window's backing layer a
+         * distinct solid color (contents niled). Skip the content-image
+         * assignment below so the solid color actually PERSISTS to glass -
+         * otherwise it is overwritten by colorImage in this same call (the
+         * bug that invalidated the prior force-red test). */
+        if (proton_cef_pair_paint_enabled())
+            return;
+
+        if (getenv("PROTON_CEF_FLUSH") && colorImage)
+        {
+            CGRect lb = [self layer].bounds;
+            NSWindow *nsw = [self window];
+            if (getenv("PROTON_CEF_FORCE_RED"))
+            {
+                /* Paint the whole backing layer solid red to test whether THIS
+                 * window reaches glass at all (independent of the content image). */
+                CGFloat comps[4] = { 1.0, 0.0, 0.0, 1.0 };
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGColorRef red = CGColorCreate(cs, comps);
+                [self layer].contents = nil;
+                [self layer].backgroundColor = red;
+                CGColorRelease(red);
+                CGColorSpaceRelease(cs);
+            }
+            fprintf(stderr, "winemac: [CEF-UPDATELAYER] pid=%d hwnd=%p bounds=%gx%g winVisible=%d onScreen=%d "
+                    "policy=%ld winNum=%ld occl=0x%lx alpha=%.2f activeSpace=%d level=%ld\n",
+                    (int)getpid(), (void *)window.hwnd,
+                    lb.size.width, lb.size.height, (int)[window isVisible],
+                    (int)([nsw screen] != nil), (long)[NSApp activationPolicy],
+                    (long)[nsw windowNumber], (unsigned long)[nsw occlusionState],
+                    [nsw alphaValue], (int)[nsw isOnActiveSpace], (long)[nsw level]);
+            fflush(stderr);
+        }
+
         imageRect = layer.bounds;
         imageRect.origin.x *= layer.contentsScale;
         imageRect.origin.y *= layer.contentsScale;
@@ -534,6 +695,20 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
         maskedImage = shapeImage ? CGImageCreateWithMask(colorImage, shapeImage)
                                  : CGImageRetain(colorImage);
         image = CGImageCreateWithImageInRect(maskedImage, imageRect);
+        if (!image && maskedImage)
+        {
+            /* FIX (Proton macOS 2026-06-22, Steam-in-bottle CEF blank window):
+             * CGImageCreateWithImageInRect returns nil when imageRect
+             * (layer.bounds * contentsScale) is empty OR exceeds the colorImage
+             * extent -- e.g. a CEF window whose software surface is point-sized
+             * while contentsScale=2 (Retina), or a content view not yet sized
+             * (created at NSZeroRect). Then layer.contents was never assigned and
+             * the (now-opaque) window showed its solid background with NO content.
+             * Fall back to the full surface image so the UI reaches glass; CALayer
+             * scales contents to the layer bounds. Normal windows whose crop
+             * succeeds never hit this path. */
+            image = CGImageRetain(maskedImage);
+        }
         CGImageRelease(maskedImage);
 
         if (image)
@@ -563,6 +738,58 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     {
         CGImageRelease(colorImage);
         colorImage = CGImageRetain(image);
+
+        /* Strategy E.1 removal (Proton macOS 2026-06-20): a non-nil colorImage
+         * means software content has arrived for this view (e.g. CEF's software
+         * fallback after its GPU subprocess died). The E.1 overlay may already
+         * have attached an opaque black CAMetalLayer/CALayerHost BEFORE
+         * colorImage was set, and the broadcaster's retry timer was halted by
+         * the s_e1AttachedHwnds stamp - so no later broadcast arrives to fire
+         * the "remove on re-broadcast" logic and the black overlay stays stuck.
+         * Drive the removal from this software-paint side: tear down any stale
+         * E.1 overlay sublayers now. Runs on the main thread (invoked via
+         * OnMainThreadAsync in macdrv_window_set_color_image). Real DXMT/Vulkan
+         * games render via Metal and never call setColorImage, so this never
+         * fires for them; if it ever did, games re-broadcast every frame and
+         * self-heal. (Mirrors the kind-of-class check at the cocoa_app.m E.1
+         * attach site.) */
+        if (image != NULL)
+        {
+            NSUInteger removed = 0;
+            /* Protect LIVE Vulkan swapchain surfaces (Proton macOS 2026-06-21):
+             * a WineMetalView's CAMetalLayer (the DXVK->KosmicKrisp Metal
+             * surface for Steam's CEF, ANGLE->D3D11->DXVK->KK) is a sublayer
+             * here because the metal view is addSubview'd below the content
+             * view. Removing it detaches the Metal surface -> DXVK gets
+             * VK_ERROR_SURFACE_LOST_KHR -> the login never paints (black).
+             * Identify live surface layers by SUBVIEW IDENTITY, NOT by delegate:
+             * vulkan.c nils the metal layer's delegate at surface-create and
+             * never restores it, so a delegate check would miss them. Only BARE
+             * E.1 overlay layers (CALayerHost / stray CAMetalLayer not owned by
+             * a WineMetalView subview) get torn down. */
+            NSMutableSet *liveMetalLayers = [NSMutableSet set];
+            for (NSView *sv in [self subviews])
+                if ([sv isKindOfClass:[WineMetalView class]] && [sv layer])
+                    [liveMetalLayers addObject:[NSValue valueWithNonretainedObject:[sv layer]]];
+            NSArray *existing = [self.layer.sublayers copy];
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            for (CALayer *sub in existing)
+            {
+                if ([liveMetalLayers containsObject:[NSValue valueWithNonretainedObject:sub]])
+                    continue;
+                if ([sub isKindOfClass:NSClassFromString(@"CAMetalLayer")] ||
+                    [sub isKindOfClass:NSClassFromString(@"CALayerHost")])
+                {
+                    [sub removeFromSuperlayer];
+                    removed++;
+                }
+            }
+            [CATransaction commit];
+            if (removed > 0)
+                fprintf(stderr, "winemac:E.1 - setColorImage removed %lu stale overlay sublayer(s) (software content present)\n",
+                        (unsigned long)removed);
+        }
     }
 
     - (void) setShapeImage:(CGImageRef)image
@@ -574,6 +801,16 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
     - (BOOL) hasShapeImage
     {
         return !!shapeImage;
+    }
+
+    /* Strategy E.1 guard (Proton macOS 2026-06-20): a non-nil colorImage means
+     * this view is a live software paint target (GDI / software-rendered CEF).
+     * The E.1 black-overlay machinery uses this to DECLINE attaching an opaque
+     * CAMetalLayer over a software-painted window (Steam's CEF UI). Vulkan
+     * render views never set colorImage, so they keep their overlay. */
+    - (BOOL) hasLiveColorImage
+    {
+        return colorImage != NULL;
     }
 
     - (void) viewWillDraw
@@ -658,6 +895,24 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
             _cachedHasGLDescendantValid = YES;
         }
         return _cachedHasGLDescendant;
+    }
+
+    /* A WineMetalView (Vulkan/Metal swapchain target) is added as an
+     * NSWindowBelow subview of the content view. The GDI software path can
+     * make the window opaque (needsTransparency) and paint chrome over the
+     * metal content, hiding it. Report a live metal descendant so the window
+     * stays transparent and the Metal content composites through. */
+    - (BOOL) hasLiveMetalDescendant
+    {
+        for (NSView* view in [self subviews])
+        {
+            if ([view isKindOfClass:[WineMetalView class]] && ![view isHidden] && [view layer])
+                return YES;
+            if ([view isKindOfClass:[WineContentView class]] && ![view isHidden] &&
+                [(WineContentView*)view hasLiveMetalDescendant])
+                return YES;
+        }
+        return NO;
     }
 
     - (void) invalidateHasGLDescendant
@@ -2169,7 +2424,8 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
     {
         WineContentView *view = self.contentView;
         return self.contentView.layer.mask || [view hasShapeImage] || self.usePerPixelAlpha ||
-                (gl_surface_mode == GL_SURFACE_BEHIND && [view hasGLDescendant]);
+                (gl_surface_mode == GL_SURFACE_BEHIND && [view hasGLDescendant]) ||
+                ([view hasLiveMetalDescendant] && ![view hasLiveColorImage]);
     }
 
     - (void) checkTransparency
@@ -3877,6 +4133,99 @@ void macdrv_window_set_color_image(macdrv_window w, CGImageRef image, CGRect rec
         [view setSurfaceRect:cgrect_mac_from_win(rect)];
         [view setNeedsDisplayInRect:NSRectFromCGRect(cgrect_mac_from_win(dirty))];
 
+        /* FIX (Proton macOS 2026-06-22, Steam-in-bottle CEF transparent window):
+         * Wine windows are born non-opaque with a clearColor background (see
+         * window creation, setOpaque:NO). The opaque-flip (checkTransparency) is
+         * normally only reached from inside -updateLayer's `if (image)` block via
+         * -windowDidDrawContent. But on this software-flush displayIfNeeded path,
+         * -updateLayer's CGImageCreateWithImageInRect can return nil (empty/
+         * mismatched layer.bounds at flush time) -> image==nil -> the opaque-flip
+         * never fires -> the window stays transparent (the desktop shows straight
+         * through it) and macOS drops the occlusion Visible bit. Steam's CEF UI
+         * windows render this software path, so they composite see-through.
+         * When real software content arrives (image != nil), trigger the opaque
+         * flip directly. checkTransparency itself guards on needsTransparency
+         * (GL/Metal/shaped/per-pixel-alpha), so games and layered windows are
+         * unaffected -- they keep their transparency. */
+        if (image)
+            [window checkTransparency];
+
+        /* FIX (Proton macOS 2026-06-21, Steam-in-bottle CEF black window):
+         * Steam's CEF webhelper processes don't reliably service AppKit's
+         * deferred display pass, so -updateLayer often never runs and the
+         * colorImage just set is never pushed to the backing layer -> the
+         * window stays at its black background color even though content was
+         * delivered (proven: pushing pixels straight to the layer here reaches
+         * glass; relying on the scheduled redraw does not). The flush path
+         * always runs on the main thread, so force the redraw synchronously -
+         * this invokes -updateLayer with its full shape-mask/scale/shadow
+         * logic. CrossOver's runloop services this automatically; ours must be
+         * explicit. Real games render via Metal and never reach setColorImage,
+         * so this software-paint path is unaffected for them. */
+        [view displayIfNeeded];
+
+        if (proton_cef_direct_present_enabled())
+        {
+            CALayer *l = [view layer];
+            int red = getenv("PROTON_CEF_DIRECT_RED") != NULL;
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            if (red)
+            {
+                CGFloat comps[4] = { 1.0, 0.0, 0.0, 1.0 };
+                CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+                CGColorRef rc = CGColorCreate(cs, comps);
+                l.contents = nil;
+                l.backgroundColor = rc;
+                CGColorRelease(rc);
+                CGColorSpaceRelease(cs);
+            }
+            else if (getenv("PROTON_CEF_DIRECT_SYNTH"))
+            {
+                /* Push a SYNTHETIC solid-magenta opaque CGImage as contents,
+                 * built with the SAME format as the surface image. If magenta
+                 * shows on screen, CALayer.contents works and the real login
+                 * image just looks dark (its center is genuinely black); if
+                 * black, the contents path itself is broken. */
+                size_t sw = 64, sh = 64, sstride = sw * 4;
+                unsigned char *sb = malloc(sstride * sh);
+                for (size_t i = 0; i < sw * sh; i++) {
+                    sb[i*4+0] = 0xff;  /* B */
+                    sb[i*4+1] = 0x00;  /* G */
+                    sb[i*4+2] = 0xff;  /* R */
+                    sb[i*4+3] = 0xff;  /* X/A */
+                }
+                CGColorSpaceRef sc = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+                CGDataProviderRef sp = CGDataProviderCreateWithData(NULL, sb, sstride * sh, NULL);
+                CGImageRef synth = CGImageCreate(sw, sh, 8, 32, sstride, sc,
+                                                 kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little,
+                                                 sp, NULL, false, kCGRenderingIntentDefault);
+                l.contents = (id)synth;
+                CGImageRelease(synth);
+                CGDataProviderRelease(sp);
+                CGColorSpaceRelease(sc);
+                free(sb);
+            }
+            else
+            {
+                CGFloat g[4] = { 0.0, 1.0, 0.0, 1.0 };
+                CGColorSpaceRef gs = CGColorSpaceCreateDeviceRGB();
+                CGColorRef gc = CGColorCreate(gs, g);
+                l.backgroundColor = gc;
+                l.contents = (id)image;
+                CGColorRelease(gc);
+                CGColorSpaceRelease(gs);
+            }
+            [CATransaction commit];
+            fprintf(stderr, "winemac: [CEF-DIRECT] hwnd=%p view=%p layer=%p pushed=%s "
+                    "imgAlpha=%u imgW=%zu imgH=%zu imgBPP=%zu opaque=%d\n",
+                    (void *)window.hwnd, (void *)view, (void *)l, red ? "RED" : "image",
+                    (unsigned)CGImageGetAlphaInfo(image),
+                    CGImageGetWidth(image), CGImageGetHeight(image),
+                    CGImageGetBitsPerPixel(image), (int)[l isOpaque]);
+            fflush(stderr);
+        }
+
         CGImageRelease(image);
     });
 }
@@ -4037,6 +4386,33 @@ macdrv_view macdrv_window_get_content_view(macdrv_window w)
         view = [(WineWindow *)w contentView];
     });
     return (macdrv_view)view;
+}
+
+/***********************************************************************
+ *              macdrv_view_has_live_color_image
+ *
+ * Bug (Proton macOS 2026-06-22): return whether a view is a live
+ * software paint target (non-nil colorImage), i.e. GDI / software-
+ * rendered CEF content. Used by macdrv_client_surface_present in
+ * window.c to AVOID showing an empty client-surface overlay view on top
+ * of a software-painted window: Steam's CEF gpu-process creates a Vulkan
+ * swapchain surface (-> an empty WineContentView parented NSWindowAbove
+ * the contentView) even when it never presents a GPU frame (web-views
+ * GPU off). That empty overlay has contents==nil and composites
+ * transparent, so the desktop shows through and the real software content
+ * underneath is hidden. Games are unaffected (their contentView has no
+ * colorImage, and their surface has a real metal_view).
+ */
+int macdrv_view_has_live_color_image(macdrv_view v)
+{
+    if (!v) return 0;
+    __block BOOL live = NO;
+    OnMainThread(^{
+        WineContentView *view = (WineContentView *)v;
+        if ([view respondsToSelector:@selector(hasLiveColorImage)])
+            live = [view hasLiveColorImage];
+    });
+    return live ? 1 : 0;
 }
 
 /***********************************************************************

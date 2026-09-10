@@ -208,7 +208,7 @@ extern void macdrv_set_application_icon(CFArrayRef images);
 extern void macdrv_quit_reply(int reply);
 extern void macdrv_restore_mouse_association(void);
 extern bool macdrv_using_input_method(void);
-extern void macdrv_set_mouse_capture_window(macdrv_window window);
+extern void macdrv_set_mouse_capture_window(macdrv_window window, int move_size);
 extern void macdrv_set_cocoa_retina_mode(bool new_mode);
 
 
@@ -519,6 +519,7 @@ extern void macdrv_set_window_mask(macdrv_window w, CGRect rect);
 extern void macdrv_give_cocoa_window_focus(macdrv_window w, bool activate);
 extern void macdrv_set_window_min_max_sizes(macdrv_window w, CGSize min_size, CGSize max_size);
 extern macdrv_view macdrv_window_get_content_view(macdrv_window w);
+extern int macdrv_view_has_live_color_image(macdrv_view v);
 extern macdrv_view macdrv_create_view(CGRect rect);
 extern void macdrv_dispose_view(macdrv_view v);
 extern void macdrv_set_view_frame(macdrv_view v, CGRect rect);

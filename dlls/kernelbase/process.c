@@ -589,7 +589,7 @@ static int battleye_launcher_redirect_hack( const WCHAR *app_name, WCHAR *new_na
     return 1;
 }
 
-static const WCHAR *hack_append_command_line( const WCHAR *cmd )
+static const WCHAR *hack_append_command_line( const WCHAR *cmd, const WCHAR *full_cmdline )
 {
     static const struct
     {
@@ -629,30 +629,27 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
         {L"Red Tie Runner.exe", L" --use-angle=gl"},
         {L"UnrealCEFSubProcess.exe", L" --use-gl=swiftshader", "2316580"},
         {L"UnrealCEFSubProcess.exe", L" --use-angle=d3d9", "2684500"},
-        /* Bug #11 + #15 (Proton macOS): inject CEF flags for Steam's
-         * webhelper to keep all Chromium work in a single process.
-         *
-         *  - --in-process-gpu: Bug #11 cycle. The cross-process winemac
-         *    problem is that the gpu-process subprocess can't resolve
-         *    HWNDs owned by the browser process - every backend
-         *    (D3D11, ANGLE-Vulkan, SwiftShader) hits this somewhere
-         *    when binding a swapchain to a Chrome HWND. Run GPU work
-         *    in the browser process so HWND and GPU share an address
-         *    space and the cross-process lookup never happens.
-         *
-         *  - --single-process: Bug #15 cycle. Each fresh CEF
-         *    subprocess (renderer / network / utility) re-runs
-         *    Steam's platform_sockets init, and an init-order race
-         *    under our Wine's thread scheduling leaves
-         *    s_pWinsockInitData NULL when downstream code calls a
-         *    socket op - Steam asserts in
-         *    platform_sockets_win32.cpp:528, the subprocess dies,
-         *    and the browser process's UI thread blocks forever on
-         *    the IPC reply that never comes (user-visible beach
-         *    ball on click). --single-process collapses all
-         *    Chromium roles into the browser process, so Winsock
-         *    inits exactly once on a known-good thread. */
-        {L"steamwebhelper.exe", L" --in-process-gpu --single-process"},
+        /* Proton macOS 2026-06-22 (rev 5): render Steam CEF IN-PROCESS on KK.
+         * DECISIVE CrossOver finding (steam2.cxlog: --type=gpu-process appears 0
+         * times): CrossOver renders CEF because the GPU runs IN-PROCESS in the
+         * browser process -- it NEVER spawns the standalone gpu-process. Our
+         * libc++ string_view(nullptr) abort happens INSIDE that standalone
+         * gpu-process during Chromium display/EDID init; if it never spawns, the
+         * crash path never runs. So don't FIX the null, AVOID the process that
+         * hits it: force --in-process-gpu so CEF does GPU work in the browser
+         * process. Pair with ANGLE's Vulkan backend (--use-gl=angle
+         * --use-angle=vulkan) -> winevulkan -> KosmicKrisp (the differentiator;
+         * KK's Vulkan instance+device+pipeline all proven to work, fast init).
+         * SCOPE TO THE MAIN BROWSER PROCESS ONLY (the steamwebhelper.exe whose
+         * cmdline carries NO --type=): --in-process-gpu belongs on the browser,
+         * and the crashing child simply won't exist. Children (--type=renderer/
+         * utility) must NOT get it. Do NOT add --single-process (winsock
+         * init-race -> recovery dialog). Gated PROTON_INJECT_CEF_FLAGS=1; pair
+         * with KK env (WINE_MOLTENVK_PATH=loader + VK_ICD_FILENAMES=KK icd) +
+         * steam.exe -no-cef-sandbox. Prior --in-process-gpu churn was with
+         * --single-process/--use-angle=d3d11/blanket-inject; this is the clean
+         * browser-scoped Vulkan variant. */
+        {L"steamwebhelper.exe", L" --in-process-gpu --use-gl=angle --use-angle=vulkan --disable-gpu-watchdog --disable-gpu-process-crash-limit --disable-gpu-sandbox --ignore-gpu-blocklist --disable-gpu-driver-bug-workarounds"},
     };
     unsigned int i;
     char sgi[64];
@@ -681,6 +678,16 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd )
                 char gate[8];
                 if (!GetEnvironmentVariableA( "PROTON_INJECT_CEF_FLAGS", gate, sizeof(gate) )
                     || strcmp( gate, "1" ))
+                    continue;
+                /* Proton macOS 2026-06-22: scope --in-process-gpu to the MAIN
+                 * BROWSER process ONLY -- the steamwebhelper.exe whose cmdline
+                 * carries NO --type= (children are --type=renderer/utility/etc).
+                 * --in-process-gpu makes the browser run GPU internally, so no
+                 * standalone --type=gpu-process spawns (where the string_view
+                 * abort lives). The flag must NOT land on children (they'd each
+                 * try in-process GPU). NB: the spawn passes app_name (no --type)
+                 * as `cmd`, so the gate must inspect the FULL command line. */
+                if (full_cmdline && wcsstr( full_cmdline, L"--type=" ))
                     continue;
             }
             FIXME( "HACK: appending %s to command line.\n", debugstr_w(options[i].append) );
@@ -757,7 +764,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                 return FALSE;
             swprintf( tidy_cmdline, lstrlenW(app_name) + 3, L"\"%s\"", app_name );
         }
-        else if ((append = hack_append_command_line( app_name )))
+        else if ((append = hack_append_command_line( app_name, cmd_line )))
         {
             tidy_cmdline = RtlAllocateHeap( GetProcessHeap(), 0,
                                             sizeof(WCHAR) * (lstrlenW(cmd_line) + lstrlenW(append) + 1) );
@@ -769,7 +776,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
     {
         WCHAR *cmdline_new = NULL;
 
-        if ((append = hack_append_command_line( cmd_line )))
+        if ((append = hack_append_command_line( cmd_line, cmd_line )))
         {
             cmdline_new = RtlAllocateHeap( GetProcessHeap(), 0, sizeof(WCHAR)
                                            * (lstrlenW(cmd_line) + lstrlenW(append) + 1) );
