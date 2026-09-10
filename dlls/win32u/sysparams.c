@@ -329,6 +329,7 @@ static unsigned int user_lock_thread, user_lock_rec;
 static pthread_key_t user_lock_owner_key;
 static pthread_once_t user_lock_owner_init_once = PTHREAD_ONCE_INIT;
 static unsigned long long user_lock_acquire_counter; /* monotonically incremented on each user_lock acquire */
+static int user_lock_trace; /* WINE_USERLOCK_TRACE=1: log per-contention diagnostics (off by default) */
 
 static void user_lock_owner_destructor( void *value )
 {
@@ -398,6 +399,8 @@ static void user_lock_owner_init( void )
     pthread_attr_t attr;
 
     pthread_key_create( &user_lock_owner_key, user_lock_owner_destructor );
+
+    user_lock_trace = getenv("WINE_USERLOCK_TRACE") != NULL;
 
     pthread_attr_init( &attr );
     pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_DETACHED );
@@ -471,18 +474,30 @@ void user_lock(void)
 {
     pthread_once( &user_lock_owner_init_once, user_lock_owner_init );
 
-    /* Bug (Proton macOS) 2026-04-29 diagnostic: log the current holder
-     * TID on contention so we can find the leaker / long-holder. The
-     * trylock fast-path makes the no-contention case zero-overhead. */
+    /* Per-contention diagnostics (Proton macOS, 2026-04-29), off by default;
+     * set WINE_USERLOCK_TRACE=1 to log the holder TID on contention to find a
+     * leaker / long-holder. The trylock fast-path makes the no-contention case
+     * zero-overhead; with trace off, contention just block-acquires (no logging
+     * on the hot path). Threaded games (KCD2) contend this lock thousands of
+     * times/frame, so the logging is flood + perf drag when always on.
+     *
+     * TODO (Proton macOS, real fix — not just silencing the log): the USER lock
+     * is this contended because winemac.drv holds it across Cocoa main-thread
+     * round-trips. Shrink those critical sections / release the lock around the
+     * Cocoa calls so the contention itself goes away. Tracked separately. */
     if (pthread_mutex_trylock( &user_mutex ))
     {
-        unsigned int holder = user_lock_thread;
-        unsigned int rec = user_lock_rec;
-        ERR("user_lock contention: holder tid=%04x rec=%u, my tid=%04x\n",
-            holder, rec, GetCurrentThreadId());
-        pthread_mutex_lock( &user_mutex );
-        ERR("user_lock acquired after wait: my tid=%04x (was waiting for holder=%04x)\n",
-            GetCurrentThreadId(), holder);
+        if (user_lock_trace)
+        {
+            unsigned int holder = user_lock_thread;
+            unsigned int rec = user_lock_rec;
+            ERR("user_lock contention: holder tid=%04x rec=%u, my tid=%04x\n",
+                holder, rec, GetCurrentThreadId());
+            pthread_mutex_lock( &user_mutex );
+            ERR("user_lock acquired after wait: my tid=%04x (was waiting for holder=%04x)\n",
+                GetCurrentThreadId(), holder);
+        }
+        else pthread_mutex_lock( &user_mutex );
     }
     if (!user_lock_rec++) user_lock_thread = GetCurrentThreadId();
     user_lock_acquire_counter++; /* watchdog progress signal */

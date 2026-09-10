@@ -1220,6 +1220,74 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     INITIAL_TEB stack;
     NTSTATUS status;
 
+    /* PROTON: env-gated higher floor for the per-thread stack reserve, scoped to
+     * the steamwebhelper.exe (CEF) process ONLY. When PROTON_MIN_STACK_RESERVE_MB
+     * is set (integer, megabytes) AND the current process's main executable is
+     * steamwebhelper.exe, raise reserve_size to that many MB; otherwise (any other
+     * process, or env unset/0) => identical behavior to upstream. Needed because
+     * Steam's CEF webhelper threads (CreateThread => NtCreateThreadEx => here)
+     * overflow the default 1 MB stack => STATUS_STACK_OVERFLOW. NOTE: wine commits
+     * most of the reserve up front (see virtual_alloc_thread_stack), so this floor
+     * costs committed VA per thread; macOS backs pages lazily but it is not free,
+     * so applying it to EVERY Steam process (the env is inherited) blows committed
+     * VA (e.g. webhelper can't start). Hence the per-process gate. Both the env
+     * value and the process match are cached once; value capped to a sane max. */
+    {
+        static unsigned int min_mb = ~0u;  /* ~0u = not yet read */
+        static int is_webhelper = -1;      /* -1 = not yet detected */
+
+        if (min_mb == ~0u)
+        {
+            const char *str = getenv( "PROTON_MIN_STACK_RESERVE_MB" );
+            unsigned int mb = str ? strtoul( str, NULL, 10 ) : 0;
+
+            if (mb > 256) mb = 256;  /* cap to a sane max */
+            min_mb = mb;
+        }
+
+        if (is_webhelper == -1)
+        {
+            /* Detect whether this process's main executable is steamwebhelper.exe,
+             * case-insensitively, by scanning wine's own parsed unix-side argv
+             * (main_argv from unix_private.h; same source used elsewhere in this
+             * file's TU, e.g. env.c's start_protected_game.exe scan). Crash-safe:
+             * NULL main_argv / NULL elements => treated as "not webhelper". */
+            int found = 0;
+
+            if (main_argv)
+            {
+                int i;
+
+                /* Substring match (robust to Windows-backslash PE paths like
+                 * C:\...\cef.win64\steamwebhelper.exe), mirroring env.c's
+                 * start_protected_game.exe scan. Steam's path is lowercase. */
+                for (i = 0; main_argv[i]; i++)
+                {
+                    if (strstr( main_argv[i], "steamwebhelper.exe" )) { found = 1; break; }
+                }
+            }
+            is_webhelper = found;
+        }
+
+        if (min_mb && is_webhelper)
+        {
+            SIZE_T floor = (SIZE_T)min_mb << 20;
+
+            if (floor > reserve_size)
+            {
+                static int reported;
+
+                if (!reported)
+                {
+                    reported = 1;
+                    ERR( "init_thread_stack: steamwebhelper stack floor -> %u MB\n", min_mb );
+                }
+                reserve_size = floor;
+            }
+            if (commit_size > reserve_size) reserve_size = commit_size;
+        }
+    }
+
     /* kernel stack */
     if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
         return status;
@@ -1665,6 +1733,31 @@ NTSTATUS WINAPI NtRaiseException( EXCEPTION_RECORD *rec, CONTEXT *context, BOOL 
             if (ret_addr >= 0x140000000UL && ret_addr < 0x150000000UL)
             {
                 ERR_(seh)( "  ER frame[stack+0x%x] ret=0x%lx (callsite ~0x%lx)\n",
+                           depth * 8, ret_addr, ret_addr - 5 );
+                found++;
+            }
+        }
+    }
+
+    /* PROTON_DARWIN (throwaway diag, W3 DX12 RedIO abort hunt 2026-06-11):
+     * same scanner for STATUS_STACK_BUFFER_OVERRUN (0xc0000409 = __fastfail /
+     * CRT abort()). Dumps the game-range return addresses on the aborting
+     * thread's stack so we can see WHICH of abort()'s ~50 static callers
+     * fired. PROTON_FASTFAIL_TRACE=1 to enable. */
+    if (rec->ExceptionCode == 0xc0000409UL && getenv( "PROTON_FASTFAIL_TRACE" ))
+    {
+        CONTEXT *ctx = (CONTEXT *)context;
+        ULONG_PTR rsp = ctx->Rsp;
+        int depth, found = 0;
+        ERR_(seh)( "PROTON_FASTFAIL_TRACE: c0000409 first_chance=%d info[0]=0x%lx rip=%p rsp=%p\n",
+                   first_chance, rec->NumberParameters ? rec->ExceptionInformation[0] : 0,
+                   (void *)(ULONG_PTR)ctx->Rip, (void *)rsp );
+        for (depth = 0; depth < 128 && found < 16; depth++)
+        {
+            ULONG_PTR ret_addr = *(volatile ULONG_PTR *)(rsp + depth * 8);
+            if (ret_addr >= 0x140000000UL && ret_addr < 0x150000000UL)
+            {
+                ERR_(seh)( "  FF frame[stack+0x%x] ret=0x%lx (callsite ~0x%lx)\n",
                            depth * 8, ret_addr, ret_addr - 5 );
                 found++;
             }

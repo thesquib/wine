@@ -742,7 +742,29 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
     }
     else
     {
-        errno = (ret == KERN_NO_SPACE ? EEXIST : ENOMEM);
+        /* PROTON/macOS: mach_vm_map(VM_FLAGS_FIXED) reports several kern codes when the
+         * requested range is already occupied (e.g. macOS/Rosetta reserved mappings at
+         * the top of the address space, or arm64ec WoW64 DLLs placed top-down). Linux's
+         * MAP_FIXED_NOREPLACE returns EEXIST for all of these, which lets the caller
+         * (try_map_free_area) step down and retry into the free part of the band. Treat
+         * every "address unavailable" code as EEXIST so we get that same step-and-retry;
+         * reserve ENOMEM for a genuine resource shortage. Without this, one occupied
+         * probe aborts the whole allocation and a later 32-bit guard-page recommit fails
+         * and is mis-reported as STATUS_STACK_OVERFLOW (c00000fd). */
+        switch (ret)
+        {
+        case KERN_NO_SPACE:
+        case KERN_INVALID_ADDRESS:
+        case KERN_NO_ACCESS:
+        case KERN_PROTECTION_FAILURE:
+            errno = EEXIST;
+            break;
+        default:
+            ERR( "mach_vm_map fixed at %p failed, kern_return_t %d (treating as ENOMEM)\n",
+                 start, (int)ret );
+            errno = ENOMEM;
+            break;
+        }
         ptr = MAP_FAILED;
     }
 #else
