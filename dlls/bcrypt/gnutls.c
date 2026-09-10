@@ -479,7 +479,17 @@ static NTSTATUS gnutls_process_attach( void *args )
         setenv("GNUTLS_SYSTEM_PRIORITY_FILE", "/dev/null", 0);
     }
 
-    if (!(libgnutls_handle = dlopen( SONAME_LIBGNUTLS, RTLD_NOW )))
+    /* proton-mac (PMWMAC-GNUTLS-DLOPEN): on macOS the wine unix process does
+     * not inherit DYLD_LIBRARY_PATH (dyld strips DYLD_* across the preloader
+     * re-exec), and a bare SONAME_LIBGNUTLS ("libgnutls.30.dylib") is not on
+     * the stripped default search path, so the dlopen fails and bcrypt reports
+     * "no encryption support" (breaking BCryptGenerateSymmetricKey -> games
+     * that decrypt config files, e.g. Wolfenstein II, FATAL on startup). Fall
+     * back to the absolute Homebrew (x86_64) gnutls paths, which need no search
+     * path. Matches the absolute-path SONAME older builds happened to bake in. */
+    if (!(libgnutls_handle = dlopen( SONAME_LIBGNUTLS, RTLD_NOW ))
+        && !(libgnutls_handle = dlopen( "/usr/local/lib/libgnutls.30.dylib", RTLD_NOW ))
+        && !(libgnutls_handle = dlopen( "/usr/local/opt/gnutls/lib/libgnutls.30.dylib", RTLD_NOW )))
     {
         ERR_(winediag)( "failed to load libgnutls, no support for encryption\n" );
         return STATUS_DLL_NOT_FOUND;
@@ -523,7 +533,16 @@ static NTSTATUS gnutls_process_attach( void *args )
         goto fail; \
     }
 
-    if ((libgmp_handle = dlopen( SONAME_LIBGMP, RTLD_NOW )))
+    /* proton-mac (PMWMAC-GMP-DLOPEN): same macOS DYLD-stripping fix as the gnutls
+     * dlopen above — the bare SONAME_LIBGMP ("libgmp.10.dylib") is unresolvable in
+     * the wine unix process, and this failure does `goto fail` (unlike libgcrypt
+     * below), aborting the WHOLE gnutls_process_attach -> BCrypt "no encryption
+     * support" -> id Tech 6 (Wolfenstein II) can't decrypt config/render data and
+     * its render-init fence never signals (vkWaitForFences wedge). Fall back to
+     * absolute Homebrew x86_64 gmp paths. */
+    if ((libgmp_handle = dlopen( SONAME_LIBGMP, RTLD_NOW ))
+        || (libgmp_handle = dlopen( "/usr/local/lib/libgmp.10.dylib", RTLD_NOW ))
+        || (libgmp_handle = dlopen( "/usr/local/opt/gmp/lib/libgmp.10.dylib", RTLD_NOW )))
     {
         LOAD_FUNCPTR(mpz_init);
         LOAD_FUNCPTR(mpz_clear);
