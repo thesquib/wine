@@ -517,6 +517,10 @@ static void *mach_message_pump( void *args )
             {
                 /* The client can stop spinning and safely start waiting now */
                 __atomic_store_n( shm_tid_map + tid, 1, __ATOMIC_RELEASE );
+                /* MSYNC-ACK-BLOCK: wake a client kernel-blocked on the ack
+                 * (msync_wait_multiple in dlls/ntdll/unix/msync.c); no-op for
+                 * a client still spinning or predating this change. */
+                __ulock_wake( UL_COMPARE_AND_WAIT_SHARED, (void *)(shm_tid_map + tid), 0 );
             }
         }
     }
