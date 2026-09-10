@@ -616,8 +616,9 @@ static HRESULT WINAPI viewport_AddEventHandler(IDirectManipulationViewport2 *ifa
                     IDirectManipulationViewportEventHandler *eventHandler, DWORD *cookie)
 {
     struct directviewport *This = impl_from_IDirectManipulationViewport2(iface);
-    FIXME("%p, %p, %p, %p\n", This, window, eventHandler, cookie);
-    return E_NOTIMPL;
+    FIXME("%p, %p, %p, %p (PROTON_DARWIN: fake-success S_OK + cookie=1)\n", This, window, eventHandler, cookie);
+    if (cookie) *cookie = 1;
+    return S_OK;
 }
 
 static HRESULT WINAPI viewport_RemoveEventHandler(IDirectManipulationViewport2 *iface, DWORD cookie)
