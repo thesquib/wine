@@ -101,6 +101,13 @@ extern CGSConnectionID CGSMainConnectionID(void);
 @property (readonly) uint32_t contextId;
 @end
 
+/* Forward declaration so the E.1 handler can probe whether the target view is
+ * a live software paint target (WineContentView lives in cocoa_window.m, same
+ * unixlib). See -[WineContentView hasLiveColorImage]. */
+@interface WineContentView : NSView
+- (BOOL) hasLiveColorImage;
+@end
+
 /* Shared between the broadcast retry timer and the
  * handleDXMTRemoteLayerHostRequest: handler. The handler adds the hwnd to
  * this set when it successfully hosts the layer in this process; the retry
@@ -135,12 +142,40 @@ static int proton_e1_diag_enabled(void)
  * hypothesised safer, but as a safety belt we hard-skip Eternal so even if
  * the API turns out to be equivalent under the hood, Eternal is unaffected.
  * Cached single getenv to keep the hot path free of repeat string compares. */
+/* PROTON_FORCE_MENUBAR_HIDE: bypass the per-appid menubar-hide skip so the
+ * menubar auto-hides even for a title on the skip list (DOOM 2016 379720 was
+ * added to the skip by 0070 to dodge the alt-tab crash). Used to test whether,
+ * with PROTON_KEEP_FULLSCREEN_MAPPED keeping the window stable, the single
+ * deferred setMenuBarVisible:NO now lands cleanly on KK instead of dropping the
+ * in-flight Vulkan drawable (the DOOM Eternal MAILBOX black-screen). Cached
+ * single getenv. Tag [FORCE-MENUBAR-HIDE]. */
+static int proton_force_menubar_hide(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_FORCE_MENUBAR_HIDE");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static int proton_menubar_hide_skip_appid(void)
 {
     static int cached = -1;
     if (cached < 0) {
         const char *id = getenv("SteamAppId");
-        cached = (id && !strcmp(id, "782330")) ? 1 : 0;
+        const char *skip = getenv("PROTON_NO_MENUBAR_HIDE");
+        /* setMenuBarVisible: drives a WindowServer compositor reconfigure.
+         * For some fullscreen titles this re-enters the fullscreen-state
+         * detection and flaps anyFullscreen 1<->0, re-firing adjustWindowLevels
+         * -> updateMenuBarHiding forever (DOOM Eternal black-screens; Detroit:
+         * Become Human melts down at 600%+ CPU into a user_lock convoy + window
+         * death). Skip the toggle for known-bad appids, or via env so a recipe
+         * can opt out without a rebuild. */
+        cached = ((skip && *skip && *skip != '0') ||
+                  (id && (!strcmp(id, "782330") ||    /* DOOM Eternal */
+                          !strcmp(id, "1222140") ||   /* Detroit: Become Human */
+                          !strcmp(id, "379720")))) ? 1 : 0;  /* DOOM 2016 (alt-tab crash) */
     }
     return cached;
 }
@@ -346,6 +381,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
 @property (retain, nonatomic) NSImage* applicationIcon;
 @property (readonly, nonatomic) BOOL inputSourceIsInputMethod;
 @property (retain, nonatomic) WineWindow* mouseCaptureWindow;
+    /* YES when the current capture is Wine's own move/size loop (GUI_INMOVESIZE)
+     * rather than an app calling SetCapture for mouse-look. See fpsModeActive. */
+@property (nonatomic) BOOL mouseCaptureIsMoveSize;
 
     - (void) setupObservations;
     - (void) applicationDidBecomeActive:(NSNotification *)notification;
@@ -363,6 +401,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     @synthesize applicationIcon;
     @synthesize cursorFrames, cursorTimer, cursor;
     @synthesize mouseCaptureWindow;
+    @synthesize mouseCaptureIsMoveSize;
     @synthesize lastSetCursorPositionTime;
 
     + (void) initialize
@@ -996,12 +1035,14 @@ static NSString* WineLocalizedString(unsigned int stringID)
         }
         if (!gate_cached) return;
 
-        /* Per-appid safety belt. DOOM Eternal (782330) bails out
-         * regardless of which AppKit hide API we use. 2026-05-23
-         * empirical confirmation: even with setMenuBarVisible: (not
-         * setPresentationOptions:), removing this skip black-screens
-         * Eternal's main menu. Keep the skip. */
-        if (proton_menubar_hide_skip_appid()) return;
+        /* Per-appid safety belt. Even with 2s dispatch_after defer
+         * (2026-05-23), DOOM Eternal (782330) main menu still doesn't
+         * render — the WindowServer compositor reconfigure breaks
+         * the MAILBOX swapchain regardless of timing within ~seconds.
+         * Keep the skip until a deeper fix is found. */
+        if (proton_menubar_hide_skip_appid() && !proton_force_menubar_hide()) return;
+        if (proton_force_menubar_hide())
+            fprintf(stderr, "winemac: [FORCE-MENUBAR-HIDE] bypassing per-appid skip\n");
 
         if ([NSApp isActive])
         {
@@ -1020,12 +1061,52 @@ static NSString* WineLocalizedString(unsigned int stringID)
          * is unique enough to survive into `strings winemac.so` output, which
          * lets us confirm a built binary actually picked up this overlay
          * (ObjC selector names do not reliably show up in strings). */
-        fprintf(stderr, "winemac: [PROTON-MENUBAR-HIDE] anyFullscreen=%d skip_appid=%d\n",
-                (int)anyFullscreenActive, proton_menubar_hide_skip_appid());
+        fprintf(stderr, "winemac: [PROTON-MENUBAR-HIDE] anyFullscreen=%d\n",
+                (int)anyFullscreenActive);
 
         desiredVisible = anyFullscreenActive ? NO : YES;
-        if ([NSMenu menuBarVisible] != desiredVisible)
-            [NSMenu setMenuBarVisible:desiredVisible];
+
+        if (desiredVisible)
+        {
+            /* SHOW: restore menu bar promptly when the wine window
+             * is no longer fullscreen-active. */
+            if (![NSMenu menuBarVisible])
+                [NSMenu setMenuBarVisible:YES];
+        }
+        else
+        {
+            /* HIDE: defer by 2s. setMenuBarVisible: shares the WindowServer
+             * write path with setPresentationOptions: (per SDL #14265 and
+             * Mozilla bug 1172664: both route through SetSystemUIMode).
+             * The resulting compositor reconfigure drops the in-flight
+             * Vulkan drawable for engines using VK_PRESENT_MODE_MAILBOX_KHR
+             * with tight pipelining — confirmed black-screens DOOM Eternal
+             * main menu on 2026-05-23. Deferring lets the swapchain reach
+             * steady state before the toggle. Re-check state at fire time
+             * because the deferred block may execute after the app has lost
+             * focus or the fullscreen window has changed. */
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                           dispatch_get_main_queue(), ^{
+                BOOL stillNeedsHide = FALSE;
+                if ([NSApp isActive])
+                {
+                    for (NSNumber* wn in [NSWindow windowNumbersWithOptions:0])
+                    {
+                        WineWindow* w = (WineWindow*)[NSApp windowWithWindowNumber:[wn integerValue]];
+                        if ([w isKindOfClass:[WineWindow class]] && w.fullscreen)
+                        {
+                            stillNeedsHide = TRUE;
+                            break;
+                        }
+                    }
+                }
+                if (stillNeedsHide && [NSMenu menuBarVisible])
+                {
+                    fprintf(stderr, "winemac: [PROTON-MENUBAR-HIDE-DEFERRED] firing hide after settle\n");
+                    [NSMenu setMenuBarVisible:NO];
+                }
+            });
+        }
     }
 
     - (void) activeSpaceDidChange
@@ -1699,9 +1780,26 @@ static NSString* WineLocalizedString(unsigned int stringID)
              * fullscreen with cursor hidden. Any of these suggests mouse-look.
              * Force RELATIVE motion + disassociate Mac cursor so trackpad
              * deltas go directly to the game. */
+            /* [FPS-CURSOR] The game hid the cursor (SetCursor NULL) while a target
+             * window is focused — the universal signal for in-game mouse-look
+             * (FPS / 3rd-person camera). MENUS show the cursor, so this trigger
+             * auto-DISENGAGES there, giving relative motion in-game and an absolute
+             * cursor in menus WITHOUT PROTON_FORCE_FPS_MOUSE (which is always-on and
+             * kills the menu cursor). This is the cursor-state the [fullscreen]
+             * heuristic below was a poor proxy for (fullscreen can't tell in-game
+             * from a fullscreen menu), and it fixes the laggy-default-vs-dead-menu
+             * split on raw-input titles (DOOM, KCD2). Opt out via PROTON_NO_FPS_MOUSE
+             * for cursor-driven titles that hide the cursor in menus (Detroit). */
+            /* A capture flagged GUI_INMOVESIZE is Wine's OWN window drag loop
+             * (defwnd.c captures for the duration of a caption drag), NOT the app
+             * asking for mouse-look. Counting it disassociated the cursor mid-drag:
+             * the pointer froze at the grab point while the window followed stale
+             * deltas, then snapped back on release. Confirmed 2026-09-06. */
             BOOL fpsModeActive = self.clippingCursor
                               || (self.mouseCaptureWindow != nil
-                                  && self.mouseCaptureWindow == targetWindow)
+                                  && self.mouseCaptureWindow == targetWindow
+                                  && !self.mouseCaptureIsMoveSize)
+                              || (clientWantsCursorHidden && targetWindow != nil)
                               || (cursor_clipping_locks_windows
                                   && [(WineWindow*)targetWindow respondsToSelector:@selector(fullscreen)]
                                   && [(WineWindow*)targetWindow fullscreen]);
@@ -1718,6 +1816,21 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             if (force_cached && targetWindow)
                 fpsModeActive = YES;
+            /* PROTON_NO_FPS_MOUSE=1: never enter FPS/relative mouse mode — keep
+             * the Mac cursor ASSOCIATED so the absolute OS cursor position keeps
+             * updating. Inverse of PROTON_FORCE_FPS_MOUSE. Recipes set this for
+             * narrative / cursor-driven titles (Detroit: Become Human) that
+             * ClipCursor in their menus: Wine would otherwise disassociate the
+             * mouse into relative mouse-look, freezing the absolute cursor so
+             * menu buttons can't be moused (clicks land, the cursor just can't
+             * move). Placed after the force override so suppression wins. */
+            static int no_fps_cached = -1;
+            if (no_fps_cached < 0) {
+                const char *v = getenv("PROTON_NO_FPS_MOUSE");
+                no_fps_cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+            }
+            if (no_fps_cached)
+                fpsModeActive = NO;
             if (fpsModeActive != macdrv_mouse_disassociated) {
                 CGAssociateMouseAndMouseCursorPosition(!fpsModeActive);
                 macdrv_mouse_disassociated = fpsModeActive;
@@ -2267,7 +2380,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
             if (window == lastTargetWindow)
                 lastTargetWindow = nil;
             if (window == self.mouseCaptureWindow)
+            {
                 self.mouseCaptureWindow = nil;
+                self.mouseCaptureIsMoveSize = NO;
+            }
             if ([window isKindOfClass:[WineWindow class]] && [(WineWindow*)window isFullscreen])
             {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0), dispatch_get_main_queue(), ^{
@@ -2349,7 +2465,18 @@ static NSString* WineLocalizedString(unsigned int stringID)
          * only for steam.exe / steamwebhelper.exe / cef.win64
          * subprocesses; ignore it for everything else. */
         BOOL disable_e1 = NO;
-        if (getenv("PROTON_DISABLE_E1"))
+        /* PROTON_DISABLE_E1_ALL: process-agnostic kill switch. The per-process
+         * arg-suffix detection below is unreliable for Steam's CEF subprocesses
+         * (steamwebhelper child processes) - their NSProcessInfo arguments do not
+         * carry the .exe path in a matching form, so they ignore PROTON_DISABLE_E1,
+         * keep the E.1 layer-host observer, and attach an opaque overlay over the
+         * CEF software UI -> black window. In Steam-in-bottle (login-UI) mode there
+         * are no games, so disabling E.1 in EVERY process is correct. */
+        if (getenv("PROTON_DISABLE_E1_ALL"))
+        {
+            disable_e1 = YES;
+        }
+        else if (getenv("PROTON_DISABLE_E1"))
         {
             NSArray *argv = [[NSProcessInfo processInfo] arguments];
             for (NSString *arg in argv)
@@ -2468,6 +2595,40 @@ static NSString* WineLocalizedString(unsigned int stringID)
                             getpid(), hwnd, (void *)view);
                     fflush(stderr);
                 }
+                return;
+            }
+
+            /* Strategy E.1 software-window guard (Proton macOS 2026-06-20):
+             * Steam's CEF UI is SOFTWARE-rendered. Its GPU subprocess still
+             * creates a Vulkan surface (then crashes + software-falls-back),
+             * which broadcasts DXMTRemoteLayerHostRequest. If we attach the
+             * opaque black CAMetalLayer/CALayerHost overlay (zPosition 1000)
+             * onto that window's contentView, it occludes the software CEF
+             * bitmap that lands in the same view's layer.contents -> black.
+             *
+             * DECLINE attaching when the target is a WineContentView with a
+             * live colorImage (a software paint target). Real Vulkan game
+             * windows (DOOM, Hades) never set colorImage, so they are
+             * unaffected and still get their overlay.
+             *
+             * RACE: the broadcast can arrive BEFORE software fallback sets
+             * colorImage, and broadcasts RETRY repeatedly. So on a (re)broadcast
+             * where colorImage has since become non-nil, also REMOVE any overlay
+             * we already attached, then return - the overlay goes away as soon
+             * as the window has software content, and stays gone. */
+            if ([view isKindOfClass:[WineContentView class]] &&
+                [(WineContentView *)view hasLiveColorImage]) {
+                NSArray *existing = [parentLayer.sublayers copy];
+                int removed = 0;
+                for (CALayer *sib in existing) {
+                    if ([sib isKindOfClass:NSClassFromString(@"CAMetalLayer")] ||
+                        [sib isKindOfClass:NSClassFromString(@"CALayerHost")]) {
+                        [sib removeFromSuperlayer];
+                        removed++;
+                    }
+                }
+                fprintf(stderr, "winemac:E.1 - declining overlay (target has live software surface) view=%p removedExisting=%d\n",
+                        (void *)view, removed);
                 return;
             }
 
@@ -3386,14 +3547,16 @@ bool macdrv_using_input_method(void)
 /***********************************************************************
  *              macdrv_set_mouse_capture_window
  */
-void macdrv_set_mouse_capture_window(macdrv_window window)
+void macdrv_set_mouse_capture_window(macdrv_window window, int move_size)
 {
     WineWindow* w = (WineWindow*)window;
 
     [w.queue discardEventsMatchingMask:event_mask_for_type(RELEASE_CAPTURE) forWindow:w];
 
     OnMainThread(^{
-        [[WineApplicationController sharedController] setMouseCaptureWindow:w];
+        WineApplicationController* controller = [WineApplicationController sharedController];
+        controller.mouseCaptureIsMoveSize = (w && move_size) ? YES : NO;
+        [controller setMouseCaptureWindow:w];
     });
 }
 

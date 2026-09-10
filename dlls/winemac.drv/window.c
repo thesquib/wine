@@ -1993,6 +1993,27 @@ void macdrv_window_got_focus(HWND hwnd, const macdrv_event *event)
 }
 
 
+/* PROTON_KEEP_FULLSCREEN_MAPPED: when set, do NOT yank foreground to the
+ * desktop on focus loss / app-deactivate. The foreground-yank makes a
+ * fullscreen game issue SW_MINIMIZE -> the window orders out -> the
+ * fullscreen-cover flag flaps and the Vulkan surface is torn down and
+ * recreated against a 0x0 client rect (DOOM 2016 alt-tab crash/white-screen,
+ * and the "window invisible + cursor still grabbed" non-restore). Keeping the
+ * window mapped + foreground makes alt-tab a no-op for the surface; the cursor
+ * is still un-clipped on deactivate (below) so the mouse frees. Scope via the
+ * env (a recipe sets it per-title) so other titles are unaffected. Cached
+ * single getenv. Tag [KEEP-FS-MAPPED]. */
+static int proton_keep_fullscreen_mapped(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_KEEP_FULLSCREEN_MAPPED");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 /***********************************************************************
  *              macdrv_window_lost_focus
  *
@@ -2008,7 +2029,12 @@ void macdrv_window_lost_focus(HWND hwnd, const macdrv_event *event)
     {
         send_message(hwnd, WM_CANCELMODE, 0, 0);
         if (hwnd == NtUserGetForegroundWindow())
-            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        {
+            if (proton_keep_fullscreen_mapped())
+                fprintf(stderr, "winemac:[KEEP-FS-MAPPED] win %p: keeping foreground on focus loss (no desktop yank)\n", hwnd);
+            else
+                NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        }
     }
 }
 
@@ -2036,8 +2062,15 @@ void macdrv_app_deactivated(void)
 
     if (get_active_window() == NtUserGetForegroundWindow())
     {
-        TRACE("setting fg to desktop\n");
-        NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        if (proton_keep_fullscreen_mapped())
+        {
+            fprintf(stderr, "winemac:[KEEP-FS-MAPPED] app-deactivate: keeping foreground (no desktop yank)\n");
+        }
+        else
+        {
+            TRACE("setting fg to desktop\n");
+            NtUserSetForegroundWindowInternal(NtUserGetDesktopWindow());
+        }
     }
 }
 
@@ -2121,6 +2154,17 @@ done:
 void macdrv_window_brought_forward(HWND hwnd)
 {
     TRACE("win %p\n", hwnd);
+    /* Bug (Proton macOS) 2026-06-18: avoid a window-order feedback loop.
+     * Re-ordering an already-frontmost window makes Cocoa re-fire
+     * makeKeyAndOrderFront -> postBroughtForwardEvent, which during
+     * fullscreen window-level management (e.g. the menubar-hide
+     * WindowServer reconfigure) re-enters here forever, pegging the
+     * Cocoa main thread under user_lock and starving every other USER
+     * thread (Detroit: Become Human wedged with a user_lock convoy +
+     * silent window death). set_focus() already guards the identical
+     * NtUserSetWindowPos(HWND_TOP) call with is_all_the_way_front();
+     * this handler was simply missing the same guard. */
+    if (is_all_the_way_front(hwnd)) return;
     NtUserSetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
