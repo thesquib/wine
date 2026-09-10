@@ -28,6 +28,8 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -48,6 +50,58 @@ WINE_DECLARE_DEBUG_CHANNEL(fps);
 
 static const struct vulkan_driver_funcs *driver_funcs;
 static int fshack_enabled = -1;
+
+/* Detroit-class present-completion wake. Some titles' load/render coordinators
+ * block in a MsgWait for a driver/present wake that our macOS Vulkan present path
+ * never posts (CrossOver's winemac posts a CLIENT_SURFACE_PRESENTED *driver*
+ * message at present; upstream/ours does not). The wake ENGINE (set_queue_bits ->
+ * signal_sync(queue->sync)) is intact and identical to CrossOver's; only the
+ * producer of the wake is missing on our path, so the coordinator sleeps forever
+ * (the Detroit 1222140 loading-ring livelock). When PROTON_VK_PRESENT_WAKE=1, post
+ * WM_NULL to the presented swapchain window's message queue after each present so
+ * the waiter's QS_POSTMESSAGE bit is set and it advances. Opt-in / per-title,
+ * WM_NULL is a no-op message so it is side-effect free. */
+static int proton_present_wake_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "PROTON_VK_PRESENT_WAKE" );
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
+/* Retargeted present wake: the earlier single NtUserPostMessage(surface->hwnd)
+ * only woke the render window's owner thread. Detroit's stuck load coordinator is
+ * (per analysis) a DIFFERENT thread — a toplevel/UI thread, or one whose queue
+ * doesn't own surface->hwnd. So on present, set QS_POSTMESSAGE on surface->hwnd,
+ * its toplevel, AND every top-level window + owning thread of THIS process, so a
+ * coordinator blocked in MsgWaitForMultipleObjectsEx gets its msg_queue->sync
+ * signalled wherever it lives. WM_NULL is a no-op message; PostThreadMessage also
+ * covers a windowless coordinator. Env-gated PROTON_VK_PRESENT_WAKE. */
+static void proton_present_wake_all( HWND surface_hwnd )
+{
+    DWORD self = GetCurrentProcessId();
+    HWND *list;
+    UINT i;
+
+    NtUserPostMessage( surface_hwnd, 0 /* WM_NULL */, 0, 0 );
+    NtUserPostMessage( NtUserGetAncestor( surface_hwnd, 2 /* GA_ROOT */ ), 0, 0, 0 );
+    if ((list = list_window_children( 0 )))
+    {
+        for (i = 0; list[i]; i++)
+        {
+            DWORD pid = 0, tid = NtUserGetWindowThread( list[i], &pid );
+            if (pid == self)
+            {
+                NtUserPostMessage( list[i], 0, 0, 0 );
+                if (tid) NtUserPostThreadMessage( tid, 0, 0, 0 );
+            }
+        }
+        free( list );
+    }
+}
 
 static const UINT EXTERNAL_MEMORY_WIN32_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
@@ -127,6 +181,7 @@ struct device_memory
     D3DKMT_HANDLE local;
     D3DKMT_HANDLE global;
     HANDLE shared;
+    BOOL metal_shared; /* shared is an in-process MTLHeap broker handle (macOS), not a d3dkmt resource */
 
     D3DKMT_HANDLE sync;
     D3DKMT_HANDLE mutex;
@@ -304,6 +359,9 @@ static VkExternalMemoryHandleTypeFlagBits get_host_external_memory_type(void)
 {
     struct vulkan_device_extensions extensions = {.has_VK_KHR_external_memory_win32 = 1};
     driver_funcs->p_map_device_extensions( &extensions );
+    /* macOS / KosmicKrisp: the host backs shared memory with an MTLHeap rather
+     * than an fd (the winemac.drv driver aliases win32 <-> metal). */
+    if (extensions.has_VK_EXT_external_memory_metal) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
     if (extensions.has_VK_KHR_external_memory_fd) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
     if (extensions.has_VK_EXT_external_memory_dma_buf) return VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     return 0;
@@ -373,6 +431,138 @@ HANDLE open_shared_resource_from_name( const WCHAR *name )
     status = NtGdiDdDDIOpenNtHandleFromName( &open_name );
     if (status) WARN( "Failed to open %s, status %#x\n", debugstr_w( name ), status );
     return open_name.hNtHandle;
+}
+
+/* macOS / KosmicKrisp in-process MTLHeap broker (Bug Proton macOS 2026-06-27).
+ *
+ * KK services cross-API (D3D11/DXVK <-> D3D12/vkd3d) shared memory with
+ * VK_EXT_external_memory_metal, whose handle is an MTLHeap pointer (void *),
+ * not an fd. The d3dkmt broker (win32u/d3dkmt.c, wine_server_send_fd) is
+ * fd-based and cross-process; it cannot carry a raw pointer, and Clair Obscur
+ * shares the resource *in-process* (one MTLDevice). So we keep a parallel
+ * process-global table mapping a minted NT broker HANDLE -> MTLHeap pointer.
+ *
+ * Ownership: the MTLHeap's lifetime is tied to the *exporter's* host
+ * VkDeviceMemory (KK frees the MTLHeap when that memory is freed). The importer
+ * side's KK does mtl_retain() on VkImportMemoryMetalHandleInfoEXT, so the heap
+ * survives until both sides free their VkDeviceMemory. We therefore never
+ * retain/release the MTLHeap here; we only track the HANDLE<->pointer mapping
+ * and remove it when the exporting VkDeviceMemory is freed.
+ *
+ * The broker HANDLE is a real D3DKMT shared-resource NT handle (so DXVK/vkd3d's
+ * D3DKMTOpenResourceFromNtHandle / Escape(UPDATE_RESOURCE_WINE) path works); its
+ * NtDuplicateObject() in vkGetMemoryWin32HandleKHR yields a handle to the same
+ * kernel object that NtCompareObjects() can resolve back to this entry on import. */
+struct metal_shared_resource
+{
+    struct list entry;
+    HANDLE handle;  /* the minted broker HANDLE that keys this entry */
+    void *mtlheap;  /* MTLHeap pointer owned by the exporter's VkDeviceMemory */
+};
+
+static struct list metal_shared_resources = LIST_INIT( metal_shared_resources );
+static pthread_mutex_t metal_shared_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Open a named Metal broker object so a by-name import can be resolved. */
+static HANDLE open_metal_shared_handle_from_name( const WCHAR *name )
+{
+    WCHAR bufferW[MAX_PATH * 2];
+    UNICODE_STRING name_str = {.Buffer = bufferW};
+    OBJECT_ATTRIBUTES attr;
+    HANDLE handle = NULL;
+    NTSTATUS status;
+
+    init_shared_resource_path( name, &name_str );
+    InitializeObjectAttributes( &attr, &name_str, OBJ_CASE_INSENSITIVE, NULL, NULL );
+
+    if ((status = NtOpenEvent( &handle, EVENT_ALL_ACCESS, &attr )))
+    {
+        WARN( "Failed to open Metal broker %s, status %#x\n", debugstr_w( name ), status );
+        return NULL;
+    }
+    return handle;
+}
+
+static BOOL metal_shared_register( HANDLE handle, void *mtlheap )
+{
+    struct metal_shared_resource *res;
+
+    if (!(res = malloc( sizeof(*res) ))) return FALSE;
+    res->handle = handle;
+    res->mtlheap = mtlheap;
+
+    pthread_mutex_lock( &metal_shared_lock );
+    list_add_tail( &metal_shared_resources, &res->entry );
+    pthread_mutex_unlock( &metal_shared_lock );
+    return TRUE;
+}
+
+/* Resolve a (possibly duplicated) broker HANDLE back to its MTLHeap pointer. */
+static void *metal_shared_lookup( HANDLE handle )
+{
+    struct metal_shared_resource *res;
+    void *mtlheap = NULL;
+
+    pthread_mutex_lock( &metal_shared_lock );
+    LIST_FOR_EACH_ENTRY( res, &metal_shared_resources, struct metal_shared_resource, entry )
+    {
+        if (res->handle == handle || !NtCompareObjects( res->handle, handle ))
+        {
+            mtlheap = res->mtlheap;
+            break;
+        }
+    }
+    pthread_mutex_unlock( &metal_shared_lock );
+    return mtlheap;
+}
+
+/* Drop the table entry for an exported broker HANDLE (on FreeMemory / error). */
+static void metal_shared_unregister( HANDLE handle )
+{
+    struct metal_shared_resource *res;
+
+    pthread_mutex_lock( &metal_shared_lock );
+    LIST_FOR_EACH_ENTRY( res, &metal_shared_resources, struct metal_shared_resource, entry )
+    {
+        if (res->handle == handle)
+        {
+            list_remove( &res->entry );
+            free( res );
+            break;
+        }
+    }
+    pthread_mutex_unlock( &metal_shared_lock );
+}
+
+/* A Metal-backed d3dkmt resource has no backing fd (the real memory is the
+ * MTLHeap, carried out of band). But D3DKMTOpenResource2(global) / d3dkmt_object_get_fd
+ * fail unless the resource was registered with a real fd. Mint a tiny shm fd
+ * purely to satisfy that registration - the server's d3dkmt_fd_ops are no-ops,
+ * the fd is never mmap'd/read/written (DXVK/vkd3d import via the MTLHeap), so a
+ * fixed 1-byte size is sufficient and avoids any per-object size cap on large
+ * allocations. Unique short name (pid + monotonic counter) stays well under the
+ * macOS 31-char shm-name limit. Returns -1 on failure (NT path still works
+ * fd-free; KMT degrades, so warn). */
+static int create_metal_dummy_fd(void)
+{
+    static unsigned int counter;
+    char name[32];
+    int fd;
+
+    snprintf( name, sizeof(name), "/pmw-mtl-%x-%x", (unsigned)getpid(),
+              __atomic_add_fetch( &counter, 1, __ATOMIC_RELAXED ) );
+    if ((fd = shm_open( name, O_RDWR | O_CREAT | O_EXCL, 0600 )) < 0)
+    {
+        WARN( "Failed to mint Metal dummy fd; KMT cross-API sharing will not work\n" );
+        return -1;
+    }
+    shm_unlink( name );
+    if (ftruncate( fd, 1 ))
+    {
+        close( fd );
+        return -1;
+    }
+    return fd;
 }
 
 static const void *find_next_struct( const VkBaseInStructure *header, VkStructureType type )
@@ -493,6 +683,20 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
     driver_funcs->p_map_instance_extensions( &instance->obj.extensions );
     instance->obj.extensions.has_VK_KHR_win32_surface = 0;
 
+    /* A host platform-surface extension (VK_EXT_metal_surface / VK_MVK_macos_surface
+     * on macOS, VK_EXT_headless_surface, etc.) requires VK_KHR_surface. The client's
+     * VK_KHR_win32_surface is mapped to one of these above. Normally the client also
+     * enables VK_KHR_surface so has_VK_KHR_surface is already set, but DXVK in the
+     * ANGLE/CEF gpu-process path enables VK_KHR_win32_surface WITHOUT VK_KHR_surface.
+     * Without this, the host instance gets metal-surface-but-no-surface and host
+     * vkCreateInstance fails. Force-enable the host VK_KHR_surface whenever a host
+     * platform surface is being enabled. has_VK_KHR_win32_surface was just zeroed,
+     * so branch on the mapped host surface flags instead. */
+    if (instance->obj.extensions.has_VK_EXT_metal_surface ||
+        instance->obj.extensions.has_VK_MVK_macos_surface ||
+        instance->obj.extensions.has_VK_EXT_headless_surface)
+        instance->obj.extensions.has_VK_KHR_surface = 1;
+
     if (instance->obj.extensions.has_VK_EXT_debug_utils || instance->obj.extensions.has_VK_EXT_debug_report)
     {
         rb_init( &instance->objects, vulkan_object_compare );
@@ -586,7 +790,11 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     }
 
     driver_funcs->p_map_device_extensions( &extensions );
-    if (extensions.has_VK_KHR_external_memory_win32 && zero_bits && !physical_device->map_placed_align)
+    /* The WOW64 export path relies on host-pointer mapping; it does not apply
+     * to the macOS / KosmicKrisp Metal path (which exports an MTLHeap), so only
+     * disable win32 external memory here when Metal cannot service it. */
+    if (extensions.has_VK_KHR_external_memory_win32 && !extensions.has_VK_EXT_external_memory_metal &&
+        zero_bits && !physical_device->map_placed_align)
     {
         WARN( "Cannot export WOW64 memory without VK_EXT_map_memory_placed\n" );
         extensions.has_VK_KHR_external_memory_win32 = 0;
@@ -807,6 +1015,11 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     }
 
     driver_funcs->p_map_device_extensions( &device->extensions );
+    /* The win32 external-memory/sync extensions are wine fictions the host
+     * driver never advertises, so they must be stripped from the host device
+     * create list. On macOS / KosmicKrisp p_map_device_extensions has already
+     * aliased win32 external memory onto VK_EXT_external_memory_metal, which is
+     * left enabled below and is what actually gets passed to the host. */
     device->extensions.has_VK_KHR_win32_keyed_mutex = 0;
     device->extensions.has_VK_KHR_external_memory_win32 = 0;
     device->extensions.has_VK_KHR_external_fence_win32 = 0;
@@ -1050,6 +1263,7 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
                                          const VkAllocationCallbacks *allocator, VkDeviceMemory *ret )
 {
     VkImportMemoryFdInfoKHR fd_info = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR};
+    VkImportMemoryMetalHandleInfoEXT metal_import = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_METAL_HANDLE_INFO_EXT};
     VkMemoryAllocateInfo *alloc_info = (VkMemoryAllocateInfo *)client_alloc_info; /* cast away const, chain has been copied in the thunks */
     VkBaseOutStructure **next, *prev = (VkBaseOutStructure *)alloc_info;
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
@@ -1110,7 +1324,32 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
 
     if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if (import_win32)
+    if (import_win32 && get_host_external_memory_type() == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)
+    {
+        /* macOS / KosmicKrisp in-process share: resolve the broker HANDLE back
+         * to the exporter's MTLHeap and chain a Metal import instead of an fd. */
+        HANDLE opened = NULL, shared = import_win32->handle;
+        void *mtlheap;
+
+        if (import_win32->name && (opened = open_metal_shared_handle_from_name( import_win32->name )))
+            shared = opened;
+
+        mtlheap = metal_shared_lookup( shared );
+        if (opened) NtClose( opened );
+
+        if (!mtlheap)
+        {
+            FIXME( "Unknown Metal shared handle %p name %s\n", import_win32->handle, debugstr_w( import_win32->name ) );
+            res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            goto failed;
+        }
+
+        metal_import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT;
+        metal_import.handle = mtlheap;
+        metal_import.pNext = alloc_info->pNext;
+        alloc_info->pNext = &metal_import;
+    }
+    else if (import_win32)
     {
         switch (import_win32->handleType)
         {
@@ -1169,7 +1408,81 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
     set_transient_client_handle(instance, (uintptr_t)&memory->obj.obj);
     if ((res = device->p_vkAllocateMemory( device->host.device, alloc_info, NULL, &host_device_memory ))) goto failed;
 
-    if (export_info)
+    if (export_info && get_host_external_memory_type() == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)
+    {
+        /* macOS / KosmicKrisp: export the host VkDeviceMemory's MTLHeap and back
+         * it with a real D3DKMT resource so DXVK/vkd3d's shared-resource D3DKMT
+         * calls (D3DKMTOpenResourceFromNtHandle, Escape(UPDATE_RESOURCE_WINE),
+         * QueryResourceInfoFromNtHandle) work on the resulting NT handle. We mint
+         * the resource with fd = -1 (no dma-buf to send; the MTLHeap is carried
+         * out of band in the process-global table) then share it the same way as
+         * the fd export, and stash the MTLHeap under that NT handle so an
+         * in-process importer (vkd3d) can resolve it. The MTLHeap stays owned by
+         * host_device_memory; we never retain/release it here. */
+        VkMemoryGetMetalHandleInfoEXT get_metal_info =
+        {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_GET_METAL_HANDLE_INFO_EXT,
+            .memory = host_device_memory,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT,
+        };
+        void *mtlheap = NULL;
+        int dummy_fd;
+
+        if (!device->p_vkGetMemoryMetalHandleEXT)
+        {
+            FIXME( "Host driver does not implement vkGetMemoryMetalHandleEXT\n" );
+            res = VK_ERROR_FEATURE_NOT_PRESENT;
+            goto failed;
+        }
+        if ((res = device->p_vkGetMemoryMetalHandleEXT( device->host.device, &get_metal_info, &mtlheap )) || !mtlheap)
+        {
+            if (!res) res = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            goto failed;
+        }
+
+        /* Back the d3dkmt resource with a dummy sized fd (the MTLHeap is the real
+         * memory, carried in the broker table) so DXVK/vkd3d's D3DKMTOpenResource2(global)
+         * + d3dkmt_object_get_fd succeed for the KMT path - which otherwise fail on a
+         * no-fd resource. Close it after; the wineserver holds a dup. */
+        dummy_fd = create_metal_dummy_fd();
+        memory->local = d3dkmt_create_resource( dummy_fd, nt_shared ? NULL : &memory->global );
+        if (dummy_fd >= 0) close( dummy_fd );
+        if (!memory->local)
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto failed;
+        }
+        /* NtGdiDdDDIShareObjects requires an nt_shared resource, so only the
+         * NT-handle export mints a broker HANDLE (keyed by NT-handle identity).
+         * A KMT export has no NT handle - it is shared via the global D3DKMT
+         * handle (memory->global) - so key its broker entry by UlongToPtr(global),
+         * which is exactly what the importer passes to metal_shared_lookup
+         * (resolved via the pointer-equality fast path). */
+        if (nt_shared)
+        {
+            if (!(memory->shared = create_shared_resource_handle( memory->local, &export_win32 )))
+            {
+                res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto failed;
+            }
+            memory->metal_shared = TRUE;
+            if (!metal_shared_register( memory->shared, mtlheap ))
+            {
+                res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto failed;
+            }
+        }
+        else
+        {
+            memory->metal_shared = TRUE;
+            if (!metal_shared_register( UlongToPtr( memory->global ), mtlheap ))
+            {
+                res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto failed;
+            }
+        }
+    }
+    else if (export_info)
     {
         if (!memory->local)
         {
@@ -1207,6 +1520,8 @@ failed:
     WARN( "Failed to allocate memory, res %d\n", res );
     if (host_device_memory) device->p_vkFreeMemory( device->host.device, host_device_memory, NULL );
     if (memory->semaphore) device->p_vkDestroySemaphore( device->host.device, memory->semaphore, NULL );
+    if (memory->metal_shared) metal_shared_unregister( memory->shared ? memory->shared : UlongToPtr( memory->global ) );
+    if (memory->metal_shared && memory->shared) NtClose( memory->shared );
     d3dkmt_destroy_resource( memory->local );
     d3dkmt_destroy_mutex( memory->mutex );
     d3dkmt_destroy_sync( memory->sync );
@@ -1235,6 +1550,11 @@ static void win32u_vkFreeMemory( VkDevice client_device, VkDeviceMemory client_m
         device->p_vkUnmapMemory2KHR( device->host.device, &info );
     }
 
+    /* macOS / KosmicKrisp: drop the in-process MTLHeap broker entry before the
+     * host frees the VkDeviceMemory (which releases the MTLHeap itself), so no
+     * importer can resolve a HANDLE to a heap that is about to disappear. */
+    if (memory->metal_shared) metal_shared_unregister( memory->shared ? memory->shared : UlongToPtr( memory->global ) );
+
     device->p_vkFreeMemory( device->host.device, memory->obj.host.device_memory, NULL );
     instance->p_remove_object( instance, &memory->obj.obj );
 
@@ -1256,6 +1576,7 @@ static VkResult win32u_vkGetMemoryWin32HandleKHR( VkDevice client_device, const 
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct device_memory *memory = device_memory_from_handle( handle_info->memory );
+    NTSTATUS status;
 
     TRACE( "device %p, handle_info %p, handle %p\n", device, handle_info, handle );
 
@@ -1271,7 +1592,13 @@ static VkResult win32u_vkGetMemoryWin32HandleKHR( VkDevice client_device, const 
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP_BIT:
     case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT:
-        NtDuplicateObject( NtCurrentProcess(), memory->shared, NtCurrentProcess(), handle, 0, 0, DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_SAME_ACCESS );
+        *handle = NULL;
+        if ((status = NtDuplicateObject( NtCurrentProcess(), memory->shared, NtCurrentProcess(), handle, 0, 0,
+                                         DUPLICATE_SAME_ATTRIBUTES | DUPLICATE_SAME_ACCESS )))
+        {
+            WARN( "Failed to duplicate shared handle %p, status %#x\n", memory->shared, status );
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
         TRACE( "Returning NT shared handle %p -> %p\n", memory->shared, *handle );
         return VK_SUCCESS;
 
@@ -2589,7 +2916,24 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
             FIXME( "Swapchain does not support required VK_IMAGE_USAGE_STORAGE_BIT\n" );
 
         swapchain->host_extents = capabilities.minImageExtent;
-        create_info_host.imageExtent = capabilities.minImageExtent;
+        /* [KK-RESFIX] If the Win32 client rect is degenerate (~1x1) at swapchain
+         * (re)creation - which happens during an in-game resolution / display-mode
+         * change while the window is mid-reconfigure - the fshack host swapchain
+         * locks to 1x1, the game frame is scaled down to a single pixel, and the
+         * screen goes black with no recovery (the swapchain is not recreated once
+         * the window settles). Fall back to the real host surface extent the driver
+         * reports (the CAMetalLayer drawable size), which reflects the actual
+         * on-screen size. */
+        if ((swapchain->host_extents.width <= 1 || swapchain->host_extents.height <= 1) &&
+            caps.currentExtent.width > 1 && caps.currentExtent.height > 1 &&
+            caps.currentExtent.width != 0xFFFFFFFFu && caps.currentExtent.height != 0xFFFFFFFFu)
+        {
+            WARN( "[KK-RESFIX] degenerate fshack host extent %ux%u -> host surface currentExtent %ux%u\n",
+                  swapchain->host_extents.width, swapchain->host_extents.height,
+                  caps.currentExtent.width, caps.currentExtent.height );
+            swapchain->host_extents = caps.currentExtent;
+        }
+        create_info_host.imageExtent = swapchain->host_extents;
         create_info_host.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
         create_info_host.imageUsage = VK_IMAGE_USAGE_STORAGE_BIT;
 
@@ -3009,6 +3353,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         RECT client_rect;
 
         client_surface_present( surface->client );
+
+        if (proton_present_wake_enabled() && surface->hwnd)
+            proton_present_wake_all( surface->hwnd );
 
         if (swapchain_res < VK_SUCCESS) continue;
         if (!get_surface_rect( surface->hwnd, &client_rect, NtUserGetDpiForWindow( surface->hwnd ) ))

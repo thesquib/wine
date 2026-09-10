@@ -248,6 +248,29 @@ static void macdrv_map_instance_extensions(struct vulkan_instance_extensions *ex
 
 static void macdrv_map_device_extensions(struct vulkan_device_extensions *extensions)
 {
+    /* Bug (Proton macOS) 2026-06-27: bridge VK_KHR_external_memory_win32 (what
+     * DXVK / vkd3d-proton speak for cross-API D3D11<->D3D12 shared resources)
+     * onto KosmicKrisp's VK_EXT_external_memory_metal (MTLHeap handle type),
+     * mirroring the win32<->fd aliasing winex11.drv does for the Linux host
+     * (winex11.drv/vulkan.c). The actual export/import is serviced win32u-side
+     * (get_host_external_memory_type / win32u_vkAllocateMemory) via
+     * vkGetMemoryMetalHandleEXT and VkImportMemoryMetalHandleInfoEXT on the
+     * single shared MTLDevice; in-process only (same process, same MTLDevice). */
+
+    /* PROTON_NO_METAL_SHARE (Proton macOS 2026-06-29): when set, DON'T advertise
+     * VK_KHR_external_memory_win32 via the Metal alias. DXVK's canShareImage then
+     * returns false, so a "shared" D3D11 texture is created as a plain (non-
+     * exportable) VkImage instead of an exported MTLHeap-backed one. CO's analysis
+     * (doc §15h) showed nothing ever CONSUMES these textures (KMT-CONSUMER=0), yet
+     * the EXPORTED texture faults the GPU (Internal Error 0000010c) on first use —
+     * while 21k+ normal frames render fine. This toggle confirms that root cause
+     * and is a ship path for titles whose "shared" textures are never consumed
+     * cross-API. dxvk 5a081159 gates handleType on m_shared so createImage won't
+     * throw without the alias. */
+    if (getenv( "PROTON_NO_METAL_SHARE" )) return;
+
+    if (extensions->has_VK_KHR_external_memory_win32) extensions->has_VK_EXT_external_memory_metal = 1;
+    if (extensions->has_VK_EXT_external_memory_metal) extensions->has_VK_KHR_external_memory_win32 = 1;
 }
 
 static const struct vulkan_driver_funcs macdrv_vulkan_driver_funcs =

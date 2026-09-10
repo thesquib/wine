@@ -406,6 +406,16 @@ VkResult WINAPI vkCreateInstance(const VkInstanceCreateInfo *create_info,
         TRACE("  - %s\n", extension);
     }
 
+    /* Proton macOS 2026-06-21: DXVK in the ANGLE/CEF gpu-process enables VK_KHR_win32_surface
+     * WITHOUT its required dependency VK_KHR_surface. winevulkan implements win32_surface via a
+     * host metal surface that needs host VK_KHR_surface; without it the host instance is invalid
+     * and vkCreateInstance fails -> Steam CEF stays black. Force-enable VK_KHR_surface in the
+     * extension bitfield (which win32u uses to rebuild the host extension list) so the request
+     * is spec-valid. No-op when the client already enabled VK_KHR_surface (every game/normal
+     * caller). */
+    if (extensions.has_VK_KHR_win32_surface && !extensions.has_VK_KHR_surface)
+        is_instance_extension_supported("VK_KHR_surface", &extensions);
+
     for (;;)
     {
         if (!(instance = vulkan_client_object_create(FIELD_OFFSET(struct VkInstance_T, physical_device[device_count]))))
