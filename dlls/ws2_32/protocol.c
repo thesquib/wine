@@ -2125,9 +2125,18 @@ int WINAPI WSAGetServiceClassNameByClassIdW( GUID *class, WCHAR *service, DWORD 
  */
 int WINAPI WSALookupServiceBeginA( WSAQUERYSETA *query, DWORD flags, HANDLE *lookup )
 {
-    FIXME( "(%p %#lx %p) Stub!\n", query, flags, lookup );
-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
-    return -1;
+    /* Proton macOS 2026-06-21: upstream stubs this to WSA_NOT_ENOUGH_MEMORY (8),
+     * which makes Chromium's NetworkChangeNotifierWin fail every call
+     * (network_change_notifier_win.cc "WSALookupServiceBegin failed with: 8")
+     * and contributes to Steam's CEF webhelper instability. Return a benign
+     * EMPTY enumeration instead of a hard error: succeed here and let
+     * WSALookupServiceNext report WSA_E_NO_MORE, so the caller sees "no
+     * results" (degraded NLA: no connection-type/change detection) rather than
+     * a failure it retries forever. */
+    FIXME( "(%p %#lx %p) Proton: empty-success stub.\n", query, flags, lookup );
+    if (!lookup) { SetLastError( WSAEFAULT ); return -1; }
+    *lookup = (HANDLE)(ULONG_PTR)0x57534e4c; /* 'WSNL' magic, ignored by Next/End */
+    return 0;
 }
 
 
@@ -2136,9 +2145,15 @@ int WINAPI WSALookupServiceBeginA( WSAQUERYSETA *query, DWORD flags, HANDLE *loo
  */
 int WINAPI WSALookupServiceBeginW( WSAQUERYSETW *query, DWORD flags, HANDLE *lookup )
 {
-    FIXME( "(%p %#lx %p) Stub!\n", query, flags, lookup );
-    SetLastError( WSA_NOT_ENOUGH_MEMORY );
-    return -1;
+    /* Proton macOS 2026-06-21: see WSALookupServiceBeginA. Empty-success so
+     * Chromium's network-change notifier stops failing with error 8. */
+    if (getenv("PROTON_WS_TRACE")) { FILE *f = fopen("/tmp/proton-ws-trace.log","a");
+        if (f) { fprintf(f,"[WS-INIT] WSALookupServiceBeginW pid=%u tid=%u flags=%#lx\n",
+            (unsigned)GetCurrentProcessId(),(unsigned)GetCurrentThreadId(),flags); fclose(f);} }
+    FIXME( "(%p %#lx %p) Proton: empty-success stub.\n", query, flags, lookup );
+    if (!lookup) { SetLastError( WSAEFAULT ); return -1; }
+    *lookup = (HANDLE)(ULONG_PTR)0x57534e4c; /* 'WSNL' magic, ignored by Next/End */
+    return 0;
 }
 
 

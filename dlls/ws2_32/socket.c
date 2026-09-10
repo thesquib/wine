@@ -486,6 +486,35 @@ static INT WINAPI WSA_DefaultBlockingHook( FARPROC x );
 int num_startup;
 static FARPROC blocking_hook = (FARPROC)WSA_DefaultBlockingHook;
 
+/* PROTON_WS_TRACE (Proton macOS, Bug #15 winsock-init race diag, 2026-06-21):
+ * log-only. Reveals whether Steam calls a gatable ws2_32 API while
+ * num_startup==0 (the race window before its WSAStartup). Tag [WS-INIT]. */
+static int proton_ws_trace_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_WS_TRACE");
+        cached = (v && v[0] && !(v[0] == '0' && v[1] == '\0')) ? 1 : 0;
+    }
+    return cached;
+}
+/* Write to a FIXED FILE, not stderr: Steam discards the webhelper subprocess
+ * stderr, so a file is the only way to observe its winsock calls. O_APPEND
+ * keeps concurrent process/thread writes from interleaving mid-line. */
+static void proton_ws_log(const char *tag, const char *extra)
+{
+    FILE *f;
+    if (!proton_ws_trace_enabled()) return;
+    f = fopen("/tmp/proton-ws-trace.log", "a");
+    if (!f) return;
+    fprintf(f, "[WS-INIT] %s pid=%u tid=%u num_startup=%d %s\n",
+            tag, (unsigned)GetCurrentProcessId(), (unsigned)GetCurrentThreadId(),
+            num_startup, extra ? extra : "");
+    fclose(f);
+}
+#define PROTON_WS_LOG(tag, fmt, ...) do { if (proton_ws_trace_enabled()) { \
+    char _b[256]; snprintf(_b, sizeof(_b), fmt, ##__VA_ARGS__); proton_ws_log(tag, _b); } } while (0)
+
 /* function prototypes */
 static int ws_protocol_info(SOCKET s, int unicode, WSAPROTOCOL_INFOW *buffer, int *size);
 
@@ -667,6 +696,7 @@ int WINAPI WSAStartup( WORD version, WSADATA *data )
 
     num_startup++;
     TRACE( "increasing startup count to %d\n", num_startup );
+    PROTON_WS_LOG("WSAStartup", "version=%#x", version);
     return 0;
 }
 
@@ -1248,6 +1278,7 @@ int WINAPI closesocket( SOCKET s )
 
     if (!num_startup)
     {
+        PROTON_WS_LOG("closesocket-NOTINIT", "s=%#Ix", s);
         SetLastError( WSANOTINITIALISED );
         return -1;
     }
@@ -3957,6 +3988,7 @@ SOCKET WINAPI WSASocketW(int af, int type, int protocol,
 
     if (!num_startup)
     {
+        PROTON_WS_LOG("WSASocketW-NOTINIT", "af=%d type=%d proto=%d", af, type, protocol);
         WARN( "not initialised\n" );
         SetLastError( WSANOTINITIALISED );
         return -1;
