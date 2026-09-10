@@ -77,6 +77,58 @@ static LONGLONG update_timeout( ULONGLONG end )
     return timeleft;
 }
 
+/* Diagnostic (log-only, env-gated): identify which msync object a stuck
+ * poll-thread waits on that never signals. PROTON_DTR_WAIT_TRACE=1 turns it
+ * on; PROTON_DTR_WAIT_PERIOD tunes the sampling of the (very hot) zero-timeout
+ * busy-poll path. Remove after the Detroit (1222140) loading-ring investigation. */
+static int proton_dtr_wait_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "PROTON_DTR_WAIT_TRACE" );
+        cached = (v && *v && strcmp( v, "0" )) ? 1 : 0;
+    }
+    return cached;
+}
+
+static unsigned int proton_dtr_wait_period(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv( "PROTON_DTR_WAIT_PERIOD" );
+        cached = (v && *v) ? atoi( v ) : 2048;
+        if (cached < 1) cached = 1;
+    }
+    return (unsigned int)cached;
+}
+
+static void proton_dtr_log_signal( const char *what, int obj )
+{
+    if (!proton_dtr_wait_enabled()) return;
+    fprintf( stderr, "msync: [DTR-SIGNAL] %s obj=%d tid=%04x\n",
+             what, obj, (unsigned)GetCurrentThreadId() );
+    fflush( stderr );
+}
+
+/* Detroit ring-freeze cycle 5 (park logger): [DTR-WAIT] only fires on a wait
+ * that TIMES OUT; the freeze coordinator parks in an INDEFINITE wait (timeout==
+ * NULL, __ulock_wait forever) so it never emits. This logs the obj a thread is
+ * about to park on indefinitely, filtered to the server-backed sync class
+ * (AUTO/MANUAL_SERVER = the INPROC_SYNC_INTERNAL containers) to bound volume. At
+ * the freeze the LAST [DTR-PARK] per still-stuck tid = its orphan obj; correlate
+ * that obj# against the server-side [DTR-SIG] stream (/tmp/dtr-sig.log): a signal
+ * during the freeze but no wake ⇒ macOS inproc propagation bug; no signal ⇒ the
+ * producer never fires. Gated PROTON_DTR_WAIT_TRACE. */
+static void proton_dtr_log_park( int obj, int type, unsigned tid )
+{
+    if (!proton_dtr_wait_enabled()) return;
+    if (type != MSYNC_MANUAL_SERVER && type != MSYNC_AUTO_SERVER) return;
+    fprintf( stderr, "msync: [DTR-PARK] tid=%04x obj=%d type=%d\n", tid, obj, type );
+    fflush( stderr );
+}
+
 #define UL_COMPARE_AND_WAIT_SHARED  0x3
 #define ULF_WAKE_ALL                0x00000100
 #define ULF_NO_ERRNO                0x01000000
@@ -824,6 +876,29 @@ NTSTATUS msync_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info )
     return STATUS_SUCCESS;
 }
 
+/* placed here (not with the other proton_dtr_* helpers up top) because it
+ * dereferences struct event, which is only fully defined further down. */
+static void proton_dtr_log_timeout( int tid, DWORD count, const int *objs,
+                                    void **objs_shm, int wait_any, int zero_to )
+{
+    static unsigned long counter = 0;
+    unsigned long n;
+    int t0 = -1, idx0 = -1;
+
+    if (!proton_dtr_wait_enabled()) return;
+    n = __atomic_add_fetch( &counter, 1, __ATOMIC_RELAXED );
+    if ((n % proton_dtr_wait_period()) != 0) return;
+
+    if (count >= 1 && objs_shm && objs_shm[0])
+    {
+        idx0 = objs[0];
+        t0 = ((struct event *)objs_shm[0])->msync_type;
+    }
+    fprintf( stderr, "msync: [DTR-WAIT] tid=%04x count=%u wait_any=%d zero_to=%d obj0=%d type=%d n=%lu\n",
+             (unsigned)tid, (unsigned)count, wait_any, zero_to, idx0, t0, n );
+    fflush( stderr );
+}
+
 static NTSTATUS do_single_wait( int obj, void *obj_shm, int alert_obj, void *alert_obj_shm, ULONGLONG *end, int tid )
 {
     NTSTATUS status;
@@ -883,6 +958,41 @@ NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
 
     for (i = 0; i < count; i++)
         objs_shm[i] = (struct event *)get_shm( objs[i] );
+
+    /* Detroit ring-freeze cycle 7 (wait graph): log each thread's CURRENT primary
+     * wait obj (ANY type), deduped per-tid so at the freeze each thread's LAST line
+     * = exactly what it is now waiting on. Fixes the cycle-5/6 blind spots: the
+     * type-filtered [DTR-PARK] only saw server-sync BLOCKS and missed (a) a thread's
+     * true final wait when it's an event/mutex, and (b) the SPIN case — a wait that
+     * returns immediately because obj0 is permanently signaled. sat=1 => obj0 already
+     * signaled at entry (immediate return = spin signature); inf=1 => indefinite (no
+     * timeout). Deduped on obj0-change per tid => low volume. Gated. */
+    if (proton_dtr_wait_enabled() && count >= 1 && objs_shm[0])
+    {
+        static int last_obj0[65536];
+        unsigned slot = (unsigned)current_tid & 0xffff;
+        if (last_obj0[slot] != objs[0])
+        {
+            /* cycle 8: log the FULL wait set (each obj as obj:t<type>:s<sat>) + the
+             * wait_any flag, so a count>1 wait reveals whether it's wait-ALL (any=0,
+             * needs every obj) vs wait-ANY (any=1), and names obj1.. (the ring's real
+             * gate). type: 1SEM 2AUTO_EVT 3MANUAL_EVT 4MUTEX 5AUTO_SRV 6MANUAL_SRV;
+             * s = obj already signaled at entry. Deduped per-tid on obj0-change. */
+            char buf[512];
+            int p = 0, k, kmax = count < 8 ? (int)count : 8;
+            last_obj0[slot] = objs[0];
+            for (k = 0; k < kmax; k++)
+            {
+                int tk = objs_shm[k] ? ((struct event *)objs_shm[k])->msync_type : -1;
+                int sk = objs_shm[k] ? (__atomic_load_n( (int *)objs_shm[k], __ATOMIC_SEQ_CST ) != 0) : -1;
+                p += snprintf( buf + p, sizeof(buf) - p, "%s%d:t%d:s%d", k ? "," : "", objs[k], tk, sk );
+                if (p >= (int)sizeof(buf) - 24) break;
+            }
+            fprintf( stderr, "msync: [DTR-WENTRY] tid=%04x any=%d count=%u inf=%d objs=[%s]\n",
+                     (unsigned)current_tid, wait_any, (unsigned)count, timeout ? 0 : 1, buf );
+            fflush( stderr );
+        }
+    }
 
     if (wait_any || count <= 1)
     {
