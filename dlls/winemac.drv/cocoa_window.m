@@ -4543,7 +4543,16 @@ void macdrv_set_view_superview(macdrv_view v, macdrv_view s, macdrv_window w, ma
         {
             NSArray* subviews = [superview subviews];
             NSUInteger index = [subviews indexOfObjectIdenticalTo:view];
-            if (!prev && !next && index == [subviews count] - 1)
+            /* Bug (Proton macOS) 2026-09-16: Steam CEF store flicker. With no
+             * ordering hint the caller (macdrv_client_surface_update, run on
+             * EVERY present) only means "make sure the view is attached", not
+             * "raise it above every sibling". Two sibling client surfaces in
+             * one toplevel (Steam's main UI browser at ~83 presents/s and the
+             * Store browser at ~8/s) otherwise fight for the top slot on each
+             * present and the Store is hidden behind the main browser's layer
+             * except for one frame after each of its own presents. Keep the
+             * existing order; a real z-order change passes prev/next. */
+            if (!prev && !next)
                 return;
             if (prev && index + 1 < [subviews count] && subviews[index + 1] == prev)
                 return;
