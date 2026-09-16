@@ -1290,7 +1290,15 @@ static bool stream_decodebin_create(struct wg_parser_stream *stream)
     gst_bin_add(GST_BIN(parser->container), stream->decodebin);
 
     g_signal_connect(stream->decodebin, "pad-added", G_CALLBACK(stream_decodebin_pad_added_cb), stream);
-    g_signal_connect(stream->decodebin, "autoplug-select", G_CALLBACK(autoplug_select_cb), stream);
+    /* Bug (Proton macOS) 2026-09-17: autoplug_select_cb expects a struct wg_parser
+     * as its user data (it reads parser->error / use_mediaconv / sink_caps); the
+     * per-stream decodebin passed the stream instead. On Linux the bytes it read
+     * happened to be zero; on macOS parser->error lands inside the stream's
+     * pthread_cond_t signature (non-zero), so every decoder was SKIPped and any
+     * stream needing a per-stream decoder failed with "missing plug-in"
+     * (HOMM Olden Era: MP3 audio in the splash mp4 -> Unity VideoPlayer never
+     * finished -> exit hang). Pass the parser. */
+    g_signal_connect(stream->decodebin, "autoplug-select", G_CALLBACK(autoplug_select_cb), parser);
     g_signal_connect(stream->decodebin, "no-more-pads", G_CALLBACK(stream_decodebin_no_more_pads_cb), stream);
 
     pthread_mutex_lock(&parser->mutex);
