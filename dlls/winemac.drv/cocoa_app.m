@@ -2741,6 +2741,37 @@ static NSString* WineLocalizedString(unsigned int stringID)
                     if (sib != child) [sib removeFromSuperlayer];
                 }
             }
+            /* Bug (Proton macOS) 2026-09-22 -- DETECTOR ONLY, no behaviour
+             * change. A CALayer has exactly one superlayer, so the
+             * addSublayer: below REMOVES child from wherever it currently is.
+             * That is harmless when child is new (superlayer nil) or when we
+             * are re-hosting onto a window the user can see. It is destructive
+             * in one specific case: the resolver failed to find client_view,
+             * fell back to cocoa_window (isWindow=1), and that window is not
+             * visible -- we then steal a LIVE layer off the view on screen and
+             * park it somewhere invisible. Presents keep returning VK_SUCCESS
+             * and the user sees black.
+             *
+             * That is the suspected cause of the Detroit minimise-then-restore
+             * black screen. It has reproduced once in twelve runs and not at
+             * all on demand, so this only shouts -- it does not intervene.
+             * Across the eleven good runs isWindow=1 never occurred; in the
+             * one that went black it occurred 3 times.
+             * See docs/macos/detroit-minimise-black-screen-2026-09-22.md in
+             * proton-darwin. */
+            if (isWindow && child.superlayer && child.superlayer != parentLayer &&
+                ![view.window isVisible])
+            {
+                fprintf(stderr,
+                        "winemac:E.1 !! LAYER-STEAL hwnd=%p child=%p moving from superlayer=%p "
+                        "to parentLayer=%p on an INVISIBLE window (view=%p isWindow=1, "
+                        "resolver fell back to cocoa_window). This is the suspected "
+                        "minimise-black-screen path -- capture this log.\n",
+                        hwnd, (void *)child, (void *)child.superlayer,
+                        (void *)parentLayer, (void *)view);
+                fflush(stderr);
+            }
+
             if (child.superlayer != parentLayer) [parentLayer addSublayer:child];
 
             [CATransaction commit];
