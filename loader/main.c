@@ -36,35 +36,72 @@
 #endif
 #ifdef __APPLE__
 # include <mach-o/dyld.h>
+# include <mach-o/getsect.h>
 #endif
 
 #include "main.h"
 
-#if defined(__APPLE__) && defined(__x86_64__) && !defined(HAVE_WINE_PRELOADER)
+#if defined(__APPLE__) && !defined(HAVE_WINE_PRELOADER)
 
-/* Not using the preloader on x86_64:
+/* Not using the preloader (x86_64, or arm64):
  * Reserve the same areas as the preloader does, but using zero-fill sections
  * (the only way to prevent system frameworks from using them, including allocations
  * before main() runs).
+ *
+ * On arm64 an 8GB WINE_RESERVE section is not possible: the dyld shared cache
+ * loads around 0x18e000000, so there is nowhere near that much room below it.
+ * Instead the loader is linked with a large -pagezero_size (see configure.ac),
+ * which reserves all the low address space and, as a side effect, keeps our
+ * mandatory-PIE __TEXT out of the shared-cache band -- landing in it gets the
+ * process SIGKILLed by AppleSystemPolicy before dyld hands control over.
+ *
+ * PAGEZERO cannot be mapped into as-is, so init_reserved_areas() reads its real
+ * size back out of our own Mach-O header and mmaps PROT_NONE over the range,
+ * turning it into an ordinary reservation ntdll can carve KUSER_SHARED_DATA and
+ * the rest of the Windows address space out of.
  */
+#ifdef __x86_64__
 __asm__(".zerofill WINE_RESERVE,WINE_RESERVE");
 static char __wine_reserve[0x1fffff000] __attribute__((section("WINE_RESERVE, WINE_RESERVE")));
+#endif
 
 __asm__(".zerofill WINE_TOP_DOWN,WINE_TOP_DOWN");
 static char __wine_top_down[0x001ff0000] __attribute__((section("WINE_TOP_DOWN, WINE_TOP_DOWN")));
 
-static const struct wine_preload_info preload_info[] =
+/* Not const: on arm64 entry 0's size is only known once we can read our own
+ * __PAGEZERO back at runtime. */
+static struct wine_preload_info preload_info[] =
 {
+#ifdef __x86_64__
     { __wine_reserve,  sizeof(__wine_reserve)  }, /*         0x1000 -    0x200000000: low 8GB */
+#else
+    { (void *)0x1000, 0 },                        /*         0x1000 - end of PAGEZERO, filled in below */
+#endif
     { __wine_top_down, sizeof(__wine_top_down) }, /* 0x7ff000000000 - 0x7ff001ff0000: top-down allocations + virtual heap */
     { 0, 0 }                                      /* end of list */
 };
 
-const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = preload_info;
+__attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = preload_info;
 
 static void init_reserved_areas(void)
 {
     int i;
+
+#ifndef __x86_64__
+    /* Fill in the size of PAGEZERO. ASLR moves the image, so the link-time
+     * -pagezero_size has to be read back from the loaded header rather than
+     * hardcoded here. */
+    {
+        Dl_info dli;
+
+        if (dladdr( (void *)&init_reserved_areas, &dli ))
+        {
+            unsigned long size = 0;
+            getsegmentdata( dli.dli_fbase, "__PAGEZERO", &size );
+            if (size) preload_info[0].size = size - (uintptr_t)preload_info[0].addr;
+        }
+    }
+#endif
 
     for (i = 0; wine_main_preload_info[i].size != 0; i++)
     {
@@ -78,7 +115,7 @@ static void init_reserved_areas(void)
 
 /* the preloader will set these variables */
 __attribute((visibility("default"))) struct r_debug *wine_r_debug = NULL;
-const __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = NULL;
+__attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = NULL;
 
 static void init_reserved_areas(void)
 {

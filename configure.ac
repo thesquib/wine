@@ -947,11 +947,42 @@ case $host_os in
     AC_SUBST(SECURITY_LIBS,"-framework Security -framework CoreFoundation")
     AC_SUBST(SYSTEMCONFIGURATION_LIBS,"-framework SystemConfiguration")
 
-    WINELOADER_LDFLAGS="-Wl,-segalign,0x1000,-pagezero_size,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+    WINELOADER_LDFLAGS="-Wl,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
 
     case $HOST_ARCH in
-      i386) wine_use_preloader=yes ;;
+      i386)
+        wine_use_preloader=yes
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segalign,0x1000,-pagezero_size,0x1000"
+        ;;
+      aarch64)
+        wine_use_preloader=no
+        dnl Native-arm64 macOS has no preloader and cannot use an 8GB WINE_RESERVE
+        dnl zerofill section: the dyld shared cache loads around 0x18e000000, so
+        dnl there is nowhere near that much room below it. Reserve the low address
+        dnl space with PAGEZERO instead, as large as possible while still leaving a
+        dnl buffer to the cache.
+        dnl
+        dnl This is also what gets the loader off the ground at all. arm64 macOS is
+        dnl mandatory-PIE, so with a 1-page PAGEZERO dyld slides our __TEXT into the
+        dnl shared-cache band and the kernel unnests it -> AppleSystemPolicy SIGKILLs
+        dnl the process before dyld hands over control (silently: no stderr, no crash
+        dnl report, rc=137). A PAGEZERO this size leaves nowhere to slide to.
+        dnl loader/main.c then mmaps PROT_NONE over the range so ntdll can carve
+        dnl KUSER_SHARED_DATA (0x7ffe0000) and the Windows address space out of it.
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segalign,0x4000,-pagezero_size,0x170000000"
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segaddr,WINE_TOP_DOWN,0x7ff000000000"
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-no_fixup_chains"
+        dnl Build against the macOS 11 SDK to get implicit x18 preservation, and to
+        dnl avoid dyld "segment 'WINE_TOP_DOWN' vm address out of order" at launch.
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-platform_version,macos,11.0,11.0"
+        dnl NOTE: CrossOver additionally passes -Wl,-x86_64_layout_emulation, which
+        dnl pairs with the restricted com.apple.developer.cross-architecture-support
+        dnl entitlement (Apple-granted, provisioning-profile gated). It is NOT needed
+        dnl to boot; it appears to be about getting 4K page granularity in a native
+        dnl arm64 process, which is what an in-process x86 JIT wants.
+        ;;
       x86_64)
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segalign,0x1000,-pagezero_size,0x1000"
         dnl If the -no_huge linker option is present (added in Xcode 15.3), use zerofill sections instead of the preloader
         WINE_TRY_CFLAGS([-Wl,-no_huge],
            [wine_use_preloader=no
