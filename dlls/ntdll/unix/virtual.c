@@ -3681,7 +3681,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
     struct file_view *view;
     unsigned int status;
     sigset_t sigset;
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
     int dantelion_should_patch = 0;
 #endif
 
@@ -3724,7 +3724,7 @@ static NTSTATUS virtual_map_image( HANDLE mapping, void **addr_ptr, SIZE_T *size
             size -= offset;
         }
 
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
         /* PROTON_DARWIN: defer the Dantelion patch trigger until AFTER
          * we release virtual_mutex. The patcher calls
          * NtProtectVirtualMemory which itself acquires virtual_mutex —
@@ -3760,7 +3760,7 @@ done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     if (needs_close) close( unix_fd );
     if (shared_needs_close) close( shared_fd );
-#ifdef __APPLE__
+#if defined(__APPLE__) && defined(__x86_64__)
     /* PROTON_DARWIN: now that virtual_mutex is released, run the
      * Dantelion patcher. Calls NtProtectVirtualMemory internally
      * which would have recursed into virtual_mutex if we'd called
