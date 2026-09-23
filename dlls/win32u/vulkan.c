@@ -118,9 +118,13 @@ static const UINT EXTERNAL_FENCE_WIN32_BITS = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQ
 #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
 
 /* arm64 vCPU mode (ntdll, PMW_VCPU): the Windows code runs in a VM that sees only memory mapped into it through
- * NtAllocateVirtualMemory, never a pointer the driver maps itself (vkMapMemory), and VK_EXT_map_memory_placed would
- * map driver memory over a guest range with MAP_FIXED, which the VM's memory manager forbids. So host-visible memory
- * is allocated by Wine and imported with VK_EXT_external_memory_host, as for WoW64. */
+ * NtAllocateVirtualMemory / NtMapViewOfSection, never a pointer the driver maps itself (vkMapMemory).
+ * VK_EXT_map_memory_placed must not be used there: it remaps driver memory over a guest range that is already
+ * stage-2 mapped (gmm rule R2), so the guest would keep seeing the old anonymous pages and GPU data would be lost
+ * silently. Importing Wine memory with VK_EXT_external_memory_host (the WoW64 route) is no answer either: KosmicKrisp
+ * has a single host-visible memory type and cannot bind optimal-tiled images to imported host memory, and engines
+ * put textures in the blocks they map. Until the driver's mappings are mapped into the guest (gmm's foreign-memory
+ * mapping), a mapped pointer is reported once (win32u_vkMapMemory2KHR) and guest access to it faults. */
 static BOOL vcpu_mode(void)
 {
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -132,7 +136,7 @@ static BOOL vcpu_mode(void)
 
 static BOOL use_external_memory(void)
 {
-    return zero_bits != 0 || vcpu_mode();
+    return zero_bits != 0;
 }
 
 struct mempool
@@ -792,7 +796,7 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
         }
     }
 
-    if (use_external_memory() && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
+    if (zero_bits && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
     {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_mem_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &host_mem_props};
@@ -1332,9 +1336,12 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
 
     /* For host visible memory, we try to use VK_EXT_external_memory_host on wow64 to ensure that mapped pointer is 32-bit. */
     mem_flags = physical_device->memory_properties.memoryTypes[alloc_info->memoryTypeIndex].propertyFlags;
-    if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
-        (res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info )))
-        return res;
+    if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info)
+    {
+        if ((res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info ))) return res;
+        /* the imported allocation is the mapping: map returns it, free releases it */
+        if (alloc_info->pNext == (void *)&host_pointer_info) mapping = host_pointer_info.pHostPointer;
+    }
 
     if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -1703,10 +1710,10 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
 
     if (res == VK_SUCCESS && vcpu_mode() && !memory->vm_map)
     {
-        /* not imported from Wine memory: the pointer is the driver's, outside the VM (see vcpu_mode) */
+        /* the driver's pointer, outside the VM (see vcpu_mode) */
         static int once;
-        if (!once++) ERR( "vCPU mode: mapping %p is not guest-visible (host memory not imported); guest access "
-                          "will fault\n", *data );
+        if (!once++) ERR( "vCPU mode: mapping %p is not guest-visible (driver memory is not mapped into the VM yet); "
+                          "guest access will fault\n", *data );
     }
 
 #ifdef _WIN64
