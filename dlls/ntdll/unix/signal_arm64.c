@@ -58,6 +58,7 @@
 #include "winternl.h"
 #include "wine/asm.h"
 #include "unix_private.h"
+#include "vcpu_arm64.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
@@ -193,27 +194,7 @@ struct callback_stack_layout
 C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
 C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
 
-#define RESTORE_FLAGS_EMULATION  0x00010000
-
-struct syscall_frame
-{
-    ULONG64               x[29];          /* 000 */
-    ULONG64               fp;             /* 0e8 */
-    ULONG64               lr;             /* 0f0 */
-    ULONG64               sp;             /* 0f8 */
-    ULONG64               pc;             /* 100 */
-    ULONG                 cpsr;           /* 108 */
-    ULONG                 restore_flags;  /* 10c */
-    struct syscall_frame *prev_frame;     /* 110 */
-    void                 *syscall_cfa;    /* 118 */
-    ULONG                 syscall_id;     /* 120 */
-    ULONG                 align;          /* 124 */
-    ULONG                 fpcr;           /* 128 */
-    ULONG                 fpsr;           /* 12c */
-    NEON128               v[32];          /* 130 */
-};
-
-C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
+/* struct syscall_frame and RESTORE_FLAGS_EMULATION are in vcpu_arm64.h, shared with the vCPU mode */
 
 
 /***********************************************************************
