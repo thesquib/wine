@@ -801,6 +801,16 @@ int __wine_vcpu_hardware_tso(void)
 }
 
 /***********************************************************************
+ *           __wine_vcpu_active
+ *
+ * Whether Windows code runs in vCPUs in this process (include/wine/unixlib.h).
+ */
+int __wine_vcpu_active(void)
+{
+    return vcpu_mode != 0;
+}
+
+/***********************************************************************
  *           vcpu_syscall_target
  *
  * The function to call for a syscall: its Apple-ABI shim when it has one (ntdll's vcpu_shims_arm64.c for table
