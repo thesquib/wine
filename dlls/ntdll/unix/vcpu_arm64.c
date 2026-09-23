@@ -951,6 +951,8 @@ NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_le
         pthread_sigmask( SIG_SETMASK, &old, NULL );
     }
 
+    TRACE( "user callback: user_sp %#llx, from a %s exit\n", (unsigned long long)user_sp,
+           outer_level->kind == VEL1_EXIT_UNIX_CALL ? "unix-call" : "syscall" );
     memset( &inner, 0, sizeof(inner) );
     inner.prev_frame = outer;
     inner.sp = user_sp;
@@ -980,6 +982,7 @@ NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_le
     atomic_store( &vt->in_syscall, 1 );
     *ret_ptr = level.cb_ret_ptr;
     *ret_len = level.cb_ret_len;
+    TRACE( "user callback done: status %#x, %u bytes\n", (unsigned int)level.cb_status, (unsigned int)level.cb_ret_len );
     return level.cb_status;
 }
 
