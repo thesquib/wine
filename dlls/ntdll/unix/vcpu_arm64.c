@@ -158,22 +158,35 @@ static double ticks_to_us( uint64_t ticks )
 /***********************************************************************
  *           vcpu_create
  *
- * vel1_vcpu_create with hardware TSO (ACTLR_EL1.EnTSO, vcpu_el1.h D3) when the VM gives it. If the bit does not read
- * back, warn once and create every vCPU without it: M1 runs only arm64 code, which needs no TSO; FEX (M2) must know.
+ * vel1_vcpu_create with hardware TSO (ACTLR_EL1.EnTSO, vcpu_el1.h D3), all or none per process: the process's first
+ * vCPU decides (an x86 emulator picks its memory-ordering scheme once per process), and a later vCPU that disagrees
+ * is fatal, never a silent vCPU without TSO in a process whose emulator relies on it.
  */
-static atomic_int tso_unavailable;
+static atomic_int tso_state;  /* 0: undecided, 1: every vCPU runs with EnTSO, -1: none does */
 
 static int vcpu_create( vel1_vcpu *v, vel1_vcpu_cfg *cfg )
 {
-    int ret;
+    int ret, have, state = atomic_load( &tso_state );
 
-    if (!atomic_load( &tso_unavailable ))
+    if (state < 0)
     {
-        if ((ret = vel1_vcpu_create( v, cfg )) != VEL1_E_ENTSO) return ret;
-        if (!atomic_exchange( &tso_unavailable, 1 ))
-            fprintf( stderr, "wine: vCPU mode: ACTLR_EL1.EnTSO did not read back: vCPUs run WITHOUT hardware TSO "
-                     "(fine for arm64 code; x86 emulation would need software TSO)\n" );
+        cfg->flags |= VEL1_CFG_NO_ENTSO;
+        return vel1_vcpu_create( v, cfg );
     }
+    if ((ret = vel1_vcpu_create( v, cfg )) && ret != VEL1_E_ENTSO) return ret;
+    have = ret ? -1 : 1;
+    if (!state && atomic_compare_exchange_strong( &tso_state, &state, have ))
+    {
+        state = have;
+        if (have < 0)
+            fprintf( stderr, "wine: vCPU mode: ACTLR_EL1.EnTSO did not read back on the first vCPU: every vCPU of "
+                     "this process runs WITHOUT hardware TSO (fine for arm64 code; x86 emulation needs software TSO)\n" );
+    }
+    if (state != have)
+        vcpu_fatal( "ACTLR_EL1.EnTSO %s on this vCPU but %s on the process's first: a process's vCPUs must all "
+                    "run with hardware TSO or all without\n", have > 0 ? "reads back" : "did not read back",
+                    state > 0 ? "did" : "did not" );
+    if (have > 0) return VEL1_OK;
     cfg->flags |= VEL1_CFG_NO_ENTSO;
     return vel1_vcpu_create( v, cfg );
 }
@@ -440,7 +453,7 @@ static void vcpu_selftest(void)
      * is not this one (loader.c: apple_wine_thread): give this one back, the probe makes its own */
     if ((ret = vel1_vcpu_destroy( v ))) fprintf( stderr, "vcpu selftest: vel1_vcpu_destroy %d\n", ret );
     fprintf( stderr, "vcpu selftest: hardware PASS (VM %d-bit IPA, hardware TSO %s, sys page %p, KUSER host %p, "
-             "ttbr0 %#llx)\n", VCPU_IPA_BITS, atomic_load( &tso_unavailable ) ? "NO" : "yes", sys_page, kuser_host,
+             "ttbr0 %#llx)\n", VCPU_IPA_BITS, atomic_load( &tso_state ) > 0 ? "yes" : "NO", sys_page, kuser_host,
              (unsigned long long)gmm_ttbr0( gmm ));
     /* virtual_init continues with the memory selftest (virtual.c) */
 }
@@ -1245,8 +1258,9 @@ void vcpu_init_process(void)
     pthread_mutex_unlock( &tlbi_mutex );
     if (ret) vcpu_fatal( "TLBI executor vCPU failed\n" );
 
-    TRACE( "VM up in %.1f us: IPA %u bits (max %u), sys page %p, KUSER host %p\n",
-           ticks_to_us( mach_absolute_time() - start ), info.ipa_bits, info.max_ipa_bits, sys_page, kuser_host );
+    TRACE( "VM up in %.1f us: IPA %u bits (max %u), hardware TSO %s, sys page %p, KUSER host %p\n",
+           ticks_to_us( mach_absolute_time() - start ), info.ipa_bits, info.max_ipa_bits,
+           atomic_load( &tso_state ) > 0 ? "yes" : "NO", sys_page, kuser_host );
     if (vcpu_mode == 2) vcpu_selftest();
 }
 
