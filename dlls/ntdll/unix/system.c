@@ -2395,6 +2395,55 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
     return regidx;
 }
 
+#elif defined(__APPLE__)
+
+#include <Hypervisor/Hypervisor.h>
+#include <os/object.h>
+
+/* macOS gives user space no view of the ID registers. Hypervisor.framework reports the values a vCPU created from
+ * a default configuration sees, which in the vCPU mode (PMW_VCPU) is exactly what the Windows code, including an
+ * ARM64EC emulator reading "CP xxxx" under CentralProcessor, runs against (ntdll links the framework for that mode,
+ * vcpu_el1_live_arm64.c). Without the hypervisor entitlement the config cannot be created and nothing is reported,
+ * as before. MIDR_EL1 and ID_AA64ISAR2_EL1 are not feature registers there and stay unpopulated. */
+static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
+                                     WORD logical_thread_id )
+{
+    static const struct { hv_feature_reg_t hv; WORD reg; } map[] =
+    {
+        { HV_FEATURE_REG_ID_AA64PFR0_EL1,  0x4020 },
+        { HV_FEATURE_REG_ID_AA64PFR1_EL1,  0x4021 },
+        { HV_FEATURE_REG_ID_AA64DFR0_EL1,  0x4028 },
+        { HV_FEATURE_REG_ID_AA64DFR1_EL1,  0x4029 },
+        { HV_FEATURE_REG_ID_AA64ISAR0_EL1, 0x4030 },
+        { HV_FEATURE_REG_ID_AA64ISAR1_EL1, 0x4031 },
+        { HV_FEATURE_REG_ID_AA64MMFR0_EL1, 0x4038 },
+        { HV_FEATURE_REG_ID_AA64MMFR1_EL1, 0x4039 },
+        { HV_FEATURE_REG_ID_AA64MMFR2_EL1, 0x403a },
+        { HV_FEATURE_REG_CTR_EL0,          0x5801 },
+    };
+    hv_vcpu_config_t config = hv_vcpu_config_create();
+    DWORD i, regidx = 0;
+    uint64_t value;
+
+    if (!config)
+    {
+        WARN( "no Hypervisor.framework vCPU configuration: ID registers not populated\n" );
+        return 0;
+    }
+    for (i = 0; i < ARRAY_SIZE(map); i++)
+        if (hv_vcpu_config_get_feature_reg( config, map[i].hv, &value ) == HV_SUCCESS)
+            regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ map[i].reg, value };
+    if (__builtin_available( macOS 15.2, * ))
+    {
+        if (hv_vcpu_config_get_feature_reg( config, HV_FEATURE_REG_ID_AA64ZFR0_EL1, &value ) == HV_SUCCESS)
+            regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4024, value };
+        if (hv_vcpu_config_get_feature_reg( config, HV_FEATURE_REG_ID_AA64SMFR0_EL1, &value ) == HV_SUCCESS)
+            regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4025, value };
+    }
+    os_release( config );
+    return regidx;
+}
+
 #else
 
 static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
