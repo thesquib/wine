@@ -46,7 +46,12 @@ WINE_DECLARE_DEBUG_CHANNEL(relay);
 #define QS_HARDWARE     0x40000000
 #define QS_INTERNAL     (QS_DRIVER | QS_HARDWARE)
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* arm64 vCPU mode: 0x7ffe0000 is a guest-only address; ntdll keeps the host's mapping (unixlib.h) */
+#define user_shared_data (__wine_user_shared_data())
+#else
 static const struct _KUSER_SHARED_DATA *user_shared_data = (struct _KUSER_SHARED_DATA *)0x7ffe0000;
+#endif
 
 static LONG atomic_load_long( const volatile LONG *ptr )
 {

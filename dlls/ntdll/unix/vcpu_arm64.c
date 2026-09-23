@@ -667,6 +667,17 @@ void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsig
 }
 
 /***********************************************************************
+ *           __wine_user_shared_data
+ *
+ * The host's mapping of the KUSER_SHARED_DATA page (include/wine/unixlib.h): unix-side code in other libraries
+ * must not read 0x7ffe0000, which the host cannot map (M1c: win32u's tick count reads faulted forever).
+ */
+const struct _KUSER_SHARED_DATA *__wine_user_shared_data(void)
+{
+    return user_shared_data;
+}
+
+/***********************************************************************
  *           vcpu_syscall_target
  *
  * The function to call for a syscall: its Apple-ABI shim when it has one (ntdll's vcpu_shims_arm64.c for table
