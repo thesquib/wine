@@ -84,6 +84,10 @@ extern gmm_t *vcpu_gmm(void);
  * guest memory: always with multi-chunk stage-2 runs (their retained chunks make a violation reachable), else with
  * PMW_VCPU_PARANOID=1 */
 extern int vcpu_check_s2;
+/* section aliasing (virtual.c: vcpu_section): needs gmm's section API (vel1-gmm-v3, not vendored yet: 0 until it
+ * is); PMW_VCPU_SECT_ALIAS=0 turns it off, and every section view is then a copy */
+#define VCPU_GMM_SECT 0
+extern int vcpu_sect_alias;
 extern uint64_t vcpu_blob_va(void);
 extern void *vcpu_kuser_host(void);
 extern void vcpu_note_entered(void);
@@ -132,6 +136,18 @@ extern void vcpu_regs_from_frame( vel1_regs *r, const struct syscall_frame *fram
 extern ULONG64 vcpu_call_syscall( void *func, const ULONG64 *regs, const ULONG64 *stack_args, ULONG64 stack_bytes );
 extern void vcpu_return_plan( const struct syscall_frame *frame, ULONG64 retval, BOOL callback_ran, vel1_regs *r,
                               uint64_t *core_mask, uint32_t *simd_mask );
+
+/* a sorted set of disjoint [start, end) ranges; adjacent ranges merge. Section aliasing uses it for the ranges of a
+ * section's anchor already read from its file and the ranges this process committed (section offsets). */
+struct vcpu_ranges
+{
+    struct vcpu_range { uint64_t start, end; } *ranges;
+    unsigned int count, max;
+};
+extern int vcpu_ranges_add( struct vcpu_ranges *set, uint64_t start, uint64_t end );
+extern BOOL vcpu_ranges_find( const struct vcpu_ranges *set, uint64_t pos, uint64_t end, uint64_t *run_end );
+extern void vcpu_ranges_free( struct vcpu_ranges *set );
+extern BOOL vcpu_view_host_congruent( uint64_t base, uint64_t offset, uint64_t host_page_mask );
 
 #endif /* __APPLE__ */
 #endif /* __aarch64__ */

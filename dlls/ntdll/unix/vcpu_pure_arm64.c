@@ -27,6 +27,7 @@
 #include "config.h"
 
 #include <stdarg.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ntstatus.h"
@@ -330,5 +331,94 @@ __ASM_GLOBAL_FUNC( vcpu_call_syscall,
                    "mov sp, x29\n\t"
                    "ldp x29, x30, [sp], #16\n\t"
                    "ret" )
+
+/***********************************************************************
+ *           vcpu_ranges_add
+ *
+ * Add [start, end) to the set, merging it with every range it overlaps or touches. Returns 0, or -1 when out of
+ * memory (the set is then unchanged).
+ */
+int vcpu_ranges_add( struct vcpu_ranges *set, uint64_t start, uint64_t end )
+{
+    unsigned int i, j;
+
+    if (start >= end) return 0;
+    for (i = 0; i < set->count && set->ranges[i].end < start; i++) ;
+    for (j = i; j < set->count && set->ranges[j].start <= end; j++) ;
+
+    if (i == j)  /* touches nothing: insert at i */
+    {
+        if (set->count == set->max)
+        {
+            unsigned int max = set->max ? set->max * 2 : 8;
+            struct vcpu_range *ranges = realloc( set->ranges, max * sizeof(*ranges) );
+
+            if (!ranges) return -1;
+            set->ranges = ranges;
+            set->max = max;
+        }
+        memmove( &set->ranges[i + 1], &set->ranges[i], (set->count - i) * sizeof(*set->ranges) );
+        set->ranges[i].start = start;
+        set->ranges[i].end = end;
+        set->count++;
+        return 0;
+    }
+
+    /* ranges i .. j - 1 overlap or touch [start, end): they become one */
+    if (set->ranges[i].start < start) start = set->ranges[i].start;
+    if (set->ranges[j - 1].end > end) end = set->ranges[j - 1].end;
+    set->ranges[i].start = start;
+    set->ranges[i].end = end;
+    memmove( &set->ranges[i + 1], &set->ranges[j], (set->count - j) * sizeof(*set->ranges) );
+    set->count -= j - i - 1;
+    return 0;
+}
+
+
+/***********************************************************************
+ *           vcpu_ranges_find
+ *
+ * Whether pos is in the set; *run_end is the end of the run from pos with that answer, clipped to end (pos < end).
+ */
+BOOL vcpu_ranges_find( const struct vcpu_ranges *set, uint64_t pos, uint64_t end, uint64_t *run_end )
+{
+    unsigned int i;
+
+    for (i = 0; i < set->count; i++)
+    {
+        if (set->ranges[i].start > pos)
+        {
+            *run_end = min( set->ranges[i].start, end );
+            return FALSE;
+        }
+        if (set->ranges[i].end > pos)
+        {
+            *run_end = min( set->ranges[i].end, end );
+            return TRUE;
+        }
+    }
+    *run_end = end;
+    return FALSE;
+}
+
+
+void vcpu_ranges_free( struct vcpu_ranges *set )
+{
+    free( set->ranges );
+    memset( set, 0, sizeof(*set) );
+}
+
+
+/***********************************************************************
+ *           vcpu_view_host_congruent
+ *
+ * Whether a view at base of a section's bytes from offset can be a host remap of the section's anchor: the host
+ * maps whole 16K pages, so base and offset must be the same distance into one. Ordinary views always are (64K
+ * base and offset); a MEM_REPLACE_PLACEHOLDER view may have a 4K offset.
+ */
+BOOL vcpu_view_host_congruent( uint64_t base, uint64_t offset, uint64_t host_page_mask )
+{
+    return !((base - offset) & host_page_mask);
+}
 
 #endif /* __APPLE__ && __aarch64__ */
