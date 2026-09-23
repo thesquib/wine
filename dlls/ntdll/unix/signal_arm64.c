@@ -746,6 +746,18 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     struct exc_stack_layout *stack;
     void *stack_ptr = (void *)(SP_sig(sigcontext) & ~15);
 
+#if defined(__APPLE__)
+    if (vcpu_mode)
+    {
+        /* guest faults never arrive as signals in the vCPU mode: this is the host's own crash. Say so, rather than
+         * redirecting the host into PE code it cannot execute (a second crash that hides this one). */
+        fprintf( stderr, "wine: vCPU mode: host exception %#x at pc %p addr %p (lr %p sp %p)\n",
+                 (UINT)rec->ExceptionCode, (void *)PC_sig(sigcontext), rec->ExceptionAddress,
+                 (void *)LR_sig(sigcontext), (void *)SP_sig(sigcontext) );
+        abort_process( 1 );
+    }
+#endif
+
     if (!chpe || !chpe->InSimulation)
     {
         NTSTATUS status = send_debug_event( rec, context, TRUE, TRUE );

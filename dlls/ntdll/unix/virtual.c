@@ -1899,6 +1899,7 @@ static inline BOOL is_guest_view( const struct file_view *view )
 #if defined(__APPLE__) && defined(__aarch64__)
 
 static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vprot );
+static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE clear );
 
 /***********************************************************************
  *           vcpu_sync_pages
@@ -1907,7 +1908,22 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
  * applied (the vCPU-mode body of mprotect_range: the host mapping stays RW, all protection is in stage 1).
  * Pages that become executable get their I-cache lines invalidated: the host wrote them through the D-cache.
  */
+/* no SIGQUIT may end the thread inside gmm (its mutex) or HVF (its locks); server signals are already blocked
+ * under virtual_mutex */
+#define VCPU_GMM_BEGIN() sigset_t vcpu_old_, vcpu_quit_; sigemptyset( &vcpu_quit_ ); sigaddset( &vcpu_quit_, SIGQUIT ); \
+                         pthread_sigmask( SIG_BLOCK, &vcpu_quit_, &vcpu_old_ )
+#define VCPU_GMM_END()   pthread_sigmask( SIG_SETMASK, &vcpu_old_, NULL )
+
 static int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear )
+{
+    int res;
+    VCPU_GMM_BEGIN();
+    res = vcpu_sync_pages_nosig( base, size, set, clear );
+    VCPU_GMM_END();
+    return res;
+}
+
+static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE clear )
 {
     unsigned char s1[512];
     char *addr = ROUND_ADDR( base, page_mask );
@@ -1950,10 +1966,16 @@ static int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear 
 static void vcpu_revoke_pages( const void *base, size_t size )
 {
     char *addr = ROUND_ADDR( base, page_mask );
-    int ret;
+    int ret = 0;
 
     size = ROUND_SIZE( base, size, page_mask );
-    if (size && (ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, size, GMM_S1_NONE )))
+    if (size)
+    {
+        VCPU_GMM_BEGIN();
+        ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, size, GMM_S1_NONE );
+        VCPU_GMM_END();
+    }
+    if (ret)
     {
         ERR( "gmm_vm_range_set %p-%p NONE failed %d\n", addr, addr + size, ret );
         abort();  /* the host mapping change that follows would pull memory out from under the guest */
@@ -1963,8 +1985,11 @@ static void vcpu_revoke_pages( const void *base, size_t size )
 static NTSTATUS vcpu_view_created( struct file_view *view )
 {
     int ret;
+    VCPU_GMM_BEGIN();
 
-    if ((ret = gmm_view_map( vcpu_gmm(), (UINT_PTR)view->base, view->size, view->base, GMM_S1_NONE )))
+    ret = gmm_view_map( vcpu_gmm(), (UINT_PTR)view->base, view->size, view->base, GMM_S1_NONE );
+    VCPU_GMM_END();
+    if (ret)
     {
         ERR( "gmm_view_map %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
         /* gmm rule R7: only resource exhaustion is an allocation failure; anything else is a view-tree or backing
@@ -1983,8 +2008,11 @@ static NTSTATUS vcpu_view_created( struct file_view *view )
 static void vcpu_view_deleted( struct file_view *view )
 {
     int ret;
+    VCPU_GMM_BEGIN();
 
-    if ((ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size )))
+    ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
+    VCPU_GMM_END();
+    if (ret)
     {
         ERR( "gmm_view_unmap %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
         abort();
