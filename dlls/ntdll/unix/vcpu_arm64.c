@@ -1240,6 +1240,9 @@ void vcpu_init_process(void)
     cfg.pt_pool_sz = VCPU_PT_POOL_SIZE;
     cfg.t0sz = 16;
     cfg.flags = GMM_CFG_PARANOID;
+    /* multi-chunk runs (> 1) also need GMM_CFG_S2_REMAP, or virtual.c skipping the host change of a retained chunk:
+     * without them a refused sub-range unmap retains chunks, and vcpu_assert_s2_unmapped aborts on the next
+     * ordinary decommit or free there */
     cfg.s2_run_chunks = 1;
     if ((ret = gmm_init( &gmm, &cfg, &backend ))) vcpu_fatal( "gmm_init: %d\n", ret );
     vcpu_check_s2 = cfg.s2_run_chunks > 1 || ((env = getenv( "PMW_VCPU_PARANOID" )) && !strcmp( env, "1" ));

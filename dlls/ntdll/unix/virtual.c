@@ -1931,6 +1931,12 @@ static int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear 
     return res;
 }
 
+/* vCPU mode: after the host wrote guest code through the D-cache */
+static inline void vcpu_icache_invalidate( void *addr, size_t size )
+{
+    sys_icache_invalidate( addr, size );
+}
+
 /* whether the guest can execute the 4K page now and nobody can write it (neither the guest nor, by Wine's own
  * rule, the host: unix code writes guest memory only while it is writable, e.g. an image before its sections are
  * protected). gmm_walk reads the live tables without gmm's mutex: safe here, every change to them after vCPU-mode
@@ -1939,6 +1945,8 @@ static BOOL vcpu_page_is_rx( const char *addr )
 {
     gmm_xlat_t x;
 
+    /* an armed write watch clears stage-1 W on a writable page, and the host still writes it (NtReadFile) */
+    if (get_page_vprot( addr ) & VPROT_WRITEWATCH) return FALSE;
     gmm_walk( vcpu_gmm(), (UINT_PTR)addr, &x );
     return x.valid && !x.pxn && x.ap_ro;
 }
@@ -1947,7 +1955,8 @@ static BOOL vcpu_page_is_rx( const char *addr )
  * (s1[i], or target when s1 is NULL), except those already executable and read-only: anything else may have been
  * written through the D-cache since it was last fetched from. Runs BEFORE the gmm call that makes them executable,
  * so no vCPU can fetch a stale line from them. Writes to an executable page without a protection change are the
- * writer's to flush (NtFlushInstructionCache), as on Windows. */
+ * writer's to flush: NtFlushInstructionCache as on Windows, and on the host side map_file_into_view, which reads
+ * a file into a view that is executable from its creation on. */
 static void vcpu_icache_sync( char *addr, size_t npages, const unsigned char *s1, unsigned char target )
 {
     size_t i, run = 0;
@@ -2150,6 +2159,7 @@ static void vcpu_view_deleted( struct file_view *view )
 static inline int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear ) { return 0; }
 static inline void vcpu_revoke_pages( const void *base, size_t size ) {}
 static inline void vcpu_assert_s2_unmapped( const void *start, size_t size ) {}
+static inline void vcpu_icache_invalidate( void *addr, size_t size ) {}
 static inline NTSTATUS vcpu_view_created( struct file_view *view ) { return STATUS_SUCCESS; }
 static inline void vcpu_view_deleted( struct file_view *view ) {}
 static inline NTSTATUS vcpu_add_writeback( const struct file_view *view, char *addr, size_t size, int fd, off_t offset )
@@ -2983,6 +2993,9 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
         /* vCPU mode: gmm can only map anonymous memory into the guest, so files are always read; a shared
          * writable view is a copy written back on flush and unmap (vcpu_view_flush) */
         pread( fd, map_addr, size, offset );
+        /* the view may be executable from its creation on (vcpu_view_created): the pages this read wrote are not
+         * re-invalidated by a later protection sync, which skips executable read-only pages (vcpu_icache_sync) */
+        if (view->protect & VPROT_EXEC) vcpu_icache_invalidate( map_addr, size );
         if (vprot & VPROT_WRITE) return vcpu_add_writeback( view, map_addr, size, fd, offset );
         return STATUS_SUCCESS;
     }
@@ -3172,6 +3185,9 @@ static NTSTATUS remove_pages_from_view( struct file_view *view, char *base, size
  */
 static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *base, size_t size )
 {
+    /* vCPU mode: a host-only view stays host-only as a placeholder (never mapped into the guest, untagged) */
+    const unsigned int hostonly = view->protect & VPROT_HOSTONLY;
+    const BOOL guest = is_guest_view( view );
     NTSTATUS status;
 
     if (!size) return STATUS_INVALID_PARAMETER_3;
@@ -3191,18 +3207,18 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
          * before create_view maps the range as a new view and before any host mapping change (rule R5) */
         status = remove_pages_from_view( view, base, size );
         if (status) return status;
-        if (is_guest_view( view )) vcpu_revoke_pages( base, size );
+        if (guest) vcpu_revoke_pages( base, size );
 
-        status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER );
+        status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER | hostonly );
         if (status) return status;
     }
 
-    if (is_guest_view( view )) vcpu_revoke_pages( view->base, view->size );
-    view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
+    if (guest) vcpu_revoke_pages( view->base, view->size );
+    view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER | hostonly;
     set_page_vprot( view->base, view->size, 0 );
-    if (is_guest_view( view )) vcpu_assert_s2_unmapped( view->base, ROUND_SIZE( 0, view->size, host_page_mask ));
+    if (guest) vcpu_assert_s2_unmapped( view->base, ROUND_SIZE( 0, view->size, host_page_mask ));
     anon_mmap_fixed_tag( view->base, ROUND_SIZE( 0, view->size, host_page_mask ),
-                         is_guest_view( view ) ? PROT_READ | PROT_WRITE : PROT_NONE, 0, is_guest_view( view ) );
+                         guest ? PROT_READ | PROT_WRITE : PROT_NONE, 0, guest );
     return STATUS_SUCCESS;
 }
 
