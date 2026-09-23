@@ -21,6 +21,18 @@
 #ifndef __WINE_NTDLL_UNIX_VCPU_ARM64_H
 #define __WINE_NTDLL_UNIX_VCPU_ARM64_H
 
+/* PMW_VCPU: 0 off (the EL0 path, unchanged), 1 on, 2 selftest. A constant 0 everywhere but arm64 macOS, so every
+ * "if (vcpu_mode)" branch compiles away there. */
+#if defined(__APPLE__) && defined(__aarch64__)
+extern int vcpu_mode;
+extern void vcpu_init_process(void);
+extern void vcpu_start_kuser_publisher( const void *src );
+#else
+#define vcpu_mode 0
+static inline void vcpu_init_process(void) {}
+static inline void vcpu_start_kuser_publisher( const void *src ) {}
+#endif
+
 #ifdef __aarch64__
 
 /* The per-thread user-mode register frame, at the top of the kernel stack. In the vCPU mode it stays the single
@@ -63,6 +75,13 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
 /* everything but SP_EL0 and the TPIDRs: what a fault or kick exit loads and stores */
 #define VCPU_FULL_CORE_MASK (VEL1_R_GPRS | VEL1_R_PC | VEL1_R_CPSR | VEL1_R_SP_EL1 | VEL1_R_FPCR | VEL1_R_FPSR)
+
+/* process state (vcpu_arm64.c) */
+extern gmm_t *vcpu_gmm(void);
+extern uint64_t vcpu_blob_va(void);
+extern void *vcpu_kuser_host(void);
+extern void vcpu_note_entered(void);
+extern vel1_exit_kind vcpu_selftest_probe( uint64_t va, uint64_t value, uint64_t *old, vel1_exit *e );
 
 /* pure translation helpers (vcpu_pure_arm64.c) */
 extern unsigned char vcpu_vprot_to_s1( unsigned char vprot );

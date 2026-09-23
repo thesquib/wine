@@ -68,6 +68,7 @@ SOURCES = \
 	unix/system.c \
 	unix/tape.c \
 	unix/thread.c \
+	unix/vcpu_arm64.c \
 	unix/vcpu_blob_arm64.c \
 	unix/vcpu_el1_arm64.c \
 	unix/vcpu_el1_live_arm64.c \
