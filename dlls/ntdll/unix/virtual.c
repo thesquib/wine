@@ -2005,11 +2005,80 @@ static NTSTATUS vcpu_view_created( struct file_view *view )
     return STATUS_SUCCESS;
 }
 
+/* vCPU mode: gmm maps only anonymous memory into the guest, so a file view is a copy of the file. A shared writable
+ * view is written back to the file when it is flushed and when it is unmapped; that covers wineboot's writable view
+ * of the KUSER_SHARED_DATA section (it maps, writes the statics, unmaps), not two processes writing one file at
+ * once. List under virtual_mutex. */
+struct vcpu_writeback
+{
+    struct vcpu_writeback *next;
+    const struct file_view *view;
+    char   *addr;     /* first mapped byte */
+    size_t  size;
+    int     fd;       /* our dup of the mapping's fd */
+    off_t   offset;
+};
+static struct vcpu_writeback *vcpu_writebacks;
+
+static NTSTATUS vcpu_add_writeback( const struct file_view *view, char *addr, size_t size, int fd, off_t offset )
+{
+    struct vcpu_writeback *wb;
+
+    if (!(wb = malloc( sizeof(*wb) ))) return STATUS_NO_MEMORY;
+    if ((wb->fd = dup( fd )) == -1)
+    {
+        free( wb );
+        return STATUS_NO_MEMORY;
+    }
+    wb->view   = view;
+    wb->addr   = addr;
+    wb->size   = size;
+    wb->offset = offset;
+    wb->next   = vcpu_writebacks;
+    vcpu_writebacks = wb;
+    TRACE( "vCPU mode: shared writable file view %p-%p, written back on flush/unmap\n", addr, addr + size );
+    return STATUS_SUCCESS;
+}
+
+/* write the committed pages of the view's shared writable ranges back to their files */
+static void vcpu_view_flush( const struct file_view *view, BOOL remove )
+{
+    struct vcpu_writeback **ptr = &vcpu_writebacks, *wb;
+    size_t pos, run;
+
+    while ((wb = *ptr))
+    {
+        if (wb->view != view)
+        {
+            ptr = &wb->next;
+            continue;
+        }
+        for (pos = 0; pos < wb->size; pos += run)
+        {
+            run = page_size - ((size_t)(wb->addr + pos) & page_mask);
+            if (run > wb->size - pos) run = wb->size - pos;
+            if (!(get_page_vprot( wb->addr + pos ) & VPROT_COMMITTED)) continue;
+            if (pwrite( wb->fd, wb->addr + pos, run, wb->offset + pos ) != run)
+                ERR( "vCPU mode: write-back of %p-%p failed: %s\n", wb->addr + pos, wb->addr + pos + run,
+                     strerror( errno ));
+        }
+        if (!remove)
+        {
+            ptr = &wb->next;
+            continue;
+        }
+        close( wb->fd );
+        *ptr = wb->next;
+        free( wb );
+    }
+}
+
 static void vcpu_view_deleted( struct file_view *view )
 {
     int ret;
     VCPU_GMM_BEGIN();
 
+    vcpu_view_flush( view, TRUE );
     ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
     VCPU_GMM_END();
     if (ret)
@@ -2024,6 +2093,11 @@ static inline int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE
 static inline void vcpu_revoke_pages( const void *base, size_t size ) {}
 static inline NTSTATUS vcpu_view_created( struct file_view *view ) { return STATUS_SUCCESS; }
 static inline void vcpu_view_deleted( struct file_view *view ) {}
+static inline NTSTATUS vcpu_add_writeback( const struct file_view *view, char *addr, size_t size, int fd, off_t offset )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+static inline void vcpu_view_flush( const struct file_view *view, BOOL remove ) {}
 #endif
 
 
@@ -2835,13 +2909,10 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
 
     if (is_guest_view( view ))
     {
-        /* vCPU mode: gmm can only map anonymous memory into the guest, so files are always read */
-        if (vprot & VPROT_WRITE)
-        {
-            ERR( "vCPU mode: shared writable file mapping %p-%p not supported\n", map_addr, map_addr + map_size );
-            return STATUS_NOT_SUPPORTED;
-        }
+        /* vCPU mode: gmm can only map anonymous memory into the guest, so files are always read; a shared
+         * writable view is a copy written back on flush and unmap (vcpu_view_flush) */
         pread( fd, map_addr, size, offset );
+        if (vprot & VPROT_WRITE) return vcpu_add_writeback( view, map_addr, size, fd, offset );
         return STATUS_SUCCESS;
     }
 
@@ -7571,8 +7642,9 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
     {
         if (!*size_ptr) *size_ptr = view->size;
         *addr_ptr = addr;
+        if (is_guest_view( view )) vcpu_view_flush( view, FALSE );
 #ifdef MS_ASYNC
-        if (msync( ROUND_ADDR( addr, host_page_mask ), ROUND_SIZE( addr, *size_ptr, host_page_mask ), MS_ASYNC ))
+        else if (msync( ROUND_ADDR( addr, host_page_mask ), ROUND_SIZE( addr, *size_ptr, host_page_mask ), MS_ASYNC ))
             status = STATUS_NOT_MAPPED_DATA;
 #endif
     }
