@@ -117,9 +117,22 @@ static const UINT EXTERNAL_FENCE_WIN32_BITS = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQ
 
 #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
 
+/* arm64 vCPU mode (ntdll, PMW_VCPU): the Windows code runs in a VM that sees only memory mapped into it through
+ * NtAllocateVirtualMemory, never a pointer the driver maps itself (vkMapMemory), and VK_EXT_map_memory_placed would
+ * map driver memory over a guest range with MAP_FIXED, which the VM's memory manager forbids. So host-visible memory
+ * is allocated by Wine and imported with VK_EXT_external_memory_host, as for WoW64. */
+static BOOL vcpu_mode(void)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    return __wine_vcpu_active();
+#else
+    return FALSE;
+#endif
+}
+
 static BOOL use_external_memory(void)
 {
-    return zero_bits != 0;
+    return zero_bits != 0 || vcpu_mode();
 }
 
 struct mempool
@@ -761,7 +774,8 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     }
     physical_device->extensions = extensions;
 
-    if (zero_bits && physical_device->extensions.has_VK_EXT_map_memory_placed && physical_device->extensions.has_VK_KHR_map_memory2)
+    if (zero_bits && !vcpu_mode() && physical_device->extensions.has_VK_EXT_map_memory_placed &&
+        physical_device->extensions.has_VK_KHR_map_memory2)
     {
         VkPhysicalDeviceMapMemoryPlacedFeaturesEXT map_placed_feature = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &map_placed_feature};
@@ -778,7 +792,7 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
         }
     }
 
-    if (zero_bits && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
+    if (use_external_memory() && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
     {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_mem_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &host_mem_props};
@@ -1685,6 +1699,14 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         memory->vm_map = placed_info.pPlacedAddress;
         *data = (char *)memory->vm_map + map_info->offset;
         TRACE( "Using placed mapping %p\n", memory->vm_map );
+    }
+
+    if (res == VK_SUCCESS && vcpu_mode() && !memory->vm_map)
+    {
+        /* not imported from Wine memory: the pointer is the driver's, outside the VM (see vcpu_mode) */
+        static int once;
+        if (!once++) ERR( "vCPU mode: mapping %p is not guest-visible (host memory not imported); guest access "
+                          "will fault\n", *data );
     }
 
 #ifdef _WIN64

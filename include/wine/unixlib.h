@@ -98,6 +98,10 @@ NTSYSAPI const struct _KUSER_SHARED_DATA *__wine_user_shared_data(void);
  * it all or none), else 0 (not in vCPU mode, or no TSO). For an x86 emulator's unix-side helper, which may then drop
  * software TSO: nothing else is needed to turn it on. Out-of-tree callers find it with dlsym(RTLD_DEFAULT). */
 NTSYSAPI int __wine_vcpu_hardware_tso(void);
+
+/* arm64 vCPU mode: nonzero if this process runs its Windows code in vCPUs (PMW_VCPU). Such code sees only memory
+ * mapped into its VM through NtAllocateVirtualMemory / NtMapViewOfSection, never memory a host library maps itself. */
+NTSYSAPI int __wine_vcpu_active(void);
 #endif
 NTSYSAPI void ntdll_add_syscall_debug_info( UINT idx, const char **syscall_names,
                                             const char **usercall_names );
