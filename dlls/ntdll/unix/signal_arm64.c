@@ -873,7 +873,26 @@ void vcpu_raise_exception_second_chance( struct syscall_frame *frame, EXCEPTION_
  */
 void vcpu_suspend( struct syscall_frame *frame, BOOL in_syscall )
 {
+    CHPE_V2_CPU_AREA_INFO *chpe;
     CONTEXT context;
+
+    /* inside the ARM64EC emulator (or one of its callbacks): the registers are the emulator's, not the thread's.
+     * As usr1_handler does: take the suspend cooperatively, ring the emulator's doorbell and resume; the emulator
+     * stops at its next safe point and comes back through NtContinue with the guest context, where
+     * signal_set_full_context sees suspend_pending and suspends on that context. */
+    if ((chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo) && chpe->SuspendDoorbell &&
+        (chpe->InSimulation || chpe->InSyscallCallback))
+    {
+        NTSTATUS status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_COOPERATIVE_SUSPEND,
+                                         0, NULL, NULL );
+        if (status == STATUS_THREAD_WAS_SUSPENDED)
+        {
+            *chpe->SuspendDoorbell = -1;  /* guest memory, host == guest VA; this thread's vCPU is stopped */
+            arm64_thread_data()->suspend_pending = TRUE;
+            TRACE( "vCPU mode: suspend inside the emulator, doorbell rung\n" );
+        }
+        return;
+    }
 
     if (in_syscall)
     {
