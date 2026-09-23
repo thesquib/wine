@@ -76,6 +76,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "vcpu_arm64.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(thread);
 WINE_DECLARE_DEBUG_CHANNEL(seh);
@@ -1557,6 +1558,7 @@ void abort_thread( int status )
 {
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
+    vcpu_thread_exit();
     pthread_exit_wrapper( status );
 }
 
@@ -1592,6 +1594,7 @@ static DECLSPEC_NORETURN void exit_thread( int status )
             virtual_free_teb( teb );
         }
     }
+    vcpu_thread_exit();
     pthread_exit_wrapper( status );
 }
 

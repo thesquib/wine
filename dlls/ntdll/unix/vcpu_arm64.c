@@ -36,6 +36,7 @@
 #if defined(__APPLE__) && defined(__aarch64__)
 
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -56,6 +57,7 @@
 #include "winnt.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
+#include "wine/unixlib.h"
 #include "unix_private.h"
 #include "vcpu_arm64.h"
 #include "wine/debug.h"
@@ -408,6 +410,472 @@ vel1_exit_kind vcpu_selftest_probe( uint64_t va, uint64_t value, uint64_t *old, 
 }
 
 
+
+/***********************************************************************
+ * The per-thread loop
+ *
+ * One vCPU per Windows thread, created on the thread itself. struct syscall_frame stays the thread's user-mode
+ * truth: each exit fills it (the same registers the asm dispatchers save), the exit is dispatched, and the frame
+ * goes back into the vCPU (the same registers __wine_syscall_dispatcher_return restores).
+ *
+ * The in_syscall mark decides where a SIGUSR1/SIGQUIT goes (vcpu_el1.h D15): while it is clear the thread is in or
+ * about to enter the guest, and the handler only kicks the vCPU (no hv_* call, D8); the loop then suspends from
+ * the full vCPU state. While it is set, the frame is complete and the existing host path runs. Order: fill the
+ * frame, set the mark, take any kick left pending; clear the mark before writing registers back into the vCPU, so
+ * a context change made by a signal after that point is never lost (the kick makes vel1_run return at once).
+ */
+struct vcpu_level
+{
+    jmp_buf             resume;        /* handle_syscall_fault returns a syscall's status here */
+    struct vcpu_level  *prev;
+    vel1_exit_kind      kind;          /* SYSCALL or UNIX_CALL being dispatched */
+    BOOL                done;          /* NtCallbackReturn ended this (nested) level */
+    BOOL                callback_ran;  /* a nested callback ran other guest code on the vCPU */
+    void               *cb_ret_ptr;
+    ULONG               cb_ret_len;
+    NTSTATUS            cb_status;
+};
+
+struct vcpu_thread
+{
+    vel1_vcpu           vcpu;          /* host-only memory (D12); the thread finds it through vcpu_key */
+    atomic_int          in_syscall;
+    atomic_int          quit;
+    int                 hv_depth;      /* inside a vel1 call: never destroy the vCPU from a handler then */
+    struct vcpu_level  *level;
+    uint64_t            exits, syscalls, unix_calls, faults, kicks;
+};
+
+static pthread_key_t vcpu_key;
+
+extern void trace_syscall( UINT id, ULONG_PTR *args, ULONG len );
+extern void trace_sysret( UINT id, ULONG_PTR retval );
+
+static inline struct vcpu_thread *vcpu_current(void)
+{
+    return pthread_getspecific( vcpu_key );
+}
+
+static void vcpu_dump_exit( const char *what, struct vcpu_thread *vt, const vel1_exit *e,
+                            const struct syscall_frame *frame )
+{
+    unsigned int i;
+
+    fprintf( stderr, "wine: vCPU mode: %s: exit %s err %d hv %#x reason %u esr %#llx far %#llx elr %#llx "
+             "spsr %#llx pc %#llx fclass %s\n", what, vel1_exit_kind_name( e->kind ), e->err, e->hv_err,
+             e->hv_reason, (unsigned long long)e->esr, (unsigned long long)e->far, (unsigned long long)e->elr,
+             (unsigned long long)e->spsr, (unsigned long long)e->pc, vel1_fault_class_name( e->fclass ));
+    if (frame)
+    {
+        for (i = 0; i < 29; i++)
+            fprintf( stderr, " x%-2u=%016llx%s", i, (unsigned long long)frame->x[i], (i % 4) == 3 ? "\n" : "" );
+        fprintf( stderr, " fp=%016llx lr=%016llx sp=%016llx pc=%016llx cpsr=%08x\n",
+                 (unsigned long long)frame->fp, (unsigned long long)frame->lr, (unsigned long long)frame->sp,
+                 (unsigned long long)frame->pc, (UINT)frame->cpsr );
+    }
+    if (vt)
+        fprintf( stderr, " thread %04x: exits %llu syscalls %llu unix calls %llu faults %llu kicks %llu\n",
+                 (UINT)GetCurrentThreadId(), (unsigned long long)vt->exits, (unsigned long long)vt->syscalls,
+                 (unsigned long long)vt->unix_calls, (unsigned long long)vt->faults, (unsigned long long)vt->kicks );
+}
+
+static void DECLSPEC_NORETURN vcpu_fatal_exit( struct vcpu_thread *vt, const vel1_exit *e,
+                                               const struct syscall_frame *frame )
+{
+    vcpu_dump_exit( "fatal exit", vt, e, frame );
+    abort_process( 1 );
+}
+
+static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
+{
+    vel1_exit_kind kind;
+
+    for (;;)
+    {
+        vt->hv_depth++;
+        kind = vel1_run( &vt->vcpu, e );
+        vt->hv_depth--;
+        vt->exits++;
+        if (kind != VEL1_EXIT_CANCELED) return kind;  /* past vel1's spurious bound: just go again */
+    }
+}
+
+/* write the whole frame into the vCPU and leave the syscall state (fault, kick, thread start) */
+static void vcpu_store_full( struct vcpu_thread *vt, const struct syscall_frame *frame )
+{
+    vel1_regs regs;
+    int ret;
+
+    atomic_store( &vt->in_syscall, 0 );
+    if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
+    {
+        fprintf( stderr, "wine: vCPU mode: ARM64EC emulation resume is not supported yet (M2)\n" );
+        abort_process( 1 );
+    }
+    vcpu_regs_from_frame( &regs, frame );
+    vt->hv_depth++;
+    ret = vel1_regs_set( &vt->vcpu, &regs, VCPU_FULL_CORE_MASK, VEL1_R_ALL_SIMD );
+    vt->hv_depth--;
+    if (ret)
+    {
+        fprintf( stderr, "wine: vCPU mode: vel1_regs_set(full) failed %d (pc %#llx)\n", ret,
+                 (unsigned long long)frame->pc );
+        abort_process( 1 );
+    }
+}
+
+/* return from a syscall or unix call with ret, as __wine_syscall_dispatcher_return does */
+static void vcpu_return( struct vcpu_thread *vt, struct vcpu_level *level, vel1_exit_kind kind, ULONG64 ret )
+{
+    struct syscall_frame *frame = get_syscall_frame();
+    uint64_t core;
+    uint32_t simd;
+    vel1_regs regs;
+    int err;
+
+    atomic_store( &vt->in_syscall, 0 );
+    if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
+    {
+        fprintf( stderr, "wine: vCPU mode: ARM64EC emulation resume is not supported yet (M2)\n" );
+        abort_process( 1 );
+    }
+    vt->hv_depth++;
+    if (!frame->restore_flags && !level->callback_ran)
+    {
+        /* the vCPU still holds everything else: only the stub's return is left to play */
+        if (kind == VEL1_EXIT_SYSCALL) err = vel1_syscall_return( &vt->vcpu, ret, frame->pc, frame->lr );
+        else err = vel1_call_return( &vt->vcpu, ret, frame->pc );
+    }
+    else
+    {
+        vcpu_return_plan( frame, ret, level->callback_ran, &regs, &core, &simd );
+        err = vel1_regs_set( &vt->vcpu, &regs, core, simd );
+    }
+    vt->hv_depth--;
+    level->callback_ran = FALSE;
+    if (err)
+    {
+        fprintf( stderr, "wine: vCPU mode: syscall return failed %d (pc %#llx)\n", err, (unsigned long long)frame->pc );
+        abort_process( 1 );
+    }
+}
+
+static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_exit *e )
+{
+    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+    UINT id = e->regs.x[8];
+    SYSTEM_SERVICE_TABLE *table = thread_data->syscall_table + ((id >> 12) & 3);
+    UINT num = id & 0xfff;
+    ULONG64 args[32], ret;
+    ULONG size, stack_bytes;
+    void *func;
+
+    if (num >= table->ServiceLimit) return STATUS_INVALID_SYSTEM_SERVICE;
+    func = (void *)table->ServiceTable[num];
+    size = table->ArgumentTable[num];
+    stack_bytes = size > 64 ? size - 64 : 0;
+    memcpy( args, e->regs.x, 8 * sizeof(args[0]) );
+    if (thread_data->syscall_trace)
+    {
+        memcpy( args + 8, (void *)frame->sp, min( stack_bytes, sizeof(args) - 64 ));
+        trace_syscall( id, (ULONG_PTR *)args, size );
+    }
+    ret = vcpu_call_syscall( func, args, (const ULONG64 *)frame->sp, stack_bytes );
+    if (thread_data->syscall_trace) trace_sysret( id, ret );
+    return ret;
+}
+
+static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *frame, const vel1_exit *e )
+{
+    EXCEPTION_RECORD rec;
+    ULONG64 pc_adjust;
+
+    vt->faults++;
+    if (e->kind == VEL1_EXIT_FAULT_SYNC && (e->fclass == VEL1_FC_DATA_ABORT || e->fclass == VEL1_FC_INSN_ABORT))
+    {
+        switch (gmm_vm_fault( gmm, e->far, e->esr ))
+        {
+        case GMM_VF_RETRY:  /* a concurrent protection change already allows it */
+            vcpu_store_full( vt, frame );
+            return;
+        case GMM_VF_FATAL:
+            vcpu_fatal_exit( vt, e, frame );
+        case GMM_VF_WINE:
+            break;
+        }
+    }
+    if (!vcpu_exit_to_exception( e, frame, &rec, &pc_adjust )) vcpu_fatal_exit( vt, e, frame );
+    TRACE( "fault %s code %#x at %p (far %#llx)\n", vel1_fault_class_name( e->fclass ), (UINT)rec.ExceptionCode,
+           rec.ExceptionAddress, (unsigned long long)e->far );
+    if (rec.ExceptionCode == STATUS_ACCESS_VIOLATION && !virtual_handle_fault( &rec, (void *)frame->sp ))
+    {
+        vcpu_store_full( vt, frame );  /* guard page, write watch or stack growth handled: retry */
+        return;
+    }
+    vcpu_raise_exception( frame, &rec, pc_adjust );
+    vcpu_store_full( vt, frame );
+}
+
+/***********************************************************************
+ *           vcpu_loop
+ *
+ * Run the thread's guest code until NtCallbackReturn ends this level (nested callbacks); level 0 never returns.
+ */
+static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
+{
+    struct syscall_frame *frame;
+    vel1_exit e;
+    vel1_exit_kind kind;
+    ULONG64 ret;
+    int jmp;
+
+    level->prev = vt->level;
+    vt->level = level;
+
+    if ((jmp = setjmp( level->resume )))
+    {
+        /* handle_syscall_fault: a host fault inside the syscall; it returns the exception code */
+        ret = (NTSTATUS)jmp;
+        kind = level->kind;
+        goto syscall_return;
+    }
+
+    for (;;)
+    {
+        kind = vcpu_run( vt, &e );
+        frame = get_syscall_frame();
+        switch (kind)
+        {
+        case VEL1_EXIT_SYSCALL:
+            vcpu_frame_from_syscall_exit( frame, &e );
+            break;
+        case VEL1_EXIT_UNIX_CALL:
+            vcpu_frame_from_unix_call_exit( frame, &e );
+            break;
+        case VEL1_EXIT_KICK:
+        case VEL1_EXIT_FAULT_SYNC:
+        case VEL1_EXIT_ILLEGAL:
+        case VEL1_EXIT_TRAP:
+        {
+            vel1_regs regs;
+            int err;
+
+            vt->hv_depth++;
+            err = vel1_regs_get( &vt->vcpu, &regs, VCPU_FULL_CORE_MASK, VEL1_R_ALL_SIMD );
+            vt->hv_depth--;
+            if (err) vcpu_fatal_exit( vt, &e, NULL );
+            vcpu_frame_from_regs( frame, &regs );
+            break;
+        }
+        default:
+            vcpu_fatal_exit( vt, &e, NULL );
+        }
+
+        atomic_store( &vt->in_syscall, 1 );
+        /* a KICK exit already consumed its kick; any exit may carry one left pending (D15) */
+        if (vel1_kick_take( &vt->vcpu ) || kind == VEL1_EXIT_KICK)
+        {
+            vt->kicks++;
+            if (!atomic_load( &vt->quit ))
+                vcpu_suspend( frame, kind == VEL1_EXIT_SYSCALL || kind == VEL1_EXIT_UNIX_CALL );
+        }
+        if (atomic_load( &vt->quit )) abort_thread( 0 );
+
+        switch (kind)
+        {
+        case VEL1_EXIT_SYSCALL:
+            vt->syscalls++;
+            level->kind = kind;
+            ret = vcpu_dispatch_syscall( frame, &e );
+            break;
+        case VEL1_EXIT_UNIX_CALL:
+            vt->unix_calls++;
+            level->kind = kind;
+            ret = ((const unixlib_entry_t *)e.regs.x[0])[e.regs.x[1]]( (void *)e.regs.x[2] );
+            break;
+        case VEL1_EXIT_KICK:
+            vcpu_store_full( vt, frame );
+            continue;
+        default:
+            vcpu_handle_fault( vt, frame, &e );
+            continue;
+        }
+
+    syscall_return:
+        if (level->done)
+        {
+            vt->level = level->prev;
+            return;
+        }
+        vcpu_return( vt, level, kind, ret );
+    }
+}
+
+/***********************************************************************
+ *           vcpu_thread_start
+ *
+ * Replaces the jump to __wine_syscall_dispatcher_return at the end of signal_start_thread: the thread's user mode
+ * runs in its own vCPU from here on.
+ */
+void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
+{
+    struct vcpu_thread *vt = calloc( 1, sizeof(*vt) );
+    struct vcpu_level level;
+    vel1_vcpu_cfg cfg;
+    int ret;
+
+    if (!vt) vcpu_fatal( "out of memory for thread %04x\n", (UINT)GetCurrentThreadId() );
+    memset( &cfg, 0, sizeof(cfg) );
+    cfg.ttbr0 = gmm_ttbr0( gmm );
+    cfg.blob_va = vcpu_blob_va();
+    cfg.sp_el1 = frame->sp;
+    cfg.pc = frame->pc;
+    cfg.cpsr = frame->cpsr;
+    cfg.x0 = frame->x[0];
+    if ((ret = vel1_vcpu_create( &vt->vcpu, &cfg )))
+        vcpu_fatal( "vel1_vcpu_create for thread %04x failed %d (hv %#x; at most %u vCPUs per process)\n",
+                    (UINT)GetCurrentThreadId(), ret, vt->vcpu.last_hv_err, VEL1_MAX_VCPUS - 1 );
+    pthread_setspecific( vcpu_key, vt );
+    vcpu_store_full( vt, frame );
+    vcpu_note_entered();  /* before the first vel1_run: from now on gmm's TLBIs are real */
+    TRACE( "thread %04x: vCPU up, pc %#llx sp %#llx\n", (UINT)GetCurrentThreadId(), (unsigned long long)frame->pc,
+           (unsigned long long)frame->sp );
+    memset( &level, 0, sizeof(level) );
+    vcpu_loop( vt, &level );
+    vcpu_fatal( "level 0 of thread %04x returned\n", (UINT)GetCurrentThreadId() );
+}
+
+/***********************************************************************
+ *           vcpu_user_mode_callback
+ *
+ * KeUserModeCallback: run KiUserCallbackDispatcher on this thread's vCPU in a nested frame and loop until its
+ * NtCallbackReturn. The outer syscall's registers come back from the outer frame when it returns.
+ */
+NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_len )
+{
+    struct vcpu_thread *vt = vcpu_current();
+    struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
+    struct syscall_frame *outer = thread_data->syscall_frame, inner;
+    struct vcpu_level level, *outer_level = vt->level;
+    vel1_regs regs;
+    int err;
+
+    /* a unix-call exit saved only q8-q15 and no FPCR/FPSR; the outer return rewrites all of them after a
+     * callback, so take the exact FP state now (unless a context change already set it) */
+    if (!(outer->restore_flags & (CONTEXT_FLOATING_POINT & ~CONTEXT_ARM64)))
+    {
+        vt->hv_depth++;
+        err = vel1_regs_get( &vt->vcpu, &regs, VEL1_R_FPCR | VEL1_R_FPSR, VEL1_R_ALL_SIMD );
+        vt->hv_depth--;
+        if (err) vcpu_fatal( "vel1_regs_get(fp) failed %d\n", err );
+        outer->fpcr = regs.fpcr;
+        outer->fpsr = regs.fpsr;
+        memcpy( outer->v, regs.v, sizeof(outer->v) );
+    }
+
+    memset( &inner, 0, sizeof(inner) );
+    inner.prev_frame = outer;
+    inner.sp = user_sp;
+    inner.pc = (ULONG64)pKiUserCallbackDispatcher;
+    inner.x[0] = user_sp;
+    inner.x[18] = (ULONG64)NtCurrentTeb();
+    inner.cpsr = outer->cpsr;
+    thread_data->syscall_frame = &inner;
+
+    memset( &regs, 0, sizeof(regs) );
+    regs.x[0] = inner.x[0];
+    regs.x[18] = inner.x[18];
+    regs.sp_el1 = inner.sp;
+    regs.pc = inner.pc;
+    atomic_store( &vt->in_syscall, 0 );
+    vt->hv_depth++;
+    err = vel1_regs_set( &vt->vcpu, &regs, VEL1_R_X(0) | VEL1_R_X(18) | VEL1_R_SP_EL1 | VEL1_R_PC, 0 );
+    vt->hv_depth--;
+    if (err) vcpu_fatal( "vel1_regs_set(callback) failed %d\n", err );
+
+    memset( &level, 0, sizeof(level) );
+    vcpu_loop( vt, &level );
+
+    thread_data->syscall_frame = outer;
+    vt->level = outer_level;
+    outer_level->callback_ran = TRUE;
+    atomic_store( &vt->in_syscall, 1 );
+    *ret_ptr = level.cb_ret_ptr;
+    *ret_len = level.cb_ret_len;
+    return level.cb_status;
+}
+
+/***********************************************************************
+ *           vcpu_callback_return
+ *
+ * NtCallbackReturn: end the innermost vcpu_loop level; its caller (vcpu_user_mode_callback) returns the result.
+ */
+NTSTATUS vcpu_callback_return( void *ret_ptr, ULONG ret_len, NTSTATUS status )
+{
+    struct vcpu_thread *vt = vcpu_current();
+    struct vcpu_level *level = vt->level;
+
+    if (!get_syscall_frame()->prev_frame || !level->prev) return STATUS_NO_CALLBACK_ACTIVE;
+    level->cb_ret_ptr = ret_ptr;
+    level->cb_ret_len = ret_len;
+    level->cb_status = status;
+    level->done = TRUE;
+    return STATUS_SUCCESS;
+}
+
+/***********************************************************************
+ *           vcpu_signal_kick
+ *
+ * From usr1_handler / quit_handler, on the thread itself. If the thread is in (or about to enter) the guest, kick
+ * the vCPU and return TRUE: the loop handles the request from the full guest state. Otherwise return FALSE and the
+ * handler takes the existing in-syscall path against the frame. No hv_* call (vcpu_el1.h D8).
+ */
+BOOL vcpu_signal_kick( BOOL quit )
+{
+    struct vcpu_thread *vt = vcpu_current();
+
+    if (!vt) return FALSE;
+    if (quit) atomic_store( &vt->quit, 1 );
+    if (atomic_load( &vt->in_syscall )) return FALSE;
+    vel1_kick_self( &vt->vcpu );
+    return TRUE;
+}
+
+/***********************************************************************
+ *           vcpu_syscall_fault_resume
+ *
+ * handle_syscall_fault: where a host fault inside a syscall returns to, or NULL (the fault is not inside a
+ * syscall dispatched by the loop: a host bug).
+ */
+void *vcpu_syscall_fault_resume(void)
+{
+    struct vcpu_thread *vt = vcpu_current();
+
+    if (!vt || !vt->level || !atomic_load( &vt->in_syscall ) || vt->hv_depth) return NULL;
+    return vt->level->resume;
+}
+
+/***********************************************************************
+ *           vcpu_thread_exit
+ *
+ * On the exiting thread, before pthread_exit: give the vCPU back (vcpu_el1.h D16).
+ */
+void vcpu_thread_exit(void)
+{
+    struct vcpu_thread *vt;
+    int ret;
+
+    if (!vcpu_mode || !(vt = vcpu_current())) return;
+    if (vt->hv_depth || vel1_in_guest( &vt->vcpu ))
+    {
+        ERR( "thread %04x exits inside a vel1 call: its vCPU slot leaks\n", (UINT)GetCurrentThreadId() );
+        return;
+    }
+    pthread_setspecific( vcpu_key, NULL );
+    if ((ret = vel1_vcpu_destroy( &vt->vcpu ))) ERR( "vel1_vcpu_destroy failed %d\n", ret );
+    else free( vt );
+}
+
 /***********************************************************************
  *           vcpu_init_process
  *
@@ -428,6 +896,7 @@ void vcpu_init_process(void)
     memset( &info, 0, sizeof(info) );
     if (!env || !*env || !strcmp( env, "0" )) return;
     vcpu_mode = strcmp( env, "selftest" ) ? 1 : 2;
+    if (pthread_key_create( &vcpu_key, NULL )) vcpu_fatal( "pthread_key_create failed\n" );
 
     block_all_signals( &old );  /* the kicker thread inherits this */
     ret = vel1_vm_create( vel1_hv_live_ops(), VCPU_IPA_BITS, &info );

@@ -34,6 +34,7 @@
 #include "windef.h"
 #include "winnt.h"
 #include "winternl.h"
+#include "wine/asm.h"
 #include "vcpu_arm64.h"
 
 /* CONTEXT_* bits as the asm dispatcher return tests them in restore_flags (without CONTEXT_ARM64) */
@@ -298,5 +299,36 @@ void vcpu_return_plan( const struct syscall_frame *frame, ULONG64 retval, BOOL c
         *simd_mask = VEL1_R_ALL_SIMD;
     }
 }
+
+
+/***********************************************************************
+ *           vcpu_call_syscall
+ *
+ * Call a syscall implementation the way __wine_syscall_dispatcher does: x0-x7 from regs, then stack_bytes of
+ * arguments copied from the guest stack to the bottom of our stack (signal_arm64.c: the ArgumentTable loop).
+ */
+__ASM_GLOBAL_FUNC( vcpu_call_syscall,
+                   "stp x29, x30, [sp, #-16]!\n\t"
+                   "mov x29, sp\n\t"
+                   "mov x9, x0\n\t"             /* func */
+                   "mov x15, x1\n\t"            /* regs */
+                   "add x12, x3, #15\n\t"
+                   "and x12, x12, #~15\n\t"
+                   "sub sp, sp, x12\n\t"
+                   "cbz x3, 2f\n\t"
+                   "mov x13, #0\n"
+                   "1:\tldr x14, [x2, x13]\n\t"
+                   "str x14, [sp, x13]\n\t"
+                   "add x13, x13, #8\n\t"
+                   "cmp x13, x3\n\t"
+                   "b.lo 1b\n"
+                   "2:\tldp x0, x1, [x15]\n\t"
+                   "ldp x2, x3, [x15, #16]\n\t"
+                   "ldp x4, x5, [x15, #32]\n\t"
+                   "ldp x6, x7, [x15, #48]\n\t"
+                   "blr x9\n\t"
+                   "mov sp, x29\n\t"
+                   "ldp x29, x30, [sp], #16\n\t"
+                   "ret" )
 
 #endif /* __APPLE__ && __aarch64__ */
