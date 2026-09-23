@@ -13,6 +13,9 @@
 //           +0x860 chain t_8..t_1: `tlbi vale1is, x(k-1)` (t_k falls through to t_1), then
 //           `dsb ish; isb; hvc #0x102; b .` — the proven G9 stub's sequence (gmm_guest.S _gmm_g9_tlbi) with the
 //           VAs in x0..x7 instead of a mailbox. Touches no memory and no register but reads x0..x(k-1).
+//   +0x890  whole-VMID TLBI entry [D18] (vel1_run_tlbi_all only; gmm's all=1): `dsb ish; tlbi vmalle1is; dsb ish;
+//           isb; hvc #0x102; b .` (hvc at +0x8A0; the blob ends at +0x8A8). Touches no memory and reads no register.
+//           Everything before +0x890 is byte-identical to the vel1-gmm-v1 blob.
 //
 // Immediates must match VEL1_HVC_* in vcpu_el1.h; build.sh disassembles this object and checks every slot.
 
@@ -63,6 +66,14 @@ Lvel1_tlbi_t1:
   dsb ish
   isb
 _vel1_tlbi_hvc:
+  hvc #0x102
+  b .
+_vel1_tlbi_all:       // +0x890: the whole-VMID entry (vel1_run_tlbi_all only)
+  dsb ish
+  tlbi vmalle1is
+  dsb ish
+  isb
+_vel1_tlbi_all_hvc:   // +0x8A0
   hvc #0x102
   b .
 _vel1_blob_end:
