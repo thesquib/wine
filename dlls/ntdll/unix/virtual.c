@@ -76,6 +76,8 @@
 # include <mach/task.h>
 # include <mach/thread_state.h>
 # include <mach/vm_map.h>
+# include <mach/vm_statistics.h>
+# include <libkern/OSCacheControl.h>
 #undef host_page_size
 #endif
 
@@ -98,6 +100,7 @@
 #include "wine/list.h"
 #include "wine/rbtree.h"
 #include "unix_private.h"
+#include "vcpu_arm64.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(virtual);
@@ -270,6 +273,13 @@ struct file_view
 #define VPROT_PLACEHOLDER      0x0400
 #define VPROT_FREE_PLACEHOLDER 0x0800
 #define VPROT_NATIVE           0x1000
+#define VPROT_HOSTONLY         0x2000  /* vCPU mode: never visible to the guest (kernel stacks) */
+
+#if defined(__APPLE__) && defined(__aarch64__)
+C_ASSERT( VPROT_READ == VCPU_VPROT_READ && VPROT_WRITE == VCPU_VPROT_WRITE && VPROT_EXEC == VCPU_VPROT_EXEC );
+C_ASSERT( VPROT_WRITECOPY == VCPU_VPROT_WRITECOPY && VPROT_GUARD == VCPU_VPROT_GUARD );
+C_ASSERT( VPROT_COMMITTED == VCPU_VPROT_COMMITTED && VPROT_WRITEWATCH == VCPU_VPROT_WRITEWATCH );
+#endif
 
 /* Conversion from VPROT_* to Win32 flags */
 static const BYTE VIRTUAL_Win32Flags[16] =
@@ -393,13 +403,23 @@ static inline BOOL is_vprot_exec_write( BYTE vprot )
     return (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY));
 }
 
+/* the mmap() fd argument for anonymous memory: in the vCPU mode every fixed anonymous mapping carries the tag gmm's
+ * backing guard requires of memory it maps into the guest (openrosetta gmm README, rule R1) */
+static inline int anon_mmap_tag(void)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (vcpu_mode) return VM_MAKE_TAG( 250 );
+#endif
+    return -1;
+}
+
 /* mmap() anonymous memory at a fixed address */
 void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
-    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
+    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, anon_mmap_tag(), 0 );
 }
 
 /* allocate anonymous mmap() memory at any address */
@@ -1866,6 +1886,117 @@ static void unmap_area( void *start, size_t size )
 
 
 /***********************************************************************
+ *           is_guest_view
+ *
+ * vCPU mode: whether the view's memory is mapped into the guest through gmm. System views (not ours) and host-only
+ * views (kernel stacks) are not.
+ */
+static inline BOOL is_guest_view( const struct file_view *view )
+{
+    return vcpu_mode && !(view->protect & (VPROT_SYSTEM | VPROT_HOSTONLY));
+}
+
+#if defined(__APPLE__) && defined(__aarch64__)
+
+static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vprot );
+
+/***********************************************************************
+ *           vcpu_sync_pages
+ *
+ * vCPU mode: set gmm's stage-1 state of every 4K page in the range from its protection byte, with set/clear
+ * applied (the vCPU-mode body of mprotect_range: the host mapping stays RW, all protection is in stage 1).
+ * Pages that become executable get their I-cache lines invalidated: the host wrote them through the D-cache.
+ */
+static int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear )
+{
+    unsigned char s1[512];
+    char *addr = ROUND_ADDR( base, page_mask );
+    size_t i, n, npages = ROUND_SIZE( base, size, page_mask ) >> page_shift;
+    BYTE vprot;
+    int ret;
+
+    if (!npages) return 0;
+    if (get_vprot_range_size( addr, npages << page_shift, ~0, &vprot ) == npages << page_shift)
+    {
+        unsigned char target = vcpu_vprot_to_s1( (vprot & ~clear) | set );
+        if ((ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, npages << page_shift, target )))
+        {
+            ERR( "gmm_vm_range_set %p-%p %#x failed %d\n", addr, addr + (npages << page_shift), target, ret );
+            return -1;
+        }
+        if (target & GMM_S1_X) sys_icache_invalidate( addr, npages << page_shift );
+        return 0;
+    }
+    while (npages)
+    {
+        n = min( npages, ARRAY_SIZE(s1) );
+        for (i = 0; i < n; i++)
+        {
+            s1[i] = vcpu_vprot_to_s1( (get_page_vprot( addr + (i << page_shift) ) & ~clear) | set );
+            if (s1[i] & GMM_S1_X) sys_icache_invalidate( addr + (i << page_shift), page_size );
+        }
+        if ((ret = gmm_vm_range_set_pages( vcpu_gmm(), (UINT_PTR)addr, n, s1 )))
+        {
+            ERR( "gmm_vm_range_set_pages %p-%p failed %d\n", addr, addr + (n << page_shift), ret );
+            return -1;
+        }
+        addr += n << page_shift;
+        npages -= n;
+    }
+    return 0;
+}
+
+/* vCPU mode: revoke every page of the range from the guest (decommit, free); returns once no vCPU can reach it */
+static void vcpu_revoke_pages( const void *base, size_t size )
+{
+    char *addr = ROUND_ADDR( base, page_mask );
+    int ret;
+
+    size = ROUND_SIZE( base, size, page_mask );
+    if (size && (ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, size, GMM_S1_NONE )))
+    {
+        ERR( "gmm_vm_range_set %p-%p NONE failed %d\n", addr, addr + size, ret );
+        abort();  /* the host mapping change that follows would pull memory out from under the guest */
+    }
+}
+
+static NTSTATUS vcpu_view_created( struct file_view *view )
+{
+    int ret;
+
+    if ((ret = gmm_view_map( vcpu_gmm(), (UINT_PTR)view->base, view->size, view->base, GMM_S1_NONE )))
+    {
+        ERR( "gmm_view_map %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
+        return STATUS_NO_MEMORY;
+    }
+    if (vcpu_sync_pages( view->base, view->size, 0, 0 ))
+    {
+        vcpu_revoke_pages( view->base, view->size );
+        return STATUS_NO_MEMORY;
+    }
+    return STATUS_SUCCESS;
+}
+
+static void vcpu_view_deleted( struct file_view *view )
+{
+    int ret;
+
+    if ((ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size )))
+    {
+        ERR( "gmm_view_unmap %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
+        abort();
+    }
+}
+
+#else
+static inline int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear ) { return 0; }
+static inline void vcpu_revoke_pages( const void *base, size_t size ) {}
+static inline NTSTATUS vcpu_view_created( struct file_view *view ) { return STATUS_SUCCESS; }
+static inline void vcpu_view_deleted( struct file_view *view ) {}
+#endif
+
+
+/***********************************************************************
  *           alloc_view
  *
  * Allocate a new view. virtual_mutex must be held by caller.
@@ -1920,6 +2051,7 @@ static void unregister_view( struct file_view *view )
  */
 static void delete_view( struct file_view *view ) /* [in] View */
 {
+    if (is_guest_view( view )) vcpu_view_deleted( view );
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     set_page_vprot( view->base, view->size, 0 );
     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
@@ -1982,6 +2114,18 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
 
     register_view( view );
     kernel_writewatch_register_range( view, view->base, view->size );
+
+    if (is_guest_view( view ))
+    {
+        NTSTATUS status = vcpu_view_created( view );
+        if (status)
+        {
+            set_page_vprot( base, size, 0 );
+            unregister_view( view );
+            free_view( view );
+            return status;
+        }
+    }
 
     *view_ret = view;
     return STATUS_SUCCESS;
@@ -2083,6 +2227,12 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
     char *addr = ROUND_ADDR( base, host_page_mask );
     int prot, next;
     BYTE vprot;
+
+    if (vcpu_mode)
+    {
+        struct file_view *view = find_view( base, 0 );
+        if (view && is_guest_view( view )) return vcpu_sync_pages( base, size, set, clear );
+    }
 
     size = ROUND_SIZE( base, size, host_page_mask );
 
@@ -2574,6 +2724,8 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         unix_prot = get_unix_prot( vprot & ~VPROT_WRITEWATCH );
 
     unix_prot &= ~PROT_EXEC;
+    /* vCPU mode: guest memory is RW on the host from reservation on; stage 1 does the protection (gmm rule R1) */
+    if (vcpu_mode && !(vprot & (VPROT_SYSTEM | VPROT_HOSTONLY))) unix_prot = PROT_READ | PROT_WRITE;
 
     if (base)
     {
@@ -2649,6 +2801,18 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     /* last page doesn't need to be a full page */
     if (map_addr + map_size >= (char *)view->base + view->size) host_size = map_size;
     else host_size = ROUND_SIZE( 0, map_size, host_page_mask );
+
+    if (is_guest_view( view ))
+    {
+        /* vCPU mode: gmm can only map anonymous memory into the guest, so files are always read */
+        if (vprot & VPROT_WRITE)
+        {
+            ERR( "vCPU mode: shared writable file mapping %p-%p not supported\n", map_addr, map_addr + map_size );
+            return STATUS_NOT_SUPPORTED;
+        }
+        pread( fd, map_addr, size, offset );
+        return STATUS_SUCCESS;
+    }
 
     /* only try mmap if media is not removable (or if we require write access),
        and if alignment is correct */
@@ -2752,6 +2916,23 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
     }
     else host_end = ROUND_ADDR( base + size, host_page_mask );
 
+    if (is_guest_view( view ))
+    {
+        char *start = size ? base : view->base, *end = start + (size ? size : view->size);
+
+        /* gmm first (rule R3); then only whole host pages are replaced, by fresh RW zero pages; the decommitted 4K
+         * pages of a partly kept host page are zeroed by hand (openrosetta relay: Wine zeroes) */
+        vcpu_revoke_pages( start, end - start );
+        if (host_start < host_end)
+        {
+            anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+            if (start < host_start) memset( start, 0, host_start - start );
+            if (host_end < end) memset( host_end, 0, end - host_end );
+        }
+        else memset( start, 0, end - start );
+        set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
+        return STATUS_SUCCESS;
+    }
     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
@@ -2830,6 +3011,7 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
             return STATUS_CONFLICTING_ADDRESSES;
         }
 
+        if (is_guest_view( view )) vcpu_revoke_pages( base, size );
         status = remove_pages_from_view( view, base, size );
         if (status) return status;
 
@@ -2837,9 +3019,11 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
         if (status) return status;
     }
 
+    if (is_guest_view( view )) vcpu_revoke_pages( view->base, view->size );
     view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
     set_page_vprot( view->base, view->size, 0 );
-    anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ), PROT_NONE, 0 );
+    anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ),
+                     is_guest_view( view ) ? PROT_READ | PROT_WRITE : PROT_NONE, 0 );
     return STATUS_SUCCESS;
 }
 
@@ -2882,6 +3066,7 @@ static NTSTATUS free_pages( struct file_view *view, char *base, size_t size )
         }
     }
 
+    if (is_guest_view( view )) vcpu_revoke_pages( base, size );  /* before the host unmap (rule R5) */
     status = remove_pages_from_view( view, base, size );
     if (!status)
     {
@@ -3005,7 +3190,7 @@ static NTSTATUS map_pe_header( void *ptr, size_t size, size_t map_size, int fd, 
 
     map_size &= ~host_page_mask;
 
-    if (!*removable && map_size)
+    if (!*removable && map_size && !vcpu_mode)  /* vCPU mode: images are always read (gmm maps anonymous memory only) */
     {
         if (mmap( ptr, map_size, PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE, fd, 0 ) != MAP_FAILED)
         {
@@ -3952,6 +4137,123 @@ static void *alloc_virtual_heap( SIZE_T size )
     return anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
 }
 
+
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           vcpu_selftest_memory
+ *
+ * PMW_VCPU=selftest: drive the gmm hooks through the NT memory API and check each result from inside the guest with
+ * vcpu_selftest_probe (read then write one word). Exits the process.
+ */
+static void vcpu_selftest_memory(void)
+{
+    static int fails;
+    char *p = NULL, *big = NULL;
+    SIZE_T size;
+    ULONG old_prot;
+    uint64_t old;
+    vel1_exit e;
+    vel1_exit_kind k;
+    NTSTATUS status;
+
+#define ST_CHECK(cond, ...) do { if (!(cond)) { fails++; fprintf( stderr, "vcpu selftest: FAIL: " __VA_ARGS__ ); } \
+                                  else fprintf( stderr, "vcpu selftest: ok: " __VA_ARGS__ ); } while (0)
+#define ST_GMM() do { int n_ = gmm_debug_check( vcpu_gmm() ); ST_CHECK( !n_, "gmm_debug_check %d\n", n_ ); } while (0)
+
+    /* commit RW: the guest reads zero and writes; the host sees the write */
+    size = 0x10000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&p, 0, &size, MEM_RESERVE | MEM_COMMIT,
+                                      PAGE_READWRITE );
+    ST_CHECK( !status && (UINT_PTR)p >= 0x100000000, "commit RW 64K at %p (%#x)\n", p, (UINT)status );
+    if (status) goto done;
+    k = vcpu_selftest_probe( (UINT_PTR)p, 0x1111, &old, &e );
+    ST_CHECK( k == VEL1_EXIT_HOSTCALL && old == 0 && *(uint64_t *)p == 0x1111, "guest RW access (%s, old %#llx)\n",
+              vel1_exit_kind_name( k ), (unsigned long long)old );
+    ST_GMM();
+
+    /* lower to RO: the vCPU holds a cached RW entry, so this needs the shootdown to have worked */
+    size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&p, &size, PAGE_READONLY, &old_prot );
+    k = vcpu_selftest_probe( (UINT_PTR)p, 0x2222, &old, &e );
+    ST_CHECK( !status && k == VEL1_EXIT_FAULT_SYNC && e.fclass == VEL1_FC_DATA_ABORT && e.is_write &&
+              e.far == (UINT_PTR)p && *(uint64_t *)p == 0x1111, "RO write faults after TLBI (%s far %#llx)\n",
+              vel1_exit_kind_name( k ), (unsigned long long)e.far );
+    size = 0x1000;
+    status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&p, &size, PAGE_READWRITE, &old_prot );
+    k = vcpu_selftest_probe( (UINT_PTR)p, 0x3333, &old, &e );
+    ST_CHECK( !status && k == VEL1_EXIT_HOSTCALL && old == 0x1111, "raise back to RW (%s)\n", vel1_exit_kind_name( k ) );
+
+    /* guard page on the second 4K page (same 16K host page) */
+    size = 0x1000;
+    {
+        char *g = p + 0x1000;
+        status = NtProtectVirtualMemory( NtCurrentProcess(), (void **)&g, &size, PAGE_READWRITE | PAGE_GUARD,
+                                         &old_prot );
+        k = vcpu_selftest_probe( (UINT_PTR)p + 0x1000, 0x4444, &old, &e );
+        ST_CHECK( !status && k == VEL1_EXIT_FAULT_SYNC && e.far == (UINT_PTR)p + 0x1000, "guard page faults (%s)\n",
+                  vel1_exit_kind_name( k ) );
+        k = vcpu_selftest_probe( (UINT_PTR)p, 0x5555, &old, &e );
+        ST_CHECK( k == VEL1_EXIT_HOSTCALL, "neighbour of the guard page still RW (%s)\n", vel1_exit_kind_name( k ) );
+    }
+    ST_GMM();
+
+    /* decommit 4K inside a kept 16K host page: faults, and recommits as zero */
+    size = 0x1000;
+    {
+        char *d = p + 0x2000;
+        *(uint64_t *)d = 0x6666;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&d, &size, MEM_DECOMMIT );
+        k = vcpu_selftest_probe( (UINT_PTR)p + 0x2000, 0x7777, &old, &e );
+        ST_CHECK( !status && k == VEL1_EXIT_FAULT_SYNC, "decommitted 4K faults (%s)\n", vel1_exit_kind_name( k ) );
+        size = 0x1000;
+        d = p + 0x2000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&d, 0, &size, MEM_COMMIT, PAGE_READWRITE );
+        k = vcpu_selftest_probe( (UINT_PTR)p + 0x2000, 0x8888, &old, &e );
+        ST_CHECK( !status && k == VEL1_EXIT_HOSTCALL && old == 0, "recommitted 4K reads zero (%s, %#llx)\n",
+                  vel1_exit_kind_name( k ), (unsigned long long)old );
+    }
+    ST_GMM();
+
+    /* release: faults, and gmm no longer maps the host page */
+    size = 0;
+    status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&p, &size, MEM_RELEASE );
+    k = vcpu_selftest_probe( (UINT_PTR)p, 0x9999, &old, &e );
+    ST_CHECK( !status && k == VEL1_EXIT_FAULT_SYNC && !gmm_vm_s2_mapped( vcpu_gmm(), (UINT_PTR)p ),
+              "released range faults and is stage-2 unmapped (%s)\n", vel1_exit_kind_name( k ) );
+    ST_GMM();
+
+    /* a 1 GiB reservation, then a commit in the middle of it */
+    size = 0x40000000;
+    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&big, 0, &size, MEM_RESERVE, PAGE_NOACCESS );
+    ST_CHECK( !status, "reserve 1 GiB at %p (%#x)\n", big, (UINT)status );
+    if (!status)
+    {
+        char *c = big + 0x20000000;
+        size = 0x10000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&c, 0, &size, MEM_COMMIT, PAGE_READWRITE );
+        k = vcpu_selftest_probe( (UINT_PTR)big + 0x20000000, 0xaaaa, &old, &e );
+        ST_CHECK( !status && k == VEL1_EXIT_HOSTCALL, "commit inside the reservation (%s)\n", vel1_exit_kind_name( k ) );
+        k = vcpu_selftest_probe( (UINT_PTR)big, 0xbbbb, &old, &e );
+        ST_CHECK( k == VEL1_EXIT_FAULT_SYNC, "reserved-only page faults (%s)\n", vel1_exit_kind_name( k ) );
+        size = 0;
+        status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&big, &size, MEM_RELEASE );
+        ST_CHECK( !status, "release 1 GiB (%#x)\n", (UINT)status );
+    }
+    ST_GMM();
+
+    /* KUSER: the guest's 0x7ffe0000 reads the host copy */
+    k = vcpu_selftest_probe( 0x7ffe0000, 0, &old, &e );
+    ST_CHECK( k == VEL1_EXIT_FAULT_SYNC && e.is_write, "KUSER is read-only in the guest (%s)\n",
+              vel1_exit_kind_name( k ) );
+
+done:
+    fprintf( stderr, "vcpu selftest %s (%d failures)\n", fails ? "FAIL" : "PASS", fails );
+    exit( fails ? 1 : 0 );
+#undef ST_CHECK
+#undef ST_GMM
+}
+#endif
+
 /***********************************************************************
  *           virtual_init
  */
@@ -3971,6 +4273,8 @@ void virtual_init(void)
     pthread_mutex_init( &virtual_mutex, &attr );
     pthread_mutexattr_destroy( &attr );
 
+    vcpu_init_process();  /* PMW_VCPU: the VM and gmm must exist before the first view */
+
 #ifdef __aarch64__
     host_page_size = sysconf( _SC_PAGESIZE );
     host_page_mask = host_page_size - 1;
@@ -3988,7 +4292,12 @@ void virtual_init(void)
 
     if (preload_info && *preload_info)
         for (i = 0; (*preload_info)[i].size; i++)
+        {
+            /* vCPU mode: the arm64 loader publishes its PAGEZERO (0x1000 up to 4 GiB) as a reservation, but nothing
+             * can be mapped there (PAGEZERO sets the VM map's minimum address) and 0x1000 is not host-page aligned */
+            if (vcpu_mode && (UINT_PTR)(*preload_info)[i].addr < 0x100000000) continue;
             mmap_add_reserved_area( (*preload_info)[i].addr, (*preload_info)[i].size );
+        }
 
     mmap_init( preload_info ? *preload_info : NULL );
 
@@ -4028,6 +4337,9 @@ void virtual_init(void)
     size = (char *)address_space_start - (char *)0x10000;
     if (size && mmap_is_in_reserved_area( (void*)0x10000, size ) == 1)
         anon_mmap_fixed( (void *)0x10000, size, PROT_READ | PROT_WRITE, 0 );
+
+    /* vCPU mode: nothing can be mapped below the 4 GiB PAGEZERO; start the address space above it */
+    if (vcpu_mode) address_space_start = (void *)0x100000000;
 }
 
 
@@ -4367,16 +4679,31 @@ TEB *virtual_alloc_first_teb(void)
     SIZE_T block_size = signal_stack_mask + 1;
     SIZE_T total = 32 * block_size;
 
-    /* reserve space for shared user data */
-    status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
-                                      MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
-    if (status)
+    if (vcpu_mode)
     {
-        ERR( "wine: failed to map the shared user data: %08x\n", status );
-        exit(1);
+        /* vCPU mode: nothing can be mapped below the 4 GiB PAGEZERO. The guest's 0x7ffe0000 is a gmm page
+         * (vcpu_arm64.c); the unix side works on a host copy, republished into it once the server's is mapped. */
+        if ((user_shared_data = anon_mmap_alloc( host_page_size, PROT_READ | PROT_WRITE )) == MAP_FAILED)
+        {
+            ERR( "wine: failed to allocate the shared user data\n" );
+            exit(1);
+        }
+    }
+    else
+    {
+        /* reserve space for shared user data */
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&user_shared_data, 0, &data_size,
+                                          MEM_RESERVE | MEM_COMMIT, PAGE_READONLY );
+        if (status)
+        {
+            ERR( "wine: failed to map the shared user data: %08x\n", status );
+            exit(1);
+        }
     }
 
-    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 ? limit_2g - 1 : 0, &total,
+    /* the 64-bit TEB/PEB block goes below 2 GiB for the 32-bit views; the vCPU mode is 64-bit only and has no
+     * address space there */
+    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 && !vcpu_mode ? limit_2g - 1 : 0, &total,
                              MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
@@ -4386,6 +4713,9 @@ TEB *virtual_alloc_first_teb(void)
     teb = init_teb( ptr, FALSE );
     pthread_key_create( &teb_key, NULL );
     pthread_setspecific( teb_key, teb );
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (vcpu_mode == 2) vcpu_selftest_memory();  /* PMW_VCPU=selftest: exits */
+#endif
     return teb;
 }
 
@@ -4774,8 +5104,8 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
-    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED,
-                       limit_low, limit_high, 0 );
+    status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED |
+                       (vcpu_mode && !guard_page ? VPROT_HOSTONLY : 0), limit_low, limit_high, 0 );
     if (status != STATUS_SUCCESS) goto done;
 
 #ifdef VALGRIND_STACK_REGISTER
@@ -4829,7 +5159,22 @@ void virtual_map_user_shared_data(void)
         ERR( "failed to open the USD section: %08x\n", status );
         exit(1);
     }
-    if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
+    if (vcpu_mode)
+    {
+        /* vCPU mode: map the server's page anywhere and republish it into the guest's 0x7ffe0000 */
+        void *old = user_shared_data, *ptr;
+
+        if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
+            (ptr = mmap( NULL, host_page_size, PROT_READ, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+        {
+            ERR( "failed to map the process USD: %d\n", res );
+            exit(1);
+        }
+        user_shared_data = ptr;
+        munmap( old, host_page_size );
+        vcpu_start_kuser_publisher( user_shared_data );
+    }
+    else if ((res = server_get_unix_fd( section, 0, &fd, &needs_close, NULL, NULL )) ||
         (user_shared_data != mmap( user_shared_data, page_size, PROT_READ, MAP_SHARED|MAP_FIXED, fd, 0 )))
     {
         ERR( "failed to remap the process USD: %d\n", res );
@@ -5090,7 +5435,8 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
         if (!(get_unix_prot( vprot & ~VPROT_WRITEWATCH ) & PROT_WRITE))
             return STATUS_INVALID_USER_BUFFER;
     }
-    if (*has_write_watch)
+    /* vCPU mode: the host view is always writable, nothing to enable */
+    if (*has_write_watch && !vcpu_mode)
         mprotect_range( addr, size, 0, VPROT_WRITEWATCH );  /* temporarily enable write access */
     return STATUS_SUCCESS;
 }
@@ -5580,7 +5926,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
-        else madvise( base, size, MADV_DONTNEED );
+        else if (!is_guest_view( view )) madvise( base, size, MADV_DONTNEED );  /* never under gmm (rule R2) */
     }
     else  /* commit the pages */
     {
@@ -7385,7 +7731,7 @@ static NTSTATUS prefetch_memory( HANDLE process, ULONG_PTR count,
     {
         base = ROUND_ADDR( addresses[i].VirtualAddress, host_page_mask );
         size = ROUND_SIZE( addresses[i].VirtualAddress, addresses[i].NumberOfBytes, host_page_mask );
-        madvise( base, size, MADV_WILLNEED );
+        if (!vcpu_mode) madvise( base, size, MADV_WILLNEED );  /* never under gmm (rule R2) */
     }
 
     return STATUS_SUCCESS;
