@@ -27,10 +27,12 @@
 extern int vcpu_mode;
 extern void vcpu_init_process(void);
 extern void vcpu_start_kuser_publisher( const void *src );
+extern void vcpu_thread_exit(void);
 #else
 #define vcpu_mode 0
 static inline void vcpu_init_process(void) {}
 static inline void vcpu_start_kuser_publisher( const void *src ) {}
+static inline void vcpu_thread_exit(void) {}
 #endif
 
 #ifdef __aarch64__
@@ -83,6 +85,17 @@ extern void *vcpu_kuser_host(void);
 extern void vcpu_note_entered(void);
 extern vel1_exit_kind vcpu_selftest_probe( uint64_t va, uint64_t value, uint64_t *old, vel1_exit *e );
 
+/* the thread loop (vcpu_arm64.c) */
+extern void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame );
+extern NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_len );
+extern NTSTATUS vcpu_callback_return( void *ret_ptr, ULONG ret_len, NTSTATUS status );
+extern BOOL vcpu_signal_kick( BOOL quit );
+extern void *vcpu_syscall_fault_resume(void);
+
+/* exception delivery and suspend against the frame (signal_arm64.c) */
+extern void vcpu_raise_exception( struct syscall_frame *frame, EXCEPTION_RECORD *rec, ULONG64 pc_adjust );
+extern void vcpu_suspend( struct syscall_frame *frame, BOOL in_syscall );
+
 /* pure translation helpers (vcpu_pure_arm64.c) */
 extern unsigned char vcpu_vprot_to_s1( unsigned char vprot );
 extern BOOL vcpu_exit_to_exception( const vel1_exit *e, const struct syscall_frame *frame, EXCEPTION_RECORD *rec,
@@ -91,6 +104,7 @@ extern void vcpu_frame_from_syscall_exit( struct syscall_frame *frame, const vel
 extern void vcpu_frame_from_unix_call_exit( struct syscall_frame *frame, const vel1_exit *e );
 extern void vcpu_frame_from_regs( struct syscall_frame *frame, const vel1_regs *r );
 extern void vcpu_regs_from_frame( vel1_regs *r, const struct syscall_frame *frame );
+extern ULONG64 vcpu_call_syscall( void *func, const ULONG64 *regs, const ULONG64 *stack_args, ULONG64 stack_bytes );
 extern void vcpu_return_plan( const struct syscall_frame *frame, ULONG64 retval, BOOL callback_ran, vel1_regs *r,
                               uint64_t *core_mask, uint32_t *simd_mask );
 

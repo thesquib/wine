@@ -93,6 +93,7 @@
 #include "winioctl.h"
 #include "winternl.h"
 #include "unix_private.h"
+#include "vcpu_arm64.h"
 #ifdef __APPLE__
 #include "msync.h"
 #endif
@@ -2043,6 +2044,17 @@ static void load_ntdll_functions( HMODULE module )
         *p__wine_unix_call_dispatcher_arm64ec = __wine_unix_call_dispatcher;
     }
     else *p__wine_unix_call_dispatcher = __wine_unix_call_dispatcher;
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (vcpu_mode)
+    {
+        /* vCPU mode: PE code reaches the unix side through the guest stubs in the vector blob, which exit to the
+         * thread loop with an hvc (vcpu_el1.h D5) */
+        *p__wine_syscall_dispatcher = (void *)(vcpu_blob_va() + VEL1_SYSCALL_STUB_OFF);
+        if (p__wine_unix_call_dispatcher_arm64ec)
+            *p__wine_unix_call_dispatcher_arm64ec = (void *)(vcpu_blob_va() + VEL1_UNIXCALL_STUB_OFF);
+        else *p__wine_unix_call_dispatcher = (void *)(vcpu_blob_va() + VEL1_UNIXCALL_STUB_OFF);
+    }
+#endif
 #undef GET_FUNC
 }
 

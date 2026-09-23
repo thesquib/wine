@@ -5311,15 +5311,17 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     NTSTATUS ret = STATUS_ACCESS_VIOLATION;
     ULONG_PTR err = rec->ExceptionInformation[0];
     void *addr = (void *)rec->ExceptionInformation[1];
-    char *page = ROUND_ADDR( addr, host_page_mask );
+    /* vCPU mode: guest faults are exact per 4K page (stage 1), not per host page */
+    char *page = ROUND_ADDR( addr, vcpu_mode ? page_mask : host_page_mask );
+    size_t fault_page_size = vcpu_mode ? page_size : host_page_size;
     BYTE vprot;
 
     mutex_lock( &virtual_mutex );  /* no need for signal masking inside signal handler */
-    vprot = get_host_page_vprot( page );
+    vprot = vcpu_mode ? get_page_vprot( page ) : get_host_page_vprot( page );
 
 #ifdef __APPLE__
-    /* Rosetta on Apple Silicon misreports certain write faults as read faults. */
-    if (err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
+    /* Rosetta on Apple Silicon misreports certain write faults as read faults (the vCPU mode's ESR is exact) */
+    if (!vcpu_mode && err == EXCEPTION_READ_FAULT && (get_unix_prot( vprot ) & PROT_READ))
     {
         WARN( "treating read fault in a readable page as a write fault, addr %p\n", addr );
         err = EXCEPTION_WRITE_FAULT;
@@ -5331,11 +5333,11 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
         struct thread_stack_info stack_info;
         if (!is_inside_thread_stack( page, &stack_info ))
         {
-            set_page_vprot_bits( page, host_page_size, 0, VPROT_GUARD );
-            mprotect_range( page, host_page_size, 0, 0 );
+            set_page_vprot_bits( page, fault_page_size, 0, VPROT_GUARD );
+            mprotect_range( page, fault_page_size, 0, 0 );
             ret = STATUS_GUARD_PAGE_VIOLATION;
         }
-        else ret = grow_thread_stack( page, &stack_info );
+        else ret = grow_thread_stack( ROUND_ADDR( addr, host_page_mask ), &stack_info );
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
@@ -5349,12 +5351,12 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
             }
             else
             {
-                set_page_vprot_bits( page, host_page_size, 0, VPROT_WRITEWATCH );
-                mprotect_range( page, host_page_size, 0, 0 );
+                set_page_vprot_bits( page, fault_page_size, 0, VPROT_WRITEWATCH );
+                mprotect_range( page, fault_page_size, 0, 0 );
             }
         }
         /* ignore fault if page is writable now */
-        if (get_unix_prot( get_host_page_vprot( page )) & PROT_WRITE)
+        if (get_unix_prot( vcpu_mode ? get_page_vprot( page ) : get_host_page_vprot( page )) & PROT_WRITE)
         {
             if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ))
                 ret = STATUS_SUCCESS;

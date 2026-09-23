@@ -787,6 +787,95 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
 }
 
 
+#if defined(__APPLE__)
+/***********************************************************************
+ *           context_from_frame
+ *
+ * vCPU mode: the full guest state in the frame -> a CONTEXT (save_context's job for a sigcontext).
+ */
+static void context_from_frame( CONTEXT *context, const struct syscall_frame *frame )
+{
+    context->ContextFlags = CONTEXT_FULL | CONTEXT_ARM64_X18;
+    memcpy( context->X, frame->x, sizeof(frame->x) );
+    context->Fp   = frame->fp;
+    context->Lr   = frame->lr;
+    context->Sp   = frame->sp;
+    context->Pc   = frame->pc;
+    context->Cpsr = frame->cpsr;
+    context->Fpcr = frame->fpcr;
+    context->Fpsr = frame->fpsr;
+    memcpy( context->V, frame->v, sizeof(context->V) );
+}
+
+
+/***********************************************************************
+ *           vcpu_raise_exception
+ *
+ * vCPU mode: setup_raise_exception against the frame instead of a sigcontext. The frame holds the full guest
+ * state at the fault (PC = the faulting instruction); on return it resumes into KiUserExceptionDispatcher, or
+ * wherever the debugger said.
+ */
+void vcpu_raise_exception( struct syscall_frame *frame, EXCEPTION_RECORD *rec, ULONG64 pc_adjust )
+{
+    CHPE_V2_CPU_AREA_INFO *chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    struct exc_stack_layout *stack;
+    CONTEXT context;
+
+    context_from_frame( &context, frame );
+    context.ContextFlags |= CONTEXT_FLOATING_POINT;
+    context.Pc += pc_adjust;
+    if (!chpe || !chpe->InSimulation)
+    {
+        NTSTATUS status = send_debug_event( rec, &context, TRUE, TRUE );
+        if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
+        {
+            NtSetContextThread( GetCurrentThread(), &context );
+            return;
+        }
+    }
+
+    /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
+    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context.Pc -= 4;
+
+    stack = virtual_setup_exception( (void *)(frame->sp & ~15), sizeof(*stack), rec );
+    stack->rec = *rec;
+    stack->context = context;
+    context_init_empty_xstate( &stack->context, stack->redzone );
+    stack->sp = stack->context.Sp;
+    stack->pc = stack->context.Pc;
+
+    frame->sp = (ULONG_PTR)stack;
+    frame->pc = (ULONG_PTR)pKiUserExceptionDispatcher;
+    frame->x[18] = (ULONG_PTR)NtCurrentTeb();
+}
+
+
+/***********************************************************************
+ *           vcpu_suspend
+ *
+ * vCPU mode: usr1_handler's suspend, run by the thread loop against the frame. in_syscall: the thread stopped at a
+ * syscall / unix call boundary (the in-syscall branch); otherwise it was interrupted in user mode.
+ */
+void vcpu_suspend( struct syscall_frame *frame, BOOL in_syscall )
+{
+    CONTEXT context;
+
+    if (in_syscall)
+    {
+        context.ContextFlags = CONTEXT_FULL | CONTEXT_ARM64_X18 | CONTEXT_EXCEPTION_REQUEST;
+        NtGetContextThread( GetCurrentThread(), &context );
+    }
+    else
+    {
+        context_from_frame( &context, frame );
+        context.ContextFlags |= CONTEXT_FLOATING_POINT | CONTEXT_EXCEPTION_REPORTING;
+    }
+    wait_suspend( &context );
+    NtSetContextThread( GetCurrentThread(), &context );
+}
+#endif
+
+
 /***********************************************************************
  *           call_user_apc_dispatcher
  */
@@ -1028,6 +1117,9 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
     stack->sp   = frame->sp;
     stack->pc   = frame->pc;
     memcpy( stack->args_data, args, len );
+#if defined(__APPLE__)
+    if (vcpu_mode) return vcpu_user_mode_callback( sp, ret_ptr, ret_len );
+#endif
     return call_user_mode_callback( sp, ret_ptr, ret_len, pKiUserCallbackDispatcher, NtCurrentTeb() );
 }
 
@@ -1037,6 +1129,9 @@ NTSTATUS KeUserModeCallback( ULONG id, const void *args, ULONG len, void **ret_p
  */
 NTSTATUS WINAPI NtCallbackReturn( void *ret_ptr, ULONG ret_len, NTSTATUS status )
 {
+#if defined(__APPLE__)
+    if (vcpu_mode) return vcpu_callback_return( ret_ptr, ret_len, status );
+#endif
     if (!get_syscall_frame()->prev_frame) return STATUS_NO_CALLBACK_ACTIVE;
     user_mode_callback_return( ret_ptr, ret_len, status, NtCurrentTeb() );
 }
@@ -1097,6 +1192,24 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
         PC_sig(context)      = (ULONG_PTR)longjmp;
         ntdll_get_thread_data()->jmp_buf = NULL;
     }
+#if defined(__APPLE__)
+    else if (vcpu_mode)
+    {
+        /* vCPU mode: return the exception code as the syscall's status through the thread loop */
+        void *resume = vcpu_syscall_fault_resume();
+
+        if (!resume)
+        {
+            ERR( "vCPU mode: host fault outside a syscall, code %#x addr %p pc %p\n", (UINT)rec->ExceptionCode,
+                 rec->ExceptionAddress, (void *)PC_sig(context) );
+            abort_process( 1 );
+        }
+        TRACE( "returning to the vCPU loop ret=%08x\n", (UINT)rec->ExceptionCode );
+        REGn_sig(0, context) = (ULONG_PTR)resume;
+        REGn_sig(1, context) = (int)rec->ExceptionCode;
+        PC_sig(context)      = (ULONG_PTR)longjmp;
+    }
+#endif
     else
     {
         TRACE( "returning to user mode ip=%p ret=%08x\n", (void *)frame->pc, rec->ExceptionCode );
@@ -1326,6 +1439,10 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *context = sigcontext;
 
+#if defined(__APPLE__)
+    /* vCPU mode: in the guest, the loop aborts the thread itself (never pthread_exit from inside vel1_run) */
+    if (vcpu_mode && vcpu_signal_kick( TRUE )) return;
+#endif
     if (!is_inside_syscall( SP_sig(context) )) user_mode_abort_thread( 0, get_syscall_frame() );
     abort_thread(0);
 }
@@ -1371,6 +1488,12 @@ static void usr1_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     extern const ULONG_PTR __wine_syscall_dispatcher_user_stack;
     extern const ULONG_PTR __wine_unix_call_dispatcher_kernel_stack_ptr;
     extern const ULONG_PTR __wine_unix_call_dispatcher_user_stack;
+
+#if defined(__APPLE__)
+    /* vCPU mode: in the guest, kick the vCPU and let the loop suspend from the full guest state; otherwise the
+     * thread is inside a syscall and the frame-based branch below applies (is_inside_syscall is always true) */
+    if (vcpu_mode && vcpu_signal_kick( FALSE )) return;
+#endif
 
     /* if we're in a syscall dispatcher, but not yet on the syscall stack, construct
      * the frame now from the signal context. */
@@ -1631,6 +1754,9 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, BOOL suspend, 
     syscall_frame_fixup_for_fastpath( frame );
 
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
+#if defined(__APPLE__)
+    if (vcpu_mode) vcpu_thread_start( frame );  /* the thread's user mode runs in its own vCPU */
+#endif
 }
 
 
