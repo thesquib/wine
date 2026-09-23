@@ -4161,6 +4161,10 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     get_vprot_flags( protect, &vprot, FALSE );
     vprot |= sec_flags;
     if (!(sec_flags & SEC_RESERVE)) vprot |= VPROT_COMMITTED;
+#ifdef MEM_WINE_HOST_ONLY
+    /* vCPU mode: a view only unix-side code reads stays a live host mapping instead of a guest copy */
+    if (vcpu_mode && (alloc_type & MEM_WINE_HOST_ONLY)) vprot |= VPROT_HOSTONLY;
+#endif
 
     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
 

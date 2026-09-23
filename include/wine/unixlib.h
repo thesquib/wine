@@ -83,6 +83,12 @@ NTSYSAPI BOOLEAN KeAddSystemServiceTable( ULONG_PTR *funcs, ULONG_PTR *counters,
  * calls the shim in place of any ServiceTable entry equal to an implementation. One list per index, a later call
  * replaces it. Call it right after KeAddSystemServiceTable. */
 NTSYSAPI void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsigned int count );
+
+/* arm64 vCPU mode: NtMapViewOfSection allocation type for a view only unix-side code reads. The guest can only be
+ * given a copy of a file (gmm maps anonymous memory), taken when the view is mapped; a section another process
+ * keeps writing (the server's session shared memory) must therefore stay a host mapping to be read live. Never
+ * visible to PE code; ignored outside vCPU mode. Unused by Windows (0x0200_0000-0x0800_0000 are free). */
+#define MEM_WINE_HOST_ONLY 0x08000000
 #endif
 NTSYSAPI void ntdll_add_syscall_debug_info( UINT idx, const char **syscall_names,
                                             const char **usercall_names );
