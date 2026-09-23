@@ -64,6 +64,10 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(vcpu);
 
+/* the +syscall relay tracing of user callbacks (loader.c; the EL0 path calls them from asm) */
+extern void trace_usercall( UINT id, ULONG_PTR *args, ULONG len );
+extern void trace_userret( void *ret_ptr, ULONG len, NTSTATUS status, UINT id );
+
 int vcpu_mode;
 
 #define VCPU_IPA_BITS      40
@@ -527,7 +531,7 @@ struct vcpu_thread
     atomic_int          quit;
     volatile sig_atomic_t hv_depth;    /* inside a vel1 call: never destroy the vCPU from a handler then */
     struct vcpu_level  *level;
-    uint64_t            exits, syscalls, unix_calls, faults, kicks;
+    uint64_t            exits, syscalls, unix_calls, faults, kicks, kick_failures;
 };
 
 static pthread_key_t vcpu_key;
@@ -607,9 +611,11 @@ static void vcpu_dump_exit( const char *what, struct vcpu_thread *vt, const vel1
                  (unsigned long long)frame->pc, (UINT)frame->cpsr );
     }
     if (vt)
-        fprintf( stderr, " thread %04x: exits %llu syscalls %llu unix calls %llu faults %llu kicks %llu\n",
+        fprintf( stderr, " thread %04x: exits %llu syscalls %llu unix calls %llu faults %llu kicks %llu "
+                 "(signal failures %llu)\n",
                  (UINT)GetCurrentThreadId(), (unsigned long long)vt->exits, (unsigned long long)vt->syscalls,
-                 (unsigned long long)vt->unix_calls, (unsigned long long)vt->faults, (unsigned long long)vt->kicks );
+                 (unsigned long long)vt->unix_calls, (unsigned long long)vt->faults, (unsigned long long)vt->kicks,
+                 (unsigned long long)vt->kick_failures );
 }
 
 static void DECLSPEC_NORETURN vcpu_fatal_exit( struct vcpu_thread *vt, const vel1_exit *e,
@@ -872,7 +878,10 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
         vcpu_store_full( vt, frame );  /* guard page, write watch or stack growth handled: retry */
         return;
     }
-    vcpu_raise_exception( frame, &rec, pc_adjust );
+    if (e->fclass == VEL1_FC_BRK && (e->esr & 0xffff) == 0xf003)
+        vcpu_raise_exception_second_chance( frame, &rec );  /* __fastfail: no user handlers, as on the EL0 path */
+    else
+        vcpu_raise_exception( frame, &rec, pc_adjust );
     vcpu_store_full( vt, frame );
 }
 
@@ -1030,8 +1039,12 @@ NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_le
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
     struct syscall_frame *outer = thread_data->syscall_frame, inner;
     struct vcpu_level level, *outer_level = vt->level;
+    struct callback_stack_layout *stack = (struct callback_stack_layout *)user_sp;
+    void *exception_list = NtCurrentTeb()->Tib.ExceptionList;  /* call_user_mode_callback saves and restores it */
     vel1_regs regs;
     int err;
+
+    if (thread_data->syscall_trace) trace_usercall( stack->id, (ULONG_PTR *)stack->args, stack->len );
 
     /* a unix-call exit saved only q8-q15 and no FPCR/FPSR, and the outer return rewrites all of them after a
      * callback: take the exact FP state from the vCPU, once per exit (before the first callback runs other guest
@@ -1085,6 +1098,8 @@ NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_le
     atomic_store( &vt->in_syscall, 1 );
     *ret_ptr = level.cb_ret_ptr;
     *ret_len = level.cb_ret_len;
+    NtCurrentTeb()->Tib.ExceptionList = exception_list;
+    if (thread_data->syscall_trace) trace_userret( level.cb_ret_ptr, level.cb_ret_len, level.cb_status, stack->id );
     TRACE( "user callback done: status %#x, %u bytes\n", (unsigned int)level.cb_status, (unsigned int)level.cb_ret_len );
     return level.cb_status;
 }
@@ -1121,7 +1136,13 @@ BOOL vcpu_signal_kick( BOOL quit )
     if (!vt) return FALSE;
     if (quit) atomic_store( &vt->quit, 1 );
     if (atomic_load( &vt->in_syscall )) return FALSE;
-    vel1_kick_self( &vt->vcpu );
+    if (vel1_kick_self( &vt->vcpu ) == VEL1_KICK_SIGNAL_FAILED)
+    {
+        /* the kick stays pending in vel1 (D8); the loop will see it at its next entry. In a signal handler: no ERR */
+        static const char msg[] = "wine: vCPU mode: kick signal failed (kicker semaphore)\n";
+        write( 2, msg, sizeof(msg) - 1 );
+        vt->kick_failures++;
+    }
     return TRUE;
 }
 

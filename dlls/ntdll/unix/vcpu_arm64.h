@@ -92,8 +92,24 @@ extern NTSTATUS vcpu_callback_return( void *ret_ptr, ULONG ret_len, NTSTATUS sta
 extern BOOL vcpu_signal_kick( BOOL quit );
 extern void *vcpu_syscall_fault_resume(void);
 
+/* the kernel-stack layout KeUserModeCallback hands to KiUserCallbackDispatcher (signal_arm64.c builds it) */
+struct callback_stack_layout
+{
+    void                *args;           /* 000 arguments */
+    ULONG                len;            /* 008 arguments len */
+    ULONG                id;             /* 00c function id */
+    ULONG64              unknown;        /* 010 */
+    ULONG64              lr;             /* 018 */
+    ULONG64              sp;             /* 020 sp+pc (machine frame) */
+    ULONG64              pc;             /* 028 */
+    BYTE                 args_data[0];   /* 030 copied argument data*/
+};
+C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
+C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
+
 /* exception delivery and suspend against the frame (signal_arm64.c) */
 extern void vcpu_raise_exception( struct syscall_frame *frame, EXCEPTION_RECORD *rec, ULONG64 pc_adjust );
+extern void vcpu_raise_exception_second_chance( struct syscall_frame *frame, EXCEPTION_RECORD *rec );
 extern void vcpu_suspend( struct syscall_frame *frame, BOOL in_syscall );
 
 /* Apple-ABI shims for syscalls whose parameters Windows code passes differently (vcpu_shims_arm64.c, generated) */
