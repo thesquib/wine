@@ -80,6 +80,10 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
 /* process state (vcpu_arm64.c) */
 extern gmm_t *vcpu_gmm(void);
+/* virtual.c asserts gmm rule R2 (no host change to a stage-2 mapped host page) before each host mapping change of
+ * guest memory: always with multi-chunk stage-2 runs (their retained chunks make a violation reachable), else with
+ * PMW_VCPU_PARANOID=1 */
+extern int vcpu_check_s2;
 extern uint64_t vcpu_blob_va(void);
 extern void *vcpu_kuser_host(void);
 extern void vcpu_note_entered(void);
