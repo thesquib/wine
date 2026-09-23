@@ -264,6 +264,9 @@ static void *tlbi_thread( void *arg )
     }
 }
 
+static uint64_t tlbi_initiator_count, tlbi_initiator_ticks, tlbi_initiator_refused;
+static int tlbi_initiator( const uint64_t *va, size_t count, int all );  /* after struct vcpu_thread */
+
 static int tlbi_sync( void *ctx, const uint64_t *va, size_t count, int all )
 {
     uint64_t *mailbox = (uint64_t *)(sys_page + SYS_MAILBOX_OFF);
@@ -276,6 +279,16 @@ static int tlbi_sync( void *ctx, const uint64_t *va, size_t count, int all )
     if (!atomic_load( &any_entered )) return 0;
 
     start = mach_absolute_time();
+    if ((ret = tlbi_initiator( va, count, all )) <= 0)
+    {
+        if (!ret)
+        {
+            tlbi_initiator_count++;
+            tlbi_initiator_ticks += mach_absolute_time() - start;
+        }
+        return ret;
+    }
+
     pthread_mutex_lock( &tlbi_mutex );
     if (all || count > MAILBOX_MAX_VA) mailbox[0] = 0;
     else
@@ -400,6 +413,24 @@ static void vcpu_selftest(void)
     fprintf( stderr, "vcpu selftest: guest stub on this thread: %s, %.1f us\n", ret ? "FAIL" : "ok",
              ticks_to_us( mach_absolute_time() - start ));
     if (ret) exit( 1 );
+    /* the initiator forms (D18) on this vCPU, stopped at the stub's exit: the VA stub at blob +0x820 and the
+     * whole-VMID entry at +0x890 */
+    start = mach_absolute_time();
+    ret = vel1_run_tlbi( v, &va, 1 );
+    fprintf( stderr, "vcpu selftest: initiator TLBI (1 VA): %s (%d), %.1f us\n", ret ? "FAIL" : "ok", ret,
+             ticks_to_us( mach_absolute_time() - start ));
+    if (ret) exit( 1 );
+    start = mach_absolute_time();
+    ret = vel1_run_tlbi_all( v );
+    fprintf( stderr, "vcpu selftest: initiator TLBI (all): %s (%d), %.1f us\n", ret ? "FAIL" : "ok", ret,
+             ticks_to_us( mach_absolute_time() - start ));
+    if (ret) exit( 1 );
+    /* and the same two through the backend, which now picks the executor (this thread has no vcpu_thread) */
+    start = mach_absolute_time();
+    ret = tlbi_sync( NULL, &va, 1, 0 );
+    fprintf( stderr, "vcpu selftest: backend TLBI after the initiator forms: %s, %.1f us\n", ret ? "FAIL" : "ok",
+             ticks_to_us( mach_absolute_time() - start ));
+    if (ret) exit( 1 );
     /* vCPUs belong to their creating thread, and on macOS the Windows main thread (where the memory selftest runs)
      * is not this one (loader.c: apple_wine_thread): give this one back, the probe makes its own */
     if ((ret = vel1_vcpu_destroy( v ))) fprintf( stderr, "vcpu selftest: vel1_vcpu_destroy %d\n", ret );
@@ -507,6 +538,37 @@ extern void trace_sysret( UINT id, ULONG_PTR retval );
 static inline struct vcpu_thread *vcpu_current(void)
 {
     return pthread_getspecific( vcpu_key );
+}
+
+/***********************************************************************
+ *           tlbi_initiator
+ *
+ * The initiator TLBI (vcpu_el1.h D18, openrosetta's G11): a Windows thread calling gmm from a syscall or a fault
+ * has its own vCPU stopped at an exit, and that vCPU runs the shootdown itself (~1.2 us against the executor's
+ * round trip). gmm is called from virtual.c's uninterrupted sections, so no host signal lands in the stub; a
+ * kick's CANCELED is absorbed by vel1 and stays pending. Returns 0 done, -1 fatal (the vCPU is left unresumable,
+ * and gmm aborts on a failed backend), 1 not usable here: a host-only thread, a handler that interrupted a vel1
+ * call (hv_depth), a vCPU that is not live, VEL1_E_BUSY (state restored, shootdown not done), or a shape the stub
+ * does not take; the caller uses the parked executor then.
+ */
+static int tlbi_initiator( const uint64_t *va, size_t count, int all )
+{
+    struct vcpu_thread *vt = vcpu_current();
+    int ret;
+
+    if (!vt || vt->hv_depth || !(all || (count && count <= VEL1_TLBI_MAX_VA))) return 1;
+    vt->hv_depth++;
+    ret = all ? vel1_run_tlbi_all( &vt->vcpu ) : vel1_run_tlbi( &vt->vcpu, va, count );
+    vt->hv_depth--;
+    if (!ret) return 0;
+    if (ret == VEL1_E_HV || ret == VEL1_E_STUB || ret == VEL1_E_ARG)
+    {
+        ERR( "initiator TLBI failed %d (hv %#x) on thread %04x\n", ret, vt->vcpu.last_hv_err,
+             (UINT)GetCurrentThreadId() );
+        return -1;
+    }
+    tlbi_initiator_refused++;  /* VEL1_E_BUSY, VEL1_E_STATE, VEL1_E_WRONG_THREAD */
+    return 1;
 }
 
 /* What a signal handler would have blocked (its sa_mask) plus SIGQUIT: the loop does handler work (suspend, faults)
