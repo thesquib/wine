@@ -1592,6 +1592,17 @@ static void run_wineboot( WCHAR *env, SIZE_T size )
     LARGE_INTEGER timeout;
     unsigned int status;
     int count = 1;
+    const char *skip = getenv( "PMW_SKIP_WINEBOOT" );
+
+    /* PROTON_DARWIN (dev only): skip wineboot --init, which would start services.exe, winedevice.exe and
+     * plugplay.exe, so the first program of a session is the only PE process. For the arm64 vCPU mode's first
+     * milestone (M1a), where every PE process is its own VM; a trivial console program needs none of them.
+     * See proton-darwin docs/macos/vcpu-m1-first-prefix-2026-09-23.md. */
+    if (skip && *skip && *skip != '0')
+    {
+        WARN( "PMW_SKIP_WINEBOOT set, not running wineboot\n" );
+        return;
+    }
 
     init_unicode_string( &nameW, eventW );
     InitializeObjectAttributes( &attr, &nameW, OBJ_OPENIF, 0, NULL );
