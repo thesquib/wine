@@ -1967,6 +1967,9 @@ static NTSTATUS vcpu_view_created( struct file_view *view )
     if ((ret = gmm_view_map( vcpu_gmm(), (UINT_PTR)view->base, view->size, view->base, GMM_S1_NONE )))
     {
         ERR( "gmm_view_map %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
+        /* gmm rule R7: only resource exhaustion is an allocation failure; anything else is a view-tree or backing
+         * bug, and the caller's host unmap could then pull memory out from under a live stage-2 mapping */
+        if (ret != GMM_ENOPT && ret != GMM_ENOIPA) abort();
         return STATUS_NO_MEMORY;
     }
     if (vcpu_sync_pages( view->base, view->size, 0, 0 ))
@@ -2918,10 +2921,12 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
 
     if (is_guest_view( view ))
     {
-        char *start = size ? base : view->base, *end = start + (size ? size : view->size);
+        char *start = base, *end = base + size;
 
         /* gmm first (rule R3); then only whole host pages are replaced, by fresh RW zero pages; the decommitted 4K
-         * pages of a partly kept host page are zeroed by hand (openrosetta relay: Wine zeroes) */
+         * pages of a partly kept host page are zeroed by hand (openrosetta relay: Wine zeroes). The view's size is
+         * 4K-granular, so the whole-view case must not round its end up to a host page. */
+        host_end = ROUND_ADDR( end, host_page_mask );
         vcpu_revoke_pages( start, end - start );
         if (host_start < host_end)
         {
@@ -4214,6 +4219,32 @@ static void vcpu_selftest_memory(void)
     }
     ST_GMM();
 
+    /* whole-view decommit of a 4K-granular view (20K: one full and one partial 16K host page) */
+    {
+        char *w = NULL;
+        size = 0x5000;
+        status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&w, 0, &size, MEM_RESERVE | MEM_COMMIT,
+                                          PAGE_READWRITE );
+        if (!status)
+        {
+            *(uint64_t *)(w + 0x4000) = 0x1212;
+            size = 0;
+            status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&w, &size, MEM_DECOMMIT );
+            k = vcpu_selftest_probe( (UINT_PTR)w + 0x4000, 0x3434, &old, &e );
+            ST_CHECK( !status && k == VEL1_EXIT_FAULT_SYNC, "whole-view decommit of a 20K view faults (%s)\n",
+                      vel1_exit_kind_name( k ) );
+            size = 0x5000;
+            status = NtAllocateVirtualMemory( NtCurrentProcess(), (void **)&w, 0, &size, MEM_COMMIT, PAGE_READWRITE );
+            k = vcpu_selftest_probe( (UINT_PTR)w + 0x4000, 0x5656, &old, &e );
+            ST_CHECK( !status && k == VEL1_EXIT_HOSTCALL && old == 0, "its partial host page recommits as zero (%s)\n",
+                      vel1_exit_kind_name( k ) );
+            size = 0;
+            NtFreeVirtualMemory( NtCurrentProcess(), (void **)&w, &size, MEM_RELEASE );
+        }
+        else ST_CHECK( 0, "allocate 20K (%#x)\n", (UINT)status );
+    }
+    ST_GMM();
+
     /* release: faults, and gmm no longer maps the host page */
     size = 0;
     status = NtFreeVirtualMemory( NtCurrentProcess(), (void **)&p, &size, MEM_RELEASE );
@@ -5084,8 +5115,8 @@ NTSTATUS virtual_set_tls_information( PROCESS_TLS_INFORMATION *t )
 /***********************************************************************
  *           virtual_alloc_thread_stack
  */
-NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
-                                     SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page )
+static NTSTATUS alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                    SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page, BOOL host_only )
 {
     struct file_view *view;
     NTSTATUS status;
@@ -5105,7 +5136,7 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
 
     status = map_view( &view, NULL, size, 0, VPROT_READ | VPROT_WRITE | VPROT_COMMITTED |
-                       (vcpu_mode && !guard_page ? VPROT_HOSTONLY : 0), limit_low, limit_high, 0 );
+                       (host_only ? VPROT_HOSTONLY : 0), limit_low, limit_high, 0 );
     if (status != STATUS_SUCCESS) goto done;
 
 #ifdef VALGRIND_STACK_REGISTER
@@ -5137,6 +5168,23 @@ NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, UL
 done:
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
     return status;
+}
+
+NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                     SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page )
+{
+    return alloc_thread_stack( stack, limit_low, limit_high, reserve_size, commit_size, guard_page, FALSE );
+}
+
+/***********************************************************************
+ *           virtual_alloc_kernel_stack
+ *
+ * The thread's kernel stack: in the vCPU mode a host-only view, never mapped into the guest (it keeps its host guard
+ * page). Other guard-less stacks (the ARM64EC emulator stack) stay guest-visible.
+ */
+NTSTATUS virtual_alloc_kernel_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high, SIZE_T size )
+{
+    return alloc_thread_stack( stack, limit_low, limit_high, size, size, FALSE, vcpu_mode != 0 );
 }
 
 
@@ -5825,7 +5873,7 @@ void virtual_set_large_address_space(void)
     {
         if (!is_wow64())
         {
-            address_space_start = (void *)0x10000;
+            if (!vcpu_mode) address_space_start = (void *)0x10000;  /* vCPU mode: nothing below 4 GiB */
 #ifndef __APPLE__  /* don't free the zerofill section on macOS */
             if ((main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) &&
                 (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))

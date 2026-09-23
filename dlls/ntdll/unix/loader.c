@@ -1356,6 +1356,7 @@ static NTSTATUS steamclient_setup_trampolines( void *args )
         if (memcmp(src_sec[i].Name, ".text", 5)) continue;
         addr = (void *)(((UINT_PTR)src_mod + src_sec[i].VirtualAddress) & ~page_mask);
         size = (src_sec[i].Misc.VirtualSize + page_mask) & ~page_mask;
+        if (vcpu_mode) continue;  /* guest memory: host-RW already, and never host-mprotected (gmm rule R2) */
         if (noexec_cached) mprotect(addr, size, PROT_READ);
         else mprotect(addr, size, PROT_READ|PROT_WRITE|PROT_EXEC);
     }

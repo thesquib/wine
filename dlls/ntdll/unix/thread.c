@@ -1290,7 +1290,7 @@ NTSTATUS init_thread_stack( TEB *teb, ULONG_PTR limit, SIZE_T reserve_size, SIZE
     }
 
     /* kernel stack */
-    if ((status = virtual_alloc_thread_stack( &stack, limit_4g, 0, kernel_stack_size, kernel_stack_size, FALSE )))
+    if ((status = virtual_alloc_kernel_stack( &stack, limit_4g, 0, kernel_stack_size )))
         return status;
     thread_data->kernel_stack = stack.DeallocationStack;
 

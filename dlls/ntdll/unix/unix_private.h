@@ -312,6 +312,8 @@ extern NTSTATUS virtual_alloc_teb( TEB **ret_teb );
 extern void virtual_free_teb( TEB *teb );
 extern NTSTATUS virtual_clear_tls_index( ULONG index );
 extern NTSTATUS virtual_set_tls_information( PROCESS_TLS_INFORMATION *t );
+extern NTSTATUS virtual_alloc_kernel_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
+                                            SIZE_T size );
 extern NTSTATUS virtual_alloc_thread_stack( INITIAL_TEB *stack, ULONG_PTR limit_low, ULONG_PTR limit_high,
                                             SIZE_T reserve_size, SIZE_T commit_size, BOOL guard_page );
 extern void virtual_map_user_shared_data(void);
