@@ -96,6 +96,11 @@ extern void *vcpu_syscall_fault_resume(void);
 extern void vcpu_raise_exception( struct syscall_frame *frame, EXCEPTION_RECORD *rec, ULONG64 pc_adjust );
 extern void vcpu_suspend( struct syscall_frame *frame, BOOL in_syscall );
 
+/* Apple-ABI shims for syscalls whose parameters Windows code passes differently (vcpu_shims_arm64.c, generated) */
+struct vcpu_syscall_shim { const void *func, *shim; };
+extern const struct vcpu_syscall_shim vcpu_syscall_shims[];
+extern const unsigned int vcpu_syscall_shim_count;
+
 /* pure translation helpers (vcpu_pure_arm64.c) */
 extern unsigned char vcpu_vprot_to_s1( unsigned char vprot );
 extern BOOL vcpu_exit_to_exception( const vel1_exit *e, const struct syscall_frame *frame, EXCEPTION_RECORD *rec,
