@@ -52,6 +52,7 @@ SOURCES = \
 	syscall.c \
 	sysparams.c \
 	systray.c \
+	vcpu_shims_arm64.c \
 	vertical.c \
 	vulkan.c \
 	window.c \

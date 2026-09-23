@@ -130,6 +130,11 @@ static ULONG64 vcpu_shim_NtDelayExecution( ULONG64 a0, ULONG64 a1 )
     return (ULONG64)(ULONG)NtDelayExecution( (BOOLEAN)(ULONG_PTR)a0, (const LARGE_INTEGER *)(ULONG_PTR)a1 );
 }
 
+static ULONG64 vcpu_shim_NtDeleteAtom( ULONG64 a0 )
+{
+    return (ULONG64)(ULONG)NtDeleteAtom( (RTL_ATOM)(ULONG_PTR)a0 );
+}
+
 static ULONG64 vcpu_shim_NtDeviceIoControlFile( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULONG64 a3, ULONG64 a4, ULONG64 a5, ULONG64 a6, ULONG64 a7, ULONG64 a8, ULONG64 a9 )
 {
     return (ULONG64)(ULONG)NtDeviceIoControlFile( (HANDLE)(ULONG_PTR)a0, (HANDLE)(ULONG_PTR)a1, (PIO_APC_ROUTINE)(ULONG_PTR)a2, (void *)(ULONG_PTR)a3, (IO_STATUS_BLOCK *)(ULONG_PTR)a4, (ULONG)(ULONG_PTR)a5, (void *)(ULONG_PTR)a6, (ULONG)(ULONG_PTR)a7, (void *)(ULONG_PTR)a8, (ULONG)(ULONG_PTR)a9 );
@@ -205,6 +210,11 @@ static ULONG64 vcpu_shim_NtQueryEaFile( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULON
     return (ULONG64)(ULONG)NtQueryEaFile( (HANDLE)(ULONG_PTR)a0, (IO_STATUS_BLOCK *)(ULONG_PTR)a1, (void *)(ULONG_PTR)a2, (ULONG)(ULONG_PTR)a3, (BOOLEAN)(ULONG_PTR)a4, (void *)(ULONG_PTR)a5, (ULONG)(ULONG_PTR)a6, (ULONG *)(ULONG_PTR)a7, (BOOLEAN)(ULONG_PTR)a8 );
 }
 
+static ULONG64 vcpu_shim_NtQueryInformationAtom( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULONG64 a3, ULONG64 a4 )
+{
+    return (ULONG64)(ULONG)NtQueryInformationAtom( (RTL_ATOM)(ULONG_PTR)a0, (ATOM_INFORMATION_CLASS)(ULONG_PTR)a1, (void *)(ULONG_PTR)a2, (ULONG)(ULONG_PTR)a3, (ULONG *)(ULONG_PTR)a4 );
+}
+
 static ULONG64 vcpu_shim_NtReadFile( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULONG64 a3, ULONG64 a4, ULONG64 a5, ULONG64 a6, ULONG64 a7, ULONG64 a8 )
 {
     return (ULONG64)(ULONG)NtReadFile( (HANDLE)(ULONG_PTR)a0, (HANDLE)(ULONG_PTR)a1, (PIO_APC_ROUTINE)(ULONG_PTR)a2, (void *)(ULONG_PTR)a3, (IO_STATUS_BLOCK *)(ULONG_PTR)a4, (void *)(ULONG_PTR)a5, (ULONG)(ULONG_PTR)a6, (LARGE_INTEGER *)(ULONG_PTR)a7, (ULONG *)(ULONG_PTR)a8 );
@@ -243,6 +253,11 @@ static ULONG64 vcpu_shim_NtSetDebugFilterState( ULONG64 a0, ULONG64 a1, ULONG64 
 static ULONG64 vcpu_shim_NtSetDefaultLocale( ULONG64 a0, ULONG64 a1 )
 {
     return (ULONG64)(ULONG)NtSetDefaultLocale( (BOOLEAN)(ULONG_PTR)a0, (LCID)(ULONG_PTR)a1 );
+}
+
+static ULONG64 vcpu_shim_NtSetDefaultUILanguage( ULONG64 a0 )
+{
+    return (ULONG64)(ULONG)NtSetDefaultUILanguage( (LANGID)(ULONG_PTR)a0 );
 }
 
 static ULONG64 vcpu_shim_NtSetTimer( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULONG64 a3, ULONG64 a4, ULONG64 a5, ULONG64 a6 )
@@ -312,6 +327,7 @@ const struct vcpu_syscall_shim vcpu_syscall_shims[] =
     { (const void *)NtCreateTransaction, (const void *)vcpu_shim_NtCreateTransaction },
     { (const void *)NtCreateUserProcess, (const void *)vcpu_shim_NtCreateUserProcess },
     { (const void *)NtDelayExecution, (const void *)vcpu_shim_NtDelayExecution },
+    { (const void *)NtDeleteAtom, (const void *)vcpu_shim_NtDeleteAtom },
     { (const void *)NtDeviceIoControlFile, (const void *)vcpu_shim_NtDeviceIoControlFile },
     { (const void *)NtDuplicateToken, (const void *)vcpu_shim_NtDuplicateToken },
     { (const void *)NtFsControlFile, (const void *)vcpu_shim_NtFsControlFile },
@@ -327,6 +343,7 @@ const struct vcpu_syscall_shim vcpu_syscall_shims[] =
     { (const void *)NtQueryDirectoryFile, (const void *)vcpu_shim_NtQueryDirectoryFile },
     { (const void *)NtQueryDirectoryObject, (const void *)vcpu_shim_NtQueryDirectoryObject },
     { (const void *)NtQueryEaFile, (const void *)vcpu_shim_NtQueryEaFile },
+    { (const void *)NtQueryInformationAtom, (const void *)vcpu_shim_NtQueryInformationAtom },
     { (const void *)NtReadFile, (const void *)vcpu_shim_NtReadFile },
     { (const void *)NtReadFileScatter, (const void *)vcpu_shim_NtReadFileScatter },
     { (const void *)NtReleaseKeyedEvent, (const void *)vcpu_shim_NtReleaseKeyedEvent },
@@ -335,6 +352,7 @@ const struct vcpu_syscall_shim vcpu_syscall_shims[] =
     { (const void *)NtSecureConnectPort, (const void *)vcpu_shim_NtSecureConnectPort },
     { (const void *)NtSetDebugFilterState, (const void *)vcpu_shim_NtSetDebugFilterState },
     { (const void *)NtSetDefaultLocale, (const void *)vcpu_shim_NtSetDefaultLocale },
+    { (const void *)NtSetDefaultUILanguage, (const void *)vcpu_shim_NtSetDefaultUILanguage },
     { (const void *)NtSetTimer, (const void *)vcpu_shim_NtSetTimer },
     { (const void *)NtSetTimerResolution, (const void *)vcpu_shim_NtSetTimerResolution },
     { (const void *)NtSignalAndWaitForSingleObject, (const void *)vcpu_shim_NtSignalAndWaitForSingleObject },

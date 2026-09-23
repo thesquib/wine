@@ -365,6 +365,12 @@ extern struct client_surface *nulldrv_client_surface_create( HWND hwnd );
 
 extern ULONG_PTR zero_bits;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* vcpu_shims_arm64.c (generated): arm64 vCPU mode Apple-ABI shims, as {implementation, shim} pairs */
+extern const void *const vcpu_win32u_syscall_shims[];
+extern const unsigned int vcpu_win32u_syscall_shim_count;
+#endif
+
 static inline BOOL set_ntstatus( NTSTATUS status )
 {
     if (status) RtlSetLastWin32Error( RtlNtStatusToDosError( status ));
