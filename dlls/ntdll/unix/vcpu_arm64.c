@@ -151,6 +151,30 @@ static double ticks_to_us( uint64_t ticks )
 
 
 /***********************************************************************
+ *           vcpu_create
+ *
+ * vel1_vcpu_create with hardware TSO (ACTLR_EL1.EnTSO, vcpu_el1.h D3) when the VM gives it. If the bit does not read
+ * back, warn once and create every vCPU without it: M1 runs only arm64 code, which needs no TSO; FEX (M2) must know.
+ */
+static atomic_int tso_unavailable;
+
+static int vcpu_create( vel1_vcpu *v, vel1_vcpu_cfg *cfg )
+{
+    int ret;
+
+    if (!atomic_load( &tso_unavailable ))
+    {
+        if ((ret = vel1_vcpu_create( v, cfg )) != VEL1_E_ENTSO) return ret;
+        if (!atomic_exchange( &tso_unavailable, 1 ))
+            fprintf( stderr, "wine: vCPU mode: ACTLR_EL1.EnTSO did not read back: vCPUs run WITHOUT hardware TSO "
+                     "(fine for arm64 code; x86 emulation would need software TSO)\n" );
+    }
+    cfg->flags |= VEL1_CFG_NO_ENTSO;
+    return vel1_vcpu_create( v, cfg );
+}
+
+
+/***********************************************************************
  * gmm stage-2 backend
  */
 static uint32_t s2_map( void *host, uint64_t ipa, size_t size, int perm )
@@ -218,7 +242,7 @@ static void *tlbi_thread( void *arg )
     cfg.x0 = (uint64_t)sys_page + SYS_MAILBOX_OFF;
     cfg.hostcall_lo = (uint64_t)sys_page + SYS_TLBI_OFF;
     cfg.hostcall_hi = cfg.hostcall_lo + 0x1000;
-    ret = vel1_vcpu_create( &tlbi_vcpu, &cfg );
+    ret = vcpu_create( &tlbi_vcpu, &cfg );
 
     pthread_mutex_lock( &tlbi_mutex );
     tlbi_status = ret ? -1 : 0;
@@ -364,7 +388,7 @@ static void vcpu_selftest(void)
     cfg.hostcall_lo = (uint64_t)sys_page + SYS_TLBI_OFF;
     cfg.hostcall_hi = cfg.hostcall_lo + 0x1000;
     start = mach_absolute_time();
-    if ((ret = vel1_vcpu_create( v, &cfg )))
+    if ((ret = vcpu_create( v, &cfg )))
     {
         fprintf( stderr, "vcpu selftest: vel1_vcpu_create FAIL %d (hv %#x)\n", ret, v->last_hv_err );
         exit( 1 );
@@ -376,8 +400,9 @@ static void vcpu_selftest(void)
     fprintf( stderr, "vcpu selftest: guest stub on this thread: %s, %.1f us\n", ret ? "FAIL" : "ok",
              ticks_to_us( mach_absolute_time() - start ));
     if (ret) exit( 1 );
-    fprintf( stderr, "vcpu selftest: hardware PASS (VM %d-bit IPA, sys page %p, KUSER host %p, ttbr0 %#llx)\n",
-             VCPU_IPA_BITS, sys_page, kuser_host, (unsigned long long)gmm_ttbr0( gmm ));
+    fprintf( stderr, "vcpu selftest: hardware PASS (VM %d-bit IPA, hardware TSO %s, sys page %p, KUSER host %p, "
+             "ttbr0 %#llx)\n", VCPU_IPA_BITS, atomic_load( &tso_unavailable ) ? "NO" : "yes", sys_page, kuser_host,
+             (unsigned long long)gmm_ttbr0( gmm ));
     /* virtual_init continues with the memory selftest (virtual.c) */
 }
 
@@ -768,7 +793,7 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     cfg.cpsr = frame->cpsr;
     cfg.x0 = frame->x[0];
     vcpu_block_signals( NULL );  /* no SIGQUIT between the create and the publish; vcpu_store_full unblocks */
-    if ((ret = vel1_vcpu_create( &vt->vcpu, &cfg )))
+    if ((ret = vcpu_create( &vt->vcpu, &cfg )))
         vcpu_fatal( "vel1_vcpu_create for thread %04x failed %d (hv %#x; at most %u vCPUs per process)\n",
                     (UINT)GetCurrentThreadId(), ret, vt->vcpu.last_hv_err, VEL1_MAX_VCPUS - 1 );
     pthread_setspecific( vcpu_key, vt );
