@@ -969,12 +969,25 @@ case $host_os in
         dnl report, rc=137). A PAGEZERO this size leaves nowhere to slide to.
         dnl loader/main.c then mmaps PROT_NONE over the range so ntdll can carve
         dnl KUSER_SHARED_DATA (0x7ffe0000) and the Windows address space out of it.
-        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segalign,0x4000,-pagezero_size,0x170000000"
-        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segaddr,WINE_TOP_DOWN,0x7ff000000000"
+        dnl
+        dnl Exactly 4 GiB, the least AppleSystemPolicy accepts (0xf0000000 is killed):
+        dnl CrossOver's 0x170000000 would block 0x140000000, the default 64-bit EXE
+        dnl image base, and the vCPU mode (PMW_VCPU) keeps nothing below 4 GiB anyway.
+        dnl
+        dnl No -segaddr,WINE_TOP_DOWN,0x7ff000000000: it puts __LINKEDIT after that
+        dnl segment, 128 TiB from the rest of the image, and dyld faults walking the
+        dnl export trie in ntdll's first dlsym(RTLD_DEFAULT) (macOS 26). The zerofill
+        dnl then sits right after __DATA, which is all anything needs from it.
+        dnl
+        dnl No -platform_version,macos,11.0,11.0 (it preserved host x18 for the EL0
+        dnl dispatchers): linked against SDK 11.0, Hypervisor.framework does not read
+        dnl ACTLR_EL1.EnTSO back, and the vCPU mode's x86 emulation needs hardware TSO.
+        dnl The EL0 arm64 mode cannot boot without an Apple entitlement in any case.
+        dnl
+        dnl The vCPU mode also needs the loader signed with the hypervisor entitlement:
+        dnl proton-darwin mac/vcpu/relink-arm64-loader.sh.
+        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-segalign,0x4000,-pagezero_size,0x100000000"
         WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-no_fixup_chains"
-        dnl Build against the macOS 11 SDK to get implicit x18 preservation, and to
-        dnl avoid dyld "segment 'WINE_TOP_DOWN' vm address out of order" at launch.
-        WINELOADER_LDFLAGS="$WINELOADER_LDFLAGS -Wl,-platform_version,macos,11.0,11.0"
         dnl NOTE: CrossOver additionally passes -Wl,-x86_64_layout_emulation, which
         dnl pairs with the restricted com.apple.developer.cross-architecture-support
         dnl entitlement (Apple-granted, provisioning-profile gated). It is NOT needed
