@@ -633,9 +633,38 @@ static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
     }
 }
 
+/***********************************************************************
+ *           vcpu_emulation_entry
+ *
+ * ARM64EC: the frame resumes into x86 code (NtContinue / NtSetContextThread put an emulated pc into it and
+ * set_context set RESTORE_FLAGS_EMULATION). As usr2_handler does on the EL0 path, the emulator gets the frame as a
+ * CONTEXT on the target stack and control goes to KiUserEmulationDispatcher with sp at that context; every other
+ * register comes from the frame. The caller stores *entry in full.
+ */
+static void vcpu_emulation_entry( const struct syscall_frame *frame, struct syscall_frame *entry )
+{
+    CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
+
+    if (frame != get_syscall_frame() || !pKiUserEmulationDispatcher || !NtCurrentTeb()->ChpeV2CpuAreaInfo)
+    {
+        fprintf( stderr, "wine: vCPU mode: emulation entry from an unexpected frame %p (current %p, dispatcher %p)\n",
+                 frame, get_syscall_frame(), pKiUserEmulationDispatcher );
+        abort_process( 1 );
+    }
+    NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
+    user_context->ContextFlags = CONTEXT_FULL;
+    NtGetContextThread( GetCurrentThread(), user_context );
+    *entry = *frame;
+    entry->sp = (ULONG64)user_context;
+    entry->pc = (ULONG64)pKiUserEmulationDispatcher;
+    entry->restore_flags = 0;
+    TRACE( "emulation entry: x86 pc %#llx, context %p\n", (unsigned long long)frame->pc, user_context );
+}
+
 /* write the whole frame into the vCPU and leave the syscall state (fault, kick, thread start) */
 static void vcpu_store_full( struct vcpu_thread *vt, const struct syscall_frame *frame )
 {
+    struct syscall_frame entry;
     vel1_regs regs;
     int ret;
 
@@ -646,8 +675,8 @@ static void vcpu_store_full( struct vcpu_thread *vt, const struct syscall_frame 
     atomic_signal_fence( memory_order_seq_cst );
     if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
     {
-        fprintf( stderr, "wine: vCPU mode: ARM64EC emulation resume is not supported yet (M2)\n" );
-        abort_process( 1 );
+        vcpu_emulation_entry( frame, &entry );
+        frame = &entry;
     }
     vcpu_regs_from_frame( &regs, frame );
     vt->hv_depth++;
@@ -674,21 +703,22 @@ static void vcpu_return( struct vcpu_thread *vt, struct vcpu_level *level, vel1_
     atomic_signal_fence( memory_order_seq_cst );
     if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
     {
-        fprintf( stderr, "wine: vCPU mode: ARM64EC emulation resume is not supported yet (M2)\n" );
-        abort_process( 1 );
+        /* into x86 code: the emulator takes over with the frame as a CONTEXT, everything stored */
+        struct syscall_frame entry;
+
+        vcpu_emulation_entry( frame, &entry );
+        vcpu_regs_from_frame( &regs, &entry );
+        core = VCPU_FULL_CORE_MASK;
+        simd = VEL1_R_ALL_SIMD;
     }
+    else if (!frame->restore_flags && !level->callback_ran) core = 0;  /* the fast path below */
+    else vcpu_return_plan( frame, ret, level->callback_ran, &regs, &core, &simd );
+
     vt->hv_depth++;
-    if (!frame->restore_flags && !level->callback_ran)
-    {
-        /* the vCPU still holds everything else: only the stub's return is left to play */
-        if (kind == VEL1_EXIT_SYSCALL) err = vel1_syscall_return( &vt->vcpu, ret, frame->pc, frame->lr );
-        else err = vel1_call_return( &vt->vcpu, ret, frame->pc );
-    }
-    else
-    {
-        vcpu_return_plan( frame, ret, level->callback_ran, &regs, &core, &simd );
-        err = vel1_regs_set( &vt->vcpu, &regs, core, simd );
-    }
+    if (core) err = vel1_regs_set( &vt->vcpu, &regs, core, simd );
+    /* the vCPU still holds everything else: only the stub's return is left to play */
+    else if (kind == VEL1_EXIT_SYSCALL) err = vel1_syscall_return( &vt->vcpu, ret, frame->pc, frame->lr );
+    else err = vel1_call_return( &vt->vcpu, ret, frame->pc );
     vt->hv_depth--;
     level->callback_ran = FALSE;
     if (err)
