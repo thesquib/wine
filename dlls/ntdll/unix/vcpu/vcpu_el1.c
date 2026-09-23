@@ -981,6 +981,7 @@ static int tlbi_fatal(vel1_vcpu* v, int err, uint32_t reason, uint64_t syndrome,
   v->tlbi_bad_pc = pc;
   return err;
 }
+/* Restores x0..x(k-1) (k = 0 for the whole-VMID form: no x register is written), then PC and CPSR, raw. */
 static int tlbi_restore(vel1_vcpu* v, const uint64_t* sx, unsigned k, uint64_t pc, uint64_t cpsr) {
   const vel1_hv_ops* o = v->ops;
   for (unsigned i = 0; i < k; ++i) {
@@ -993,13 +994,59 @@ static int tlbi_restore(vel1_vcpu* v, const uint64_t* sx, unsigned k, uint64_t p
   return VEL1_OK;
 }
 
+/* One stub run, shared byte-for-byte by both forms [D18]: PC = entry, CPSR = 0x3c5 (EL1h, DAIF masked, whatever PE
+   code set), then run until the stub's `hvc #0x102` at `hvc`. VTIMER: re-enter (vk:1040-1043). CANCELED (latched, or
+   a kick): PC must lie in [lo, hvc] (else VEL1_E_STUB: e.g. in the vectors, or in the OTHER form's entry); restart at
+   `entry` (every TLBI and the final `dsb ish` are re-issued, on whichever PE runs it); more than
+   VEL1_MAX_SPURIOUS_CANCELED of them: VEL1_E_BUSY with NOTHING restored (the caller restores, then returns BUSY). Any
+   other exit, or the hvc at a PC other than hvc + 4: VEL1_E_STUB via tlbi_fatal. kick_pending is never read or
+   taken here. */
+static int tlbi_stub_run(vel1_vcpu* v, uint64_t entry, uint64_t lo, uint64_t hvc) {
+  const vel1_hv_ops* o = v->ops;
+  const uint64_t id = v->id;
+  const hv_vcpu_exit_t* hx = (const hv_vcpu_exit_t*)v->hv_exit;
+  int32_t r = o->set_reg(id, HV_REG_PC, entry);
+  if (!r) r = o->set_reg(id, HV_REG_CPSR, VEL1_CPSR_EL1H_MASKED);
+  if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
+  unsigned canceled = 0;
+  for (;;) {
+    ++v->tlbi_runs;
+    atomic_store(&v->in_run, 1); /* the kicker / kick_remote may exit it; kick_pending is NOT checked or taken */
+    const int32_t rr = o->vcpu_run(id);
+    atomic_store(&v->in_run, 0);
+    if (rr) return v->last_hv_err = rr, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
+    const uint32_t reason = hx->reason;
+    if (reason == HV_EXIT_REASON_VTIMER_ACTIVATED) { /* vk:1040-1043 */
+      ++v->tlbi_vtimer;
+      continue;
+    }
+    uint64_t pc = 0;
+    if (reason == HV_EXIT_REASON_CANCELED) {
+      ++v->tlbi_canceled;
+      r = o->get_reg(id, HV_REG_PC, &pc);
+      if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
+      if (pc < lo || pc > hvc) return tlbi_fatal(v, VEL1_E_STUB, reason, 0, pc); /* e.g. in the vectors */
+      if (++canceled > VEL1_MAX_SPURIOUS_CANCELED) return VEL1_E_BUSY;
+      r = o->set_reg(id, HV_REG_PC, entry); /* restart: every TLBI + the final dsb, on this PE */
+      if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
+      continue;
+    }
+    const uint64_t syn = reason == HV_EXIT_REASON_EXCEPTION ? hx->exception.syndrome : 0;
+    if (reason != HV_EXIT_REASON_EXCEPTION || ((syn >> 26) & 0x3f) != 0x16 || (syn & 0xFFFF) != VEL1_HVC_TLBI_DONE)
+      return tlbi_fatal(v, VEL1_E_STUB, reason, syn, 0);
+    r = o->get_reg(id, HV_REG_PC, &pc);
+    if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
+    if (pc != hvc + (VEL1_HVC_PC_IS_NEXT ? 4 : 0)) return tlbi_fatal(v, VEL1_E_STUB, reason, syn, pc);
+    return VEL1_OK;
+  }
+}
+
 int vel1_run_tlbi(vel1_vcpu* v, const uint64_t* va, size_t n) {
   const int u = usable(v); /* owner thread, live, and not from a handler inside vel1_run */
   if (u != VEL1_OK) return u;
   if (!va || n == 0 || n > VEL1_TLBI_MAX_VA) return VEL1_E_ARG;
   const vel1_hv_ops* o = v->ops;
   const uint64_t id = v->id;
-  const hv_vcpu_exit_t* hx = (const hv_vcpu_exit_t*)v->hv_exit;
   const uint64_t stub = v->lay.blob_va + VEL1_TLBI_STUB_OFF, hvc = v->lay.blob_va + VEL1_TLBI_HVC_OFF;
   const unsigned kmax = n < VEL1_TLBI_REGS ? (unsigned)n : VEL1_TLBI_REGS;
   uint64_t save_pc = 0, save_cpsr = 0, sx[VEL1_TLBI_REGS];
@@ -1016,47 +1063,36 @@ int vel1_run_tlbi(vel1_vcpu* v, const uint64_t* va, size_t n) {
       const int32_t r = o->set_reg(id, HV_REG_X0 + i, (va[done + i] >> 12) & ((1ull << 44) - 1)); /* VA[55:12] */
       if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
     }
-    int32_t r = o->set_reg(id, HV_REG_PC, entry);
-    if (!r) r = o->set_reg(id, HV_REG_CPSR, VEL1_CPSR_EL1H_MASKED); /* EL1h, DAIF masked, whatever PE code set */
-    if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
-    unsigned canceled = 0;
-    for (;;) {
-      ++v->tlbi_runs;
-      atomic_store(&v->in_run, 1); /* the kicker / kick_remote may exit it; kick_pending is NOT checked or taken */
-      const int32_t rr = o->vcpu_run(id);
-      atomic_store(&v->in_run, 0);
-      if (rr) return v->last_hv_err = rr, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
-      const uint32_t reason = hx->reason;
-      if (reason == HV_EXIT_REASON_VTIMER_ACTIVATED) { /* vk:1040-1043 */
-        ++v->tlbi_vtimer;
-        continue;
-      }
-      uint64_t pc = 0;
-      if (reason == HV_EXIT_REASON_CANCELED) {
-        ++v->tlbi_canceled;
-        r = o->get_reg(id, HV_REG_PC, &pc);
-        if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
-        if (pc < stub || pc > hvc) return tlbi_fatal(v, VEL1_E_STUB, reason, 0, pc); /* e.g. in the vectors */
-        if (++canceled > VEL1_MAX_SPURIOUS_CANCELED) {
-          const int rc = tlbi_restore(v, sx, kmax, save_pc, save_cpsr);
-          return rc == VEL1_OK ? VEL1_E_BUSY : rc;
-        }
-        r = o->set_reg(id, HV_REG_PC, entry); /* restart the chunk: every TLBI + the final dsb, on this PE */
-        if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
-        continue;
-      }
-      const uint64_t syn = reason == HV_EXIT_REASON_EXCEPTION ? hx->exception.syndrome : 0;
-      if (reason != HV_EXIT_REASON_EXCEPTION || ((syn >> 26) & 0x3f) != 0x16 ||
-          (syn & 0xFFFF) != VEL1_HVC_TLBI_DONE)
-        return tlbi_fatal(v, VEL1_E_STUB, reason, syn, 0);
-      r = o->get_reg(id, HV_REG_PC, &pc);
-      if (r) return v->last_hv_err = r, tlbi_fatal(v, VEL1_E_HV, 0, 0, 0);
-      if (pc != hvc + (VEL1_HVC_PC_IS_NEXT ? 4 : 0)) return tlbi_fatal(v, VEL1_E_STUB, reason, syn, pc);
-      break;
+    const int rc = tlbi_stub_run(v, entry, stub, hvc); /* CANCELED PC bound: the whole VA stub [+0x820, +0x888] */
+    if (rc == VEL1_E_BUSY) {
+      const int rr = tlbi_restore(v, sx, kmax, save_pc, save_cpsr);
+      return rr == VEL1_OK ? VEL1_E_BUSY : rr;
     }
+    if (rc != VEL1_OK) return rc;
     done += k;
   }
   return tlbi_restore(v, sx, kmax, save_pc, save_cpsr);
+}
+
+int vel1_run_tlbi_all(vel1_vcpu* v) {
+  const int u = usable(v); /* owner thread, live, and not from a handler inside vel1_run */
+  if (u != VEL1_OK) return u;
+  const vel1_hv_ops* o = v->ops;
+  const uint64_t id = v->id;
+  const uint64_t entry = v->lay.blob_va + VEL1_TLBI_ALL_OFF, hvc = v->lay.blob_va + VEL1_TLBI_ALL_HVC_OFF;
+  uint64_t save_pc = 0, save_cpsr = 0;
+  ++v->tlbi_calls;
+  ++v->tlbi_all_calls;
+  /* save exactly what the stub run writes: PC and CPSR (the entry reads no register, so no x register is touched) */
+  HVCHK(v, o->get_reg(id, HV_REG_PC, &save_pc));
+  HVCHK(v, o->get_reg(id, HV_REG_CPSR, &save_cpsr));
+  const int rc = tlbi_stub_run(v, entry, entry, hvc); /* CANCELED PC bound: [+0x890, +0x8A0] */
+  if (rc == VEL1_E_BUSY) {
+    const int rr = tlbi_restore(v, NULL, 0, save_pc, save_cpsr);
+    return rr == VEL1_OK ? VEL1_E_BUSY : rr;
+  }
+  if (rc != VEL1_OK) return rc;
+  return tlbi_restore(v, NULL, 0, save_pc, save_cpsr); /* k = 0: PC and CPSR only, raw */
 }
 
 /* ============================================================================================== kicks [D8] */
@@ -1136,4 +1172,5 @@ void vel1_get_stats(vel1_vcpu* v, vel1_stats* s) {
   s->tlbi_runs = v->tlbi_runs;
   s->tlbi_canceled = v->tlbi_canceled;
   s->tlbi_vtimer = v->tlbi_vtimer;
+  s->tlbi_all_calls = v->tlbi_all_calls;
 }

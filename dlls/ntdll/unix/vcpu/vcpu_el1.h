@@ -63,6 +63,7 @@
  *        +0x800         syscall stub   { bti c; hvc #VEL1_HVC_SYSCALL;   ret; udf }
  *        +0x810         unix-call stub { bti c; hvc #VEL1_HVC_UNIX_CALL; ret; udf }
  *        +0x820..0x88F  the TLBI stub [D18] (vel1_run_tlbi only)
+ *        +0x890..0x8A7  the whole-VMID TLBI entry [D18] (vel1_run_tlbi_all only); the blob ends at +0x8A8
  *      The vector touches NO register and NO memory: the host reads ESR/FAR/ELR/SPSR_EL1 (vk:1050-1053) and "plays
  *      eret" by setting PC/CPSR (vk:1080/1137). The proven page used hvc #1 in every slot (vk:1161); a distinct
  *      immediate per slot is new (rung R1 proves reading ISS[15:0]).
@@ -85,7 +86,7 @@
  *      what turns that hang into this exit. (c) After ANY exit that leaves the real PC inside the blob (vector slots
  *      and both stubs), vel1_run refuses to re-enter (VEL1_E_NOT_RESUMED) until the caller writes PC; every PC write
  *      into the blob is refused (VEL1_E_PC_IN_BLOB) except vel1_state_restore of a state saved by vel1_state_save,
- *      and vel1_run_tlbi's own entry into (and restore from) the TLBI stub [D18].
+ *      and vel1_run_tlbi's / vel1_run_tlbi_all's own entry into (and restore from) the TLBI stub [D18].
  *      So no path re-enters with PC on an hvc or a `b .`.
  * [D8] Kicks. hv_vcpus_exit is NOT async-signal-safe: it takes Hypervisor.framework's global vcpus os_unfair_lock and
  *      then a per-vCPU pthread_mutex (force_exit_vtimer_wait), and hv_vcpu_run's own entry may take the same global
@@ -180,7 +181,8 @@
  *      nothing but RAISES a valid descriptor, which the eager policy shoots down). The stub cannot clobber them:
  *      only an EL1 exception writes them, and nothing in the stub can take one — every fetch is from the blob page,
  *      which the vCPU already fetches for its vector and never changes [D7]; dsb/isb/tlbi do not fault at EL1 (HVF
- *      does not trap TLBI: gmm G3b/G4b/G9); hvc exits to EL2; DAIF is masked (CPSR 0x3c5) and the vtimer is an EL2
+ *      does not trap `tlbi vale1is` (gmm G3b/G4b/G9) or `tlbi vmalle1is` (m1 rung M1v, live 2026-09-23));
+ *      hvc exits to EL2; DAIF is masked (CPSR 0x3c5) and the vtimer is an EL2
  *      exit. So vel1 does NOT save/restore them; it VERIFIES the assumption instead: any exit other than the stub's
  *      own hvc at the expected PC — a vector hvc, a stage-2 abort, any other EC — returns VEL1_E_STUB, which is
  *      fatal: the vCPU is left unresumable (NOT_RESUMED) and nothing is restored, so it can never resume with a
@@ -192,8 +194,24 @@
  *      it. kick_pending is NEVER consumed here: the kick stays pending and the caller's next vel1_run reports it
  *      (KICK, before entering). More than VEL1_MAX_SPURIOUS_CANCELED cancels in one chunk: the state is restored and
  *      VEL1_E_BUSY returned (the shootdown did not complete; the caller uses another executor).
- *      NOT BUILT: the whole-VMID form (`tlbi vmalle1is`, gmm's n > 64 request): it has never run in a vCPU, so there
- *      is no stub for it and n > 64 is VEL1_E_ARG.
+ *      THE WHOLE-VMID FORM (gmm's all=1 request, more than 64 changed valid pages): vel1_run_tlbi_all(v) runs the
+ *      entry at +0x890, `dsb ish; tlbi vmalle1is; dsb ish; isb; hvc #0x102; b .`. It reads no register and touches no
+ *      memory, so vel1 saves PC and CPSR only (2 gets) and writes no x register at all; it sets PC = +0x890 and CPSR =
+ *      0x3c5, runs to the entry's hvc at +0x8A0 (the exit check is the same: EC 0x16, imm 0x102, PC == hvc + 4 =
+ *      +0x8A4), and restores PC and CPSR raw. COST: 7 accessors + one exit round trip (8 hv calls). The run loop is
+ *      the SAME code as the VA form's (tlbi_stub_run): the same VTIMER re-entry, the same CANCELED absorption (PC must
+ *      lie in [+0x890, +0x8A0], else VEL1_E_STUB; restart at +0x890; kick_pending never consumed), the same
+ *      VEL1_E_BUSY bound (state restored) and the same fatal VEL1_E_STUB (nothing restored, NOT_RESUMED). The two
+ *      entries share the hvc immediate, so each form's CANCELED bound excludes the other's range. The whole-VMID
+ *      entry is reached ONLY by vel1_run_tlbi_all; vel1_run_tlbi(n == 0) stays VEL1_E_ARG, and n > 64 is VEL1_E_ARG
+ *      (the caller asks for the whole-VMID form explicitly). `tlbi vmalle1is` removes every stage-1 entry of the
+ *      current VMID (all ASIDs) on every PE of the inner-shareable domain. PROVEN LIVE (m1 rung M1v, 2026-09-23,
+ *      1+5/5 per variant): HVF does not trap vmalle1is at EL1 either (vale1is: gmm G3b/G4b/G9); it removed a second
+ *      vCPU's stale entries in every round, both when asked by the harness (all=1) and when gmm's own >64-page
+ *      batching asked (big=1); CANCELs landing inside the entry restart it (17 absorbed in the storm run); the
+ *      parked executor path ran it too (20 requests). Cost ~1.0–1.2 µs, the same as the VA form. Had HVF trapped it,
+ *      the exit would not have been the entry's hvc, so the call would have returned VEL1_E_STUB (fatal, nothing
+ *      restored); the ELR/SPSR argument above holds because a trapped TLBI is an EL2 exit, not an EL1 exception.
  */
 #ifndef VCPU_EL1_H
 #define VCPU_EL1_H
@@ -237,9 +255,12 @@ extern "C" {
 #define VEL1_TLBI_ENTRY_SIZE 8u
 #define VEL1_TLBI_REGS 8u      /* VAs per stub run: x0..x7 */
 #define VEL1_TLBI_HVC_OFF 0x888u
-#define VEL1_TLBI_STUB_END 0x890u
-#define VEL1_TLBI_MAX_VA 64u   /* per vel1_run_tlbi call; gmm asks for the (unbuilt) whole-VMID form above 64 */
+#define VEL1_TLBI_MAX_VA 64u   /* per vel1_run_tlbi call; above 64 gmm asks for the whole-VMID form (_all) */
 #define VEL1_TLBI_ENTRY_OFF(k) (VEL1_TLBI_STUB_OFF + (VEL1_TLBI_REGS - (k)) * VEL1_TLBI_ENTRY_SIZE)
+/* [D18] the whole-VMID entry (vel1_run_tlbi_all only): `dsb ish; tlbi vmalle1is; dsb ish; isb; hvc #0x102; b .` */
+#define VEL1_TLBI_ALL_OFF 0x890u
+#define VEL1_TLBI_ALL_HVC_OFF 0x8A0u
+#define VEL1_TLBI_STUB_END 0x8A8u /* end of both TLBI entries == the blob's size */
 
 #define VEL1_HVC_SYSCALL 0x0100u
 #define VEL1_HVC_UNIX_CALL 0x0101u
@@ -485,7 +506,8 @@ typedef struct {
   uint64_t runs, exits, vtimer, canceled_spurious, canceled_window, wfx_stepped, kicks_reported;
   uint64_t kick_queued, kick_flag_only, kick_not_live, kick_wrong_thread, kick_signal_failed, kick_remote_sent;
   uint64_t kicker_exits; /* hv_vcpus_exit calls the kicker thread made for this vCPU */
-  uint64_t tlbi_calls, tlbi_runs, tlbi_canceled, tlbi_vtimer; /* [D18] vel1_run_tlbi */
+  uint64_t tlbi_calls, tlbi_runs, tlbi_canceled, tlbi_vtimer; /* [D18] vel1_run_tlbi and vel1_run_tlbi_all */
+  uint64_t tlbi_all_calls; /* [D18] appended: vel1_run_tlbi_all calls (also counted in tlbi_calls) */
 } vel1_stats;
 
 /* Caller-allocated in host-only memory; zero it before first use [D12]. Fields are private. */
@@ -514,6 +536,7 @@ typedef struct vel1_vcpu {
   uint64_t tlbi_calls, tlbi_runs, tlbi_canceled, tlbi_vtimer;
   uint32_t tlbi_bad_reason;
   uint64_t tlbi_bad_syndrome, tlbi_bad_pc;
+  uint64_t tlbi_all_calls; /* [D18] appended: vel1_run_tlbi_all */
 } vel1_vcpu;
 
 int vel1_vcpu_create(vel1_vcpu* v, const vel1_vcpu_cfg* cfg);
@@ -562,6 +585,11 @@ int vel1_state_restore(vel1_vcpu* v, const vel1_state* s);
    VEL1_E_STUB: fatal for the vCPU (left NOT_RESUMED). VEL1_E_HV: fatal; if it failed while SAVING (before any write)
    the vCPU is untouched and not marked NOT_RESUMED, otherwise it is left NOT_RESUMED. (Review 2026-09-23 #5.) */
 int vel1_run_tlbi(vel1_vcpu* v, const uint64_t* va, size_t n);
+/* The whole-VMID form: `tlbi vmalle1is` (every stage-1 entry of this VM, every ASID, every PE of the inner-shareable
+   domain), then `dsb ish; isb`, executed by this vCPU. For gmm's all=1 requests (more than 64 changed valid pages).
+   Same preconditions, guarantees and return codes as vel1_run_tlbi (there is no argument to refuse: VEL1_E_ARG only
+   for v == NULL). Saves and restores PC and CPSR only; no x register is read or written [D18]. */
+int vel1_run_tlbi_all(vel1_vcpu* v);
 
 /* ---- kicks [D8][D15] ------------------------------------------------------------------------------------ */
 typedef enum {
