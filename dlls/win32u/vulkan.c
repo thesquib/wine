@@ -149,8 +149,11 @@ static BOOL vcpu_import_ok( const VkPhysicalDeviceMemoryProperties *props )
     if (!vcpu_mode()) return FALSE;
     for (i = 0; i < props->memoryTypeCount; i++)
         if (!(props->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) return TRUE;
-    ERR( "vCPU mode: the driver has no non-host-visible memory type (KosmicKrisp: PMW_KK_SPLIT_MEMORY_TYPES=1); "
-         "mapped memory will not be guest-visible\n" );
+    {
+        static int once;
+        if (!once++) ERR( "vCPU mode: the driver has no non-host-visible memory type (KosmicKrisp: "
+                          "PMW_KK_SPLIT_MEMORY_TYPES=1); mapped memory will not be guest-visible\n" );
+    }
     return FALSE;
 }
 
@@ -209,6 +212,7 @@ struct device_memory
     struct vulkan_device_memory obj;
     VkDeviceSize size;
     void *vm_map;
+    BOOL app_host_pointer; /* imported from the app's own host pointer (vCPU mode: guest-visible, not ours to free) */
 
     D3DKMT_HANDLE local;
     D3DKMT_HANDLE global;
@@ -333,7 +337,7 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT,
     };
     uint32_t i, align = physical_device->external_memory_align - 1;
-    SIZE_T alloc_size = alloc_info->allocationSize;
+    SIZE_T alloc_size = (alloc_info->allocationSize + align) & ~(SIZE_T)align; /* the size that is imported */
     static int once;
     void *mapping = NULL;
     VkResult res;
@@ -350,6 +354,8 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
                                                               mapping, &props )))
     {
         ERR( "vkGetMemoryHostPointerPropertiesEXT failed: %d\n", res );
+        alloc_size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
         return res;
     }
 
@@ -384,6 +390,14 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
         import_info->pNext = alloc_info->pNext;
         alloc_info->pNext = import_info;
         alloc_info->allocationSize = (alloc_info->allocationSize + align) & ~align;
+        /* a host-pointer import must not name a dedicated resource (VUID-VkMemoryAllocateInfo-pNext-02806); the
+         * dedication is only a hint, so drop it (the chain was copied by the thunks) */
+        for (const VkBaseInStructure *ext = import_info->pNext; ext; ext = ext->pNext)
+            if (ext->sType == VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+            {
+                ((VkMemoryDedicatedAllocateInfo *)ext)->image = VK_NULL_HANDLE;
+                ((VkMemoryDedicatedAllocateInfo *)ext)->buffer = VK_NULL_HANDLE;
+            }
     }
 
     return VK_SUCCESS;
@@ -821,8 +835,9 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
 
         instance->p_vkGetPhysicalDeviceProperties2KHR( host_physical_device, &props );
         physical_device->external_memory_align = host_mem_props.minImportedHostPointerAlignment;
-        if (physical_device->external_memory_align) WARN( "Not using VK_EXT_external_memory_host for memory mapping\n" );
-        else TRACE( "Using VK_EXT_external_memory_host for memory mapping with alignment: %u\n", physical_device->external_memory_align );
+        if (physical_device->external_memory_align)
+            TRACE( "Using VK_EXT_external_memory_host for memory mapping with alignment: %u\n", physical_device->external_memory_align );
+        else WARN( "Not using VK_EXT_external_memory_host for memory mapping\n" );
     }
 
     driver_funcs->p_map_device_extensions( &extensions );
@@ -1362,7 +1377,16 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
         if (alloc_info->pNext == (void *)&host_pointer_info) mapping = host_pointer_info.pHostPointer;
     }
 
-    if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(memory = calloc( 1, sizeof(*memory) )))
+    {
+        if (mapping)
+        {
+            SIZE_T size = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &size, MEM_RELEASE );
+        }
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    memory->app_host_pointer = pointer_info != NULL;
 
     if (import_win32 && get_host_external_memory_type() == VK_EXTERNAL_MEMORY_HANDLE_TYPE_MTLHEAP_BIT_EXT)
     {
@@ -1566,6 +1590,11 @@ failed:
     d3dkmt_destroy_mutex( memory->mutex );
     d3dkmt_destroy_sync( memory->sync );
     free( memory );
+    if (mapping)  /* the Wine block imported for this allocation */
+    {
+        SIZE_T size = 0;
+        NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &size, MEM_RELEASE );
+    }
     return VK_ERROR_OUT_OF_HOST_MEMORY;
 }
 
@@ -1687,6 +1716,15 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         return VK_SUCCESS;
     }
 
+    if (vcpu_mode() && !memory->app_host_pointer)
+    {
+        /* not imported from Wine memory: the driver's pointer is outside the VM (see vcpu_mode) */
+        static int once;
+        if (!once++) ERR( "vCPU mode: memory %p is not guest-visible (not imported from Wine memory, see vcpu_mode "
+                          "in win32u/vulkan.c); failing the map\n", memory );
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+
     if (physical_device->map_placed_align)
     {
         SIZE_T alloc_size = memory->size;
@@ -1725,14 +1763,6 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         memory->vm_map = placed_info.pPlacedAddress;
         *data = (char *)memory->vm_map + map_info->offset;
         TRACE( "Using placed mapping %p\n", memory->vm_map );
-    }
-
-    if (res == VK_SUCCESS && vcpu_mode() && !memory->vm_map)
-    {
-        /* the driver's pointer, outside the VM (see vcpu_mode) */
-        static int once;
-        if (!once++) ERR( "vCPU mode: mapping %p is not guest-visible (not imported from Wine memory, see vcpu_mode "
-                          "in win32u/vulkan.c); guest access will fault\n", *data );
     }
 
 #ifdef _WIN64
