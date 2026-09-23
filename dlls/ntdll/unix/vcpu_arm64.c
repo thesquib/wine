@@ -70,6 +70,7 @@ extern void trace_userret( void *ret_ptr, ULONG len, NTSTATUS status, UINT id );
 
 int vcpu_mode;
 int vcpu_check_s2;
+int vcpu_sect_alias;
 
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
@@ -1267,6 +1268,7 @@ void vcpu_init_process(void)
     cfg.s2_run_chunks = 1;
     if ((ret = gmm_init( &gmm, &cfg, &backend ))) vcpu_fatal( "gmm_init: %d\n", ret );
     vcpu_check_s2 = cfg.s2_run_chunks > 1 || ((env = getenv( "PMW_VCPU_PARANOID" )) && !strcmp( env, "1" ));
+    vcpu_sect_alias = VCPU_GMM_SECT && !((env = getenv( "PMW_VCPU_SECT_ALIAS" )) && !strcmp( env, "0" ));
 
     init_sys_page();
     init_kuser();

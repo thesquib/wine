@@ -274,6 +274,7 @@ struct file_view
 #define VPROT_FREE_PLACEHOLDER 0x0800
 #define VPROT_NATIVE           0x1000
 #define VPROT_HOSTONLY         0x2000  /* vCPU mode: never visible to the guest (kernel stacks) */
+#define VPROT_ALIASED          0x4000  /* vCPU mode: a view of its section's anchor (vcpu_section) */
 
 #if defined(__APPLE__) && defined(__aarch64__)
 C_ASSERT( VPROT_READ == VCPU_VPROT_READ && VPROT_WRITE == VCPU_VPROT_WRITE && VPROT_EXEC == VCPU_VPROT_EXEC );
@@ -1907,7 +1908,7 @@ static inline BOOL is_guest_view( const struct file_view *view )
 #if defined(__APPLE__) && defined(__aarch64__)
 
 static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vprot );
-static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE clear );
+static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base, size_t size, BYTE set, BYTE clear );
 
 /***********************************************************************
  *           vcpu_sync_pages
@@ -1922,11 +1923,11 @@ static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE 
                          pthread_sigmask( SIG_BLOCK, &vcpu_quit_, &vcpu_old_ )
 #define VCPU_GMM_END()   pthread_sigmask( SIG_SETMASK, &vcpu_old_, NULL )
 
-static int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear )
+static int vcpu_sync_pages( const struct file_view *view, const void *base, size_t size, BYTE set, BYTE clear )
 {
     int res;
     VCPU_GMM_BEGIN();
-    res = vcpu_sync_pages_nosig( base, size, set, clear );
+    res = vcpu_sync_pages_nosig( view, base, size, set, clear );
     VCPU_GMM_END();
     return res;
 }
@@ -1941,10 +1942,13 @@ static inline void vcpu_icache_invalidate( void *addr, size_t size )
  * rule, the host: unix code writes guest memory only while it is writable, e.g. an image before its sections are
  * protected). gmm_walk reads the live tables without gmm's mutex: safe here, every change to them after vCPU-mode
  * init is made under virtual_mutex, and the page-table pool never moves. */
-static BOOL vcpu_page_is_rx( const char *addr )
+static BOOL vcpu_page_is_rx( const struct file_view *view, const char *addr )
 {
     gmm_xlat_t x;
 
+    /* a page of an aliased view can be written through another view of its section at any time (a JIT's RW view of
+     * its RX code): read-only here says nothing */
+    if (view->protect & VPROT_ALIASED) return FALSE;
     /* an armed write watch clears stage-1 W on a writable page, and the host still writes it (NtReadFile) */
     if (get_page_vprot( addr ) & VPROT_WRITEWATCH) return FALSE;
     gmm_walk( vcpu_gmm(), (UINT_PTR)addr, &x );
@@ -1957,13 +1961,14 @@ static BOOL vcpu_page_is_rx( const char *addr )
  * so no vCPU can fetch a stale line from them. Writes to an executable page without a protection change are the
  * writer's to flush: NtFlushInstructionCache as on Windows, and on the host side map_file_into_view, which reads
  * a file into a view that is executable from its creation on. */
-static void vcpu_icache_sync( char *addr, size_t npages, const unsigned char *s1, unsigned char target )
+static void vcpu_icache_sync( const struct file_view *view, char *addr, size_t npages, const unsigned char *s1,
+                              unsigned char target )
 {
     size_t i, run = 0;
 
     for (i = 0; i <= npages; i++)
     {
-        if (i < npages && ((s1 ? s1[i] : target) & GMM_S1_X) && !vcpu_page_is_rx( addr + (i << page_shift) ))
+        if (i < npages && ((s1 ? s1[i] : target) & GMM_S1_X) && !vcpu_page_is_rx( view, addr + (i << page_shift) ))
         {
             run++;
             continue;
@@ -1973,7 +1978,7 @@ static void vcpu_icache_sync( char *addr, size_t npages, const unsigned char *s1
     }
 }
 
-static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE clear )
+static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base, size_t size, BYTE set, BYTE clear )
 {
     unsigned char s1[512];
     char *addr = ROUND_ADDR( base, page_mask );
@@ -1985,7 +1990,7 @@ static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE 
     if (get_vprot_range_size( addr, npages << page_shift, ~0, &vprot ) == npages << page_shift)
     {
         unsigned char target = vcpu_vprot_to_s1( (vprot & ~clear) | set );
-        if (target & GMM_S1_X) vcpu_icache_sync( addr, npages, NULL, target );
+        if (target & GMM_S1_X) vcpu_icache_sync( view, addr, npages, NULL, target );
         if ((ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, npages << page_shift, target )))
         {
             ERR( "gmm_vm_range_set %p-%p %#x failed %d\n", addr, addr + (npages << page_shift), target, ret );
@@ -1997,7 +2002,7 @@ static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE 
     {
         n = min( npages, ARRAY_SIZE(s1) );
         for (i = 0; i < n; i++) s1[i] = vcpu_vprot_to_s1( (get_page_vprot( addr + (i << page_shift) ) & ~clear) | set );
-        vcpu_icache_sync( addr, n, s1, 0 );
+        vcpu_icache_sync( view, addr, n, s1, 0 );
         if ((ret = gmm_vm_range_set_pages( vcpu_gmm(), (UINT_PTR)addr, n, s1 )))
         {
             ERR( "gmm_vm_range_set_pages %p-%p failed %d\n", addr, addr + (n << page_shift), ret );
@@ -2064,12 +2069,331 @@ static NTSTATUS vcpu_view_created( struct file_view *view )
         if (ret != GMM_ENOPT && ret != GMM_ENOIPA) abort();
         return STATUS_NO_MEMORY;
     }
-    if (vcpu_sync_pages( view->base, view->size, 0, 0 ))
+    if (vcpu_sync_pages( view, view->base, view->size, 0, 0 ))
     {
         vcpu_revoke_pages( view->base, view->size );
         return STATUS_NO_MEMORY;
     }
     return STATUS_SUCCESS;
+}
+
+/* vCPU mode, section aliasing (openrosetta model B', relay fex-side-section-alias-reply-2026-09-24): every guest
+ * view of a pagefile section in this process is a host remap of one anchor, host-only anonymous memory that holds
+ * the section's bytes, and gmm points each view's stage-1 descriptors at the anchor's IPAs. So all views of the
+ * section see the same memory, as on Windows (CoreCLR's W^X double mapping: an RX view and a transient RW view of
+ * its code heap). The anchor lives while the section has a view in this process. Views read it from the section's
+ * file as they need it. When the last view goes, the ranges committed through the views are written back, so a
+ * later view, or another process, sees what a copy would have; two processes with views at once stay non-coherent,
+ * as with copies. Views that can't alias stay copies (map_file_into_view): file-backed sections, write-copy and
+ * host-only views, placeholders, views whose base and offset are not host-congruent. Lists under virtual_mutex. */
+struct vcpu_section
+{
+    struct list        entry;
+    dev_t              dev;        /* the section's file */
+    ino_t              ino;
+    int                fd;         /* our dup of its fd */
+    char              *anchor;     /* the section's bytes: host-only, tag 250 */
+    size_t             size;       /* of the anchor: the section in whole host pages */
+    void              *gmm_sect;   /* gmm's section over the anchor */
+    unsigned int       views;
+    BOOL               written;    /* a view was mapped writable */
+    struct vcpu_ranges filled;     /* section offsets read from the file into the anchor */
+    struct vcpu_ranges committed;  /* section offsets committed through the views (collected) */
+};
+
+struct vcpu_section_view
+{
+    struct list             entry;
+    const struct file_view *view;
+    struct vcpu_section    *section;
+    uint64_t                offset;  /* of the view's first byte in the section */
+};
+
+static struct list vcpu_sections = LIST_INIT( vcpu_sections );
+static struct list vcpu_section_views = LIST_INIT( vcpu_section_views );
+
+/* gmm vel1-gmm-v3 (openrosetta relay fex-side-gmm-v3-api-confirm-2026-09-24). The anchor carries its own tag
+ * (252): gmm refuses a tag-250 anchor, and a view's remap takes the anchor's tag. gmm_view_alias with GMM_S1_NONE
+ * takes no IPA: out-of-IPA/page-table errors come from the commit (gmm_vm_range_set on the view, vcpu_sync_pages). */
+#if VCPU_GMM_SECT
+static int vcpu_gmm_sect_anchor_tag(void)
+{
+    return gmm_sect_anchor_tag_flag();
+}
+static int vcpu_gmm_sect_create( void *anchor, size_t size, void **sect )
+{
+    return gmm_sect_create( vcpu_gmm(), anchor, size, (gmm_sect_t **)sect );
+}
+static int vcpu_gmm_view_alias( void *sect, uint64_t offset, const void *va, size_t size )
+{
+    return gmm_view_alias( vcpu_gmm(), sect, offset, (UINT_PTR)va, size, GMM_S1_NONE );
+}
+static int vcpu_gmm_sect_destroy( void *sect )
+{
+    return gmm_sect_destroy( vcpu_gmm(), sect );
+}
+#else  /* never called: vcpu_sect_alias is 0 */
+static int vcpu_gmm_sect_anchor_tag(void) { return VM_MAKE_TAG( 252 ); }
+static int vcpu_gmm_sect_create( void *anchor, size_t size, void **sect ) { return -1; }
+static int vcpu_gmm_view_alias( void *sect, uint64_t offset, const void *va, size_t size ) { return -1; }
+static int vcpu_gmm_sect_destroy( void *sect ) { return -1; }
+#endif
+
+/* gmm rule R7: only resource exhaustion is an allocation failure; anything else (GMM_EINVAL: a view that is not
+ * 16K-congruent got past vcpu_section_can_alias; GMM_EGUARD, GMM_EEXIST) is a bug */
+static BOOL vcpu_gmm_out_of_resources( int ret )
+{
+    return ret == GMM_ENOMEM || ret == GMM_ENOIPA || ret == GMM_ENOPT;
+}
+
+/* whether a view of a section at base (NULL: map_view picks one, host-aligned) can alias the section's anchor */
+static BOOL vcpu_section_can_alias( unsigned int sec_flags, unsigned int vprot, const void *base, uint64_t offset,
+                                   ULONG alloc_type )
+{
+    if (!vcpu_sect_alias || (sec_flags & SEC_FILE) || (vprot & (VPROT_HOSTONLY | VPROT_WRITECOPY))) return FALSE;
+    if (alloc_type & MEM_REPLACE_PLACEHOLDER)
+    {
+        /* the placeholder is already a gmm identity view (vcpu_view_created) */
+        WARN( "vCPU mode: section view replacing placeholder %p is a copy\n", base );
+        return FALSE;
+    }
+    if (!vcpu_view_host_congruent( (UINT_PTR)base, offset, host_page_mask ))
+    {
+        WARN( "vCPU mode: section view at %p of offset %#llx is not host-congruent, a copy\n", base,
+              (unsigned long long)offset );
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static struct vcpu_section_view *vcpu_section_view_find( const struct file_view *view )
+{
+    struct vcpu_section_view *sv;
+
+    LIST_FOR_EACH_ENTRY( sv, &vcpu_section_views, struct vcpu_section_view, entry )
+        if (sv->view == view) return sv;
+    return NULL;
+}
+
+/* the section's anchor, created on its first view in this process */
+static struct vcpu_section *vcpu_section_get( int fd, const struct stat *st, mem_size_t section_size )
+{
+    struct vcpu_section *section;
+    int ret;
+
+    LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
+        if (section->dev == st->st_dev && section->ino == st->st_ino) return section;
+
+    if (!(section = calloc( 1, sizeof(*section) ))) return NULL;
+    section->dev  = st->st_dev;
+    section->ino  = st->st_ino;
+    section->size = ROUND_SIZE( 0, section_size, host_page_mask );
+    /* lazily populated: a 2 TiB anchor (CoreCLR's code heap section) costs address space only */
+    section->anchor = mmap( NULL, section->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
+                            vcpu_gmm_sect_anchor_tag(), 0 );
+    if (section->anchor == MAP_FAILED)
+    {
+        ERR( "vCPU mode: no anchor of %#zx bytes: %s\n", section->size, strerror( errno ));
+        free( section );
+        return NULL;
+    }
+    if ((section->fd = dup( fd )) == -1)
+    {
+        munmap( section->anchor, section->size );
+        free( section );
+        return NULL;
+    }
+    {
+        VCPU_GMM_BEGIN();
+        ret = vcpu_gmm_sect_create( section->anchor, section->size, &section->gmm_sect );
+        VCPU_GMM_END();
+    }
+    if (ret)
+    {
+        ERR( "gmm_sect_create %p-%p failed %d\n", section->anchor, section->anchor + section->size, ret );
+        if (!vcpu_gmm_out_of_resources( ret )) abort();
+        close( section->fd );
+        munmap( section->anchor, section->size );
+        free( section );
+        return NULL;
+    }
+    list_add_head( &vcpu_sections, &section->entry );
+    TRACE( "vCPU mode: section %#llx:%#llx anchor %p-%p\n", (unsigned long long)st->st_dev,
+           (unsigned long long)st->st_ino, section->anchor, section->anchor + section->size );
+    return section;
+}
+
+/* after the last view: no vCPU can reach the anchor any more */
+static void vcpu_section_destroy( struct vcpu_section *section )
+{
+    int ret;
+
+    {
+        VCPU_GMM_BEGIN();
+        ret = vcpu_gmm_sect_destroy( section->gmm_sect );
+        VCPU_GMM_END();
+    }
+    if (ret)
+    {
+        /* the anchor may still be stage-2 mapped: unmapping it would pull memory out from under the guest */
+        ERR( "gmm_sect_destroy %p-%p failed %d\n", section->anchor, section->anchor + section->size, ret );
+        abort();
+    }
+    TRACE( "vCPU mode: section anchor %p-%p destroyed\n", section->anchor, section->anchor + section->size );
+    munmap( section->anchor, section->size );
+    close( section->fd );
+    vcpu_ranges_free( &section->filled );
+    vcpu_ranges_free( &section->committed );
+    list_remove( &section->entry );
+    free( section );
+}
+
+/* add the committed pages of an aliased view to its section's committed ranges */
+static void vcpu_section_collect( const struct vcpu_section_view *sv )
+{
+    char *base = sv->view->base;
+    size_t pos, run;
+    BYTE vprot;
+
+    for (pos = 0; pos < sv->view->size; pos += run)
+    {
+        run = get_vprot_range_size( base + pos, sv->view->size - pos, VPROT_COMMITTED, &vprot );
+        if ((vprot & VPROT_COMMITTED) && vcpu_ranges_add( &sv->section->committed, sv->offset + pos, sv->offset + pos + run ))
+            ERR( "vCPU mode: out of memory, %p-%p will not be written back\n", base + pos, base + pos + run );
+    }
+}
+
+/* write the committed part of the section's [start, end) back to its file, from the anchor */
+static void vcpu_section_write_back( const struct vcpu_section *section, uint64_t start, uint64_t end )
+{
+    uint64_t pos, run_end;
+    ssize_t ret;
+
+    for (pos = start; pos < end; pos = run_end)
+    {
+        if (!vcpu_ranges_find( &section->committed, pos, end, &run_end )) continue;
+        while (pos < run_end)
+        {
+            ret = pwrite( section->fd, section->anchor + pos, min( run_end - pos, (uint64_t)1 << 30 ), pos );
+            if (ret == -1 && errno == EINTR) continue;
+            if (ret <= 0)
+            {
+                ERR( "vCPU mode: write-back of section offset %#llx-%#llx failed: %s\n", (unsigned long long)pos,
+                     (unsigned long long)run_end, ret ? strerror( errno ) : "no progress" );
+                break;
+            }
+            pos += ret;
+        }
+    }
+}
+
+/* NtFlushVirtualMemory of an aliased view: every view's commits so far, then the view's part of the section */
+static void vcpu_section_view_flush( const struct vcpu_section_view *sv )
+{
+    const struct vcpu_section_view *other;
+
+    if (!sv->section->written) return;
+    LIST_FOR_EACH_ENTRY( other, &vcpu_section_views, struct vcpu_section_view, entry )
+        if (other->section == sv->section) vcpu_section_collect( other );
+    vcpu_section_write_back( sv->section, sv->offset, sv->offset + sv->view->size );
+}
+
+/***********************************************************************
+ *           vcpu_section_view_map
+ *
+ * Make a new view (VPROT_ALIASED, not a gmm identity view: create_view skips it) a view of its section's anchor:
+ * the host remap at the view's address, then gmm's stage-1 alias (in that order: gmm checks the host pages at the
+ * view are the anchor's). The caller syncs its pages to gmm (mprotect_range), and deletes the view on failure.
+ */
+static NTSTATUS vcpu_section_view_map( struct file_view *view, int fd, mem_size_t section_size, uint64_t offset )
+{
+    mach_vm_address_t addr = (UINT_PTR)view->base;
+    uint64_t pos, run_end, end = offset + view->size;
+    struct vcpu_section_view *sv;
+    struct vcpu_section *section;
+    vm_prot_t cur_prot, max_prot;
+    struct stat st;
+    kern_return_t kr;
+    int ret;
+
+    if (fstat( fd, &st ) == -1) return STATUS_INVALID_HANDLE;
+    if (!(sv = malloc( sizeof(*sv) ))) return STATUS_NO_MEMORY;
+    if (!(section = vcpu_section_get( fd, &st, section_size ))) goto failed;
+    assert( end <= section->size );
+
+    /* read only what no earlier view has read: the anchor's copy may be newer than the file */
+    for (pos = offset; pos < end; pos = run_end)
+        if (!vcpu_ranges_find( &section->filled, pos, end, &run_end ))
+            pread( section->fd, section->anchor + pos, run_end - pos, pos );
+    if (vcpu_ranges_add( &section->filled, offset, end )) goto failed;
+
+    /* the view's host side, for host access (syscalls on its buffers, NtFlushInstructionCache, write-back); never
+     * handed to hv_vm_map, which sees the anchor only */
+    kr = mach_vm_remap( mach_task_self(), &addr, ROUND_SIZE( 0, view->size, host_page_mask ), 0,
+                        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (mach_vm_address_t)(section->anchor + offset),
+                        FALSE, &cur_prot, &max_prot, VM_INHERIT_DEFAULT );
+    if (kr != KERN_SUCCESS)
+    {
+        ERR( "vCPU mode: remap of section offset %#llx at %p failed: kern_return_t %d\n", (unsigned long long)offset,
+             view->base, kr );
+        goto failed;
+    }
+    {
+        VCPU_GMM_BEGIN();
+        ret = vcpu_gmm_view_alias( section->gmm_sect, offset, view->base, view->size );
+        VCPU_GMM_END();
+    }
+    if (ret)
+    {
+        ERR( "gmm_view_alias %p-%p offset %#llx failed %d\n", view->base, (char *)view->base + view->size,
+             (unsigned long long)offset, ret );
+        if (!vcpu_gmm_out_of_resources( ret )) abort();
+        goto failed;
+    }
+
+    sv->view    = view;
+    sv->section = section;
+    sv->offset  = offset;
+    list_add_head( &vcpu_section_views, &sv->entry );
+    section->views++;
+    if (view->protect & VPROT_WRITE) section->written = TRUE;
+    TRACE( "vCPU mode: view %p-%p aliases section offset %#llx (anchor %p), %u views\n", view->base,
+           (char *)view->base + view->size, (unsigned long long)offset, section->anchor, section->views );
+    return STATUS_SUCCESS;
+
+failed:
+    if (section && !section->views) vcpu_section_destroy( section );
+    free( sv );
+    return STATUS_NO_MEMORY;
+}
+
+/* an aliased view goes (delete_view): gmm first (rule R5); the caller then unmaps the host remap */
+static void vcpu_section_view_unmap( struct file_view *view )
+{
+    struct vcpu_section_view *sv = vcpu_section_view_find( view );
+    struct vcpu_section *section;
+    int ret;
+
+    if (!sv) return;  /* vcpu_section_view_map failed: nothing in gmm */
+    section = sv->section;
+    vcpu_section_collect( sv );
+    {
+        VCPU_GMM_BEGIN();
+        ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
+        VCPU_GMM_END();
+    }
+    if (ret)
+    {
+        ERR( "gmm_view_unmap %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
+        abort();
+    }
+    list_remove( &sv->entry );
+    free( sv );
+    TRACE( "vCPU mode: aliased view %p-%p gone, %u left\n", view->base, (char *)view->base + view->size,
+           section->views - 1 );
+    if (--section->views) return;
+    if (section->written) vcpu_section_write_back( section, 0, section->size );
+    vcpu_section_destroy( section );
 }
 
 /* vCPU mode: gmm maps only anonymous memory into the guest, so a file view is a copy of the file. A shared writable
@@ -2113,6 +2437,12 @@ static void vcpu_view_flush( const struct file_view *view, BOOL remove )
     struct vcpu_writeback **ptr = &vcpu_writebacks, *wb;
     size_t pos, run;
 
+    if (view->protect & VPROT_ALIASED)
+    {
+        const struct vcpu_section_view *sv = vcpu_section_view_find( view );
+        if (sv) vcpu_section_view_flush( sv );
+        return;
+    }
     while ((wb = *ptr))
     {
         if (wb->view != view)
@@ -2143,11 +2473,18 @@ static void vcpu_view_flush( const struct file_view *view, BOOL remove )
 static void vcpu_view_deleted( struct file_view *view )
 {
     int ret;
-    VCPU_GMM_BEGIN();
 
-    vcpu_view_flush( view, TRUE );
-    ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
-    VCPU_GMM_END();
+    if (view->protect & VPROT_ALIASED)
+    {
+        vcpu_section_view_unmap( view );
+        return;
+    }
+    {
+        VCPU_GMM_BEGIN();
+        vcpu_view_flush( view, TRUE );
+        ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
+        VCPU_GMM_END();
+    }
     if (ret)
     {
         ERR( "gmm_view_unmap %p-%p failed %d\n", view->base, (char *)view->base + view->size, ret );
@@ -2156,7 +2493,10 @@ static void vcpu_view_deleted( struct file_view *view )
 }
 
 #else
-static inline int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear ) { return 0; }
+static inline int vcpu_sync_pages( const struct file_view *view, const void *base, size_t size, BYTE set, BYTE clear )
+{
+    return 0;
+}
 static inline void vcpu_revoke_pages( const void *base, size_t size ) {}
 static inline void vcpu_assert_s2_unmapped( const void *start, size_t size ) {}
 static inline void vcpu_icache_invalidate( void *addr, size_t size ) {}
@@ -2167,6 +2507,15 @@ static inline NTSTATUS vcpu_add_writeback( const struct file_view *view, char *a
     return STATUS_NOT_SUPPORTED;
 }
 static inline void vcpu_view_flush( const struct file_view *view, BOOL remove ) {}
+static inline BOOL vcpu_section_can_alias( unsigned int sec_flags, unsigned int vprot, const void *base,
+                                          uint64_t offset, ULONG alloc_type )
+{
+    return FALSE;
+}
+static inline NTSTATUS vcpu_section_view_map( struct file_view *view, int fd, mem_size_t section_size, uint64_t offset )
+{
+    return STATUS_NOT_SUPPORTED;
+}
 #endif
 
 
@@ -2293,7 +2642,8 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
     register_view( view );
     kernel_writewatch_register_range( view, view->base, view->size );
 
-    if (is_guest_view( view ))
+    /* an aliased view becomes a gmm view in vcpu_section_view_map */
+    if (is_guest_view( view ) && !(view->protect & VPROT_ALIASED))
     {
         NTSTATUS status = vcpu_view_created( view );
         if (status)
@@ -2409,7 +2759,7 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
     if (vcpu_mode)
     {
         struct file_view *view = find_view( base, 0 );
-        if (view && is_guest_view( view )) return vcpu_sync_pages( base, size, set, clear );
+        if (view && is_guest_view( view )) return vcpu_sync_pages( view, base, size, set, clear );
     }
 
     size = ROUND_SIZE( base, size, host_page_mask );
@@ -2473,7 +2823,9 @@ static NTSTATUS set_protection( struct file_view *view, void *base, SIZE_T size,
         if ((view->protect & access) != access) return STATUS_INVALID_PAGE_PROTECTION;
     }
 
-    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED )) return STATUS_ACCESS_DENIED;
+    /* vCPU mode: gmm fails a commit only when out of IPA or page tables */
+    if (!set_vprot( view, base, size, vprot | VPROT_COMMITTED ))
+        return is_guest_view( view ) ? STATUS_NO_MEMORY : STATUS_ACCESS_DENIED;
     return STATUS_SUCCESS;
 }
 
@@ -4267,6 +4619,7 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     /* vCPU mode: a view only unix-side code reads stays a live host mapping instead of a guest copy */
     if (vcpu_mode && (alloc_type & MEM_WINE_HOST_ONLY)) vprot |= VPROT_HOSTONLY;
 #endif
+    if (vcpu_section_can_alias( sec_flags, vprot, base, offset.QuadPart, alloc_type )) vprot |= VPROT_ALIASED;
 
     if ((res = server_get_unix_fd( handle, 0, &unix_handle, &needs_close, NULL, NULL ))) return res;
 
@@ -4275,23 +4628,31 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     res = map_view( &view, base, size, alloc_type, vprot, limit_low, limit_high, 0 );
     if (res) goto done;
 
-    TRACE( "handle=%p size=%lx offset=%s\n", handle, size, wine_dbgstr_longlong(offset.QuadPart) );
-    res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
+    TRACE( "handle=%p size=%lx offset=%s section size %s flags %#x\n", handle, size,
+           wine_dbgstr_longlong(offset.QuadPart), wine_dbgstr_longlong(full_size), sec_flags );
+    if (view->protect & VPROT_ALIASED)
+        res = vcpu_section_view_map( view, unix_handle, full_size, offset.QuadPart );
+    else
+        res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
     if (res == STATUS_SUCCESS)
     {
-        /* file mappings must always be accessible */
-        mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 );
-
-        SERVER_START_REQ( map_view )
+        /* file mappings must always be accessible. vCPU mode: gmm may be out of IPA or page tables (an aliased
+         * view takes its anchor's IPA here) */
+        if (mprotect_range( view->base, view->size, VPROT_COMMITTED, 0 ) && is_guest_view( view ))
+            res = STATUS_NO_MEMORY;
+        else
         {
-            req->mapping = wine_server_obj_handle( handle );
-            req->access  = access;
-            req->base    = wine_server_client_ptr( view->base );
-            req->size    = size;
-            req->start   = offset.QuadPart;
-            res = wine_server_call( req );
+            SERVER_START_REQ( map_view )
+            {
+                req->mapping = wine_server_obj_handle( handle );
+                req->access  = access;
+                req->base    = wine_server_client_ptr( view->base );
+                req->size    = size;
+                req->start   = offset.QuadPart;
+                res = wine_server_call( req );
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
     }
     else ERR( "mapping %p %lx %s failed\n", view->base, size, wine_dbgstr_longlong(offset.QuadPart) );
 
@@ -7549,6 +7910,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
+    TRACE( "%p: view %p-%p flags %#x\n", addr, view->base, (char *)view->base + view->size, flags );
 
     if (flags & MEM_PRESERVE_PLACEHOLDER && !(view->protect & VPROT_PLACEHOLDER))
     {
@@ -8061,6 +8423,7 @@ NTSTATUS WINAPI NtSetInformationVirtualMemory( HANDLE process,
  */
 NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T size )
 {
+    TRACE( "%p %p %#lx\n", handle, addr, size );
 #if defined(__x86_64__) || defined(__i386__)
     /* no-op */
 #elif defined(HAVE___CLEAR_CACHE)
