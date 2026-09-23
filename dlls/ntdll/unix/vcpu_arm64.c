@@ -636,6 +636,35 @@ static void vcpu_return( struct vcpu_thread *vt, struct vcpu_level *level, vel1_
     }
 }
 
+/***********************************************************************
+ *           vcpu_syscall_target
+ *
+ * The function to call for a syscall: its Apple-ABI shim when it has one (vcpu_shims_arm64.c), else the
+ * implementation itself. Per table, the map is built once, the first time the table is seen.
+ */
+static const void *vcpu_syscall_target( UINT table_index, const SYSTEM_SERVICE_TABLE *table, UINT num )
+{
+    static const ULONG_PTR *mapped_for[4];
+    static const void **mapped[4];
+    const void **map = mapped[table_index];
+    ULONG_PTR i;
+    unsigned int j;
+
+    if (mapped_for[table_index] != table->ServiceTable)
+    {
+        if (!(map = calloc( table->ServiceLimit, sizeof(*map) ))) vcpu_fatal( "out of memory for the shim map\n" );
+        for (i = 0; i < table->ServiceLimit; i++)
+        {
+            map[i] = (const void *)table->ServiceTable[i];
+            for (j = 0; j < vcpu_syscall_shim_count; j++)
+                if (vcpu_syscall_shims[j].func == map[i]) map[i] = vcpu_syscall_shims[j].shim;
+        }
+        mapped[table_index] = map;
+        mapped_for[table_index] = table->ServiceTable;
+    }
+    return map[num];
+}
+
 static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_exit *e )
 {
     struct ntdll_thread_data *thread_data = ntdll_get_thread_data();
@@ -647,9 +676,16 @@ static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_ex
     void *func;
 
     if (num >= table->ServiceLimit) return STATUS_INVALID_SYSTEM_SERVICE;
-    func = (void *)table->ServiceTable[num];
+    func = (void *)vcpu_syscall_target( (id >> 12) & 3, table, num );
     size = table->ArgumentTable[num];
     stack_bytes = size > 64 ? size - 64 : 0;
+    if (stack_bytes && func == (void *)table->ServiceTable[num])
+    {
+        /* Windows put these in 8-byte slots; the Apple-ABI implementation would read them packed */
+        fprintf( stderr, "wine: vCPU mode: syscall %#x has stack arguments but no Apple-ABI shim "
+                 "(re-run mac/vcpu/gen/gen_syscall_shims.py)\n", id );
+        abort_process( 1 );
+    }
     memcpy( args, e->regs.x, 8 * sizeof(args[0]) );
     if (thread_data->syscall_trace)
     {
