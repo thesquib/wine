@@ -636,33 +636,78 @@ static void vcpu_return( struct vcpu_thread *vt, struct vcpu_level *level, vel1_
     }
 }
 
+/* Apple-ABI shims per syscall table index: ntdll's own (vcpu_shims_arm64.c) serve table 0; other unix libraries
+ * register theirs ({implementation, shim} pairs) with __wine_vcpu_add_syscall_shims, e.g. win32u for table 1. */
+struct vcpu_shim_map
+{
+    const ULONG_PTR *service_table;     /* the ServiceTable this map was built for */
+    const void      *target[];          /* per syscall number: the shim, or the implementation itself */
+};
+
+static pthread_mutex_t shim_map_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const void *const *registered_shims[4];  /* protected by shim_map_mutex */
+static unsigned int registered_shim_count[4];   /* protected by shim_map_mutex */
+static _Atomic(const struct vcpu_shim_map *) shim_maps[4];
+
+/***********************************************************************
+ *           __wine_vcpu_add_syscall_shims
+ *
+ * Register the Apple-ABI shims of syscall table 'index' (include/wine/unixlib.h). Drops the table's cached map so
+ * the next syscall rebuilds it with them, should a syscall of that table already have been dispatched.
+ */
+void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsigned int count )
+{
+    if (index >= ARRAY_SIZE(registered_shims)) return;
+    pthread_mutex_lock( &shim_map_mutex );
+    registered_shims[index] = pairs;
+    registered_shim_count[index] = count;
+    /* the old map is leaked: another thread may still be reading it */
+    atomic_store_explicit( &shim_maps[index], NULL, memory_order_release );
+    pthread_mutex_unlock( &shim_map_mutex );
+}
+
 /***********************************************************************
  *           vcpu_syscall_target
  *
- * The function to call for a syscall: its Apple-ABI shim when it has one (vcpu_shims_arm64.c), else the
- * implementation itself. Per table, the map is built once, the first time the table is seen.
+ * The function to call for a syscall: its Apple-ABI shim when it has one (ntdll's vcpu_shims_arm64.c for table
+ * 0, the list registered with __wine_vcpu_add_syscall_shims for any table), else the implementation itself. Per
+ * table, the map is built the first time the table is seen, and again if the table or its registration changes.
  */
 static const void *vcpu_syscall_target( UINT table_index, const SYSTEM_SERVICE_TABLE *table, UINT num )
 {
-    static const ULONG_PTR *mapped_for[4];
-    static const void **mapped[4];
-    const void **map = mapped[table_index];
+    const struct vcpu_shim_map *map = atomic_load_explicit( &shim_maps[table_index], memory_order_acquire );
+    struct vcpu_shim_map *new_map;
+    const void *const *pairs;
+    unsigned int j, count;
     ULONG_PTR i;
-    unsigned int j;
 
-    if (mapped_for[table_index] != table->ServiceTable)
+    if (map && map->service_table == table->ServiceTable) return map->target[num];
+
+    pthread_mutex_lock( &shim_map_mutex );
+    map = atomic_load_explicit( &shim_maps[table_index], memory_order_relaxed );
+    if (!map || map->service_table != table->ServiceTable)
     {
-        if (!(map = calloc( table->ServiceLimit, sizeof(*map) ))) vcpu_fatal( "out of memory for the shim map\n" );
+        if (!(new_map = calloc( 1, sizeof(*new_map) + table->ServiceLimit * sizeof(new_map->target[0]) )))
+            vcpu_fatal( "out of memory for the shim map\n" );
+        new_map->service_table = table->ServiceTable;
+        pairs = registered_shims[table_index];
+        count = registered_shim_count[table_index];
         for (i = 0; i < table->ServiceLimit; i++)
         {
-            map[i] = (const void *)table->ServiceTable[i];
-            for (j = 0; j < vcpu_syscall_shim_count; j++)
-                if (vcpu_syscall_shims[j].func == map[i]) map[i] = vcpu_syscall_shims[j].shim;
+            const void *func = (const void *)table->ServiceTable[i];
+
+            new_map->target[i] = func;
+            if (!table_index)
+                for (j = 0; j < vcpu_syscall_shim_count; j++)
+                    if (vcpu_syscall_shims[j].func == func) new_map->target[i] = vcpu_syscall_shims[j].shim;
+            for (j = 0; j < count; j++)
+                if (pairs[2 * j] == func) new_map->target[i] = pairs[2 * j + 1];
         }
-        mapped[table_index] = map;
-        mapped_for[table_index] = table->ServiceTable;
+        atomic_store_explicit( &shim_maps[table_index], new_map, memory_order_release );
+        map = new_map;
     }
-    return map[num];
+    pthread_mutex_unlock( &shim_map_mutex );
+    return map->target[num];
 }
 
 static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_exit *e )
@@ -682,8 +727,8 @@ static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_ex
     if (stack_bytes && func == (void *)table->ServiceTable[num])
     {
         /* Windows put these in 8-byte slots; the Apple-ABI implementation would read them packed */
-        fprintf( stderr, "wine: vCPU mode: syscall %#x has stack arguments but no Apple-ABI shim "
-                 "(re-run mac/vcpu/gen/gen_syscall_shims.py)\n", id );
+        fprintf( stderr, "wine: vCPU mode: syscall %#x has stack arguments but no Apple-ABI shim (re-run "
+                 "proton-darwin mac/vcpu/gen/gen_syscall_shims.py: ntdll, win32u vcpu_shims_arm64.c)\n", id );
         abort_process( 1 );
     }
     memcpy( args, e->regs.x, 8 * sizeof(args[0]) );

@@ -77,6 +77,13 @@ NTSYSAPI void ntdll_set_exception_jmp_buf( jmp_buf jmp );
 
 NTSYSAPI BOOLEAN KeAddSystemServiceTable( ULONG_PTR *funcs, ULONG_PTR *counters, ULONG limit,
                                           BYTE *arguments, ULONG index );
+#if defined(__APPLE__) && defined(__aarch64__)
+/* arm64 vCPU mode (PMW_VCPU): register Apple-ABI shims for the syscall table 'index'. 'pairs' holds 'count'
+ * {implementation, shim} function pointer pairs (2 * count entries, must stay valid); the vCPU syscall dispatcher
+ * calls the shim in place of any ServiceTable entry equal to an implementation. One list per index, a later call
+ * replaces it. Call it right after KeAddSystemServiceTable. */
+NTSYSAPI void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsigned int count );
+#endif
 NTSYSAPI void ntdll_add_syscall_debug_info( UINT idx, const char **syscall_names,
                                             const char **usercall_names );
 

@@ -101,6 +101,9 @@ static NTSTATUS init( void *args )
     }
 #endif
     KeAddSystemServiceTable( syscalls, NULL, ARRAY_SIZE(syscalls), arguments, 1 );
+#if defined(__APPLE__) && defined(__aarch64__)
+    __wine_vcpu_add_syscall_shims( 1, vcpu_win32u_syscall_shims, vcpu_win32u_syscall_shim_count );
+#endif
     ntdll_add_syscall_debug_info( 1, syscall_names, usercall_names );
     return STATUS_SUCCESS;
 }
