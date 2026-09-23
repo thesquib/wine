@@ -118,13 +118,15 @@ static const UINT EXTERNAL_FENCE_WIN32_BITS = VK_EXTERNAL_FENCE_HANDLE_TYPE_OPAQ
 #define ROUND_SIZE(size, mask) ((((SIZE_T)(size) + (mask)) & ~(SIZE_T)(mask)))
 
 /* arm64 vCPU mode (ntdll, PMW_VCPU): the Windows code runs in a VM that sees only memory mapped into it through
- * NtAllocateVirtualMemory / NtMapViewOfSection, never a pointer the driver maps itself (vkMapMemory).
- * VK_EXT_map_memory_placed must not be used there: it remaps driver memory over a guest range that is already
- * stage-2 mapped (gmm rule R2), so the guest would keep seeing the old anonymous pages and GPU data would be lost
- * silently. Importing Wine memory with VK_EXT_external_memory_host (the WoW64 route) is no answer either: KosmicKrisp
- * has a single host-visible memory type and cannot bind optimal-tiled images to imported host memory, and engines
- * put textures in the blocks they map. Until the driver's mappings are mapped into the guest (gmm's foreign-memory
- * mapping), a mapped pointer is reported once (win32u_vkMapMemory2KHR) and guest access to it faults. */
+ * NtAllocateVirtualMemory / NtMapViewOfSection, never a pointer the driver maps itself (vkMapMemory), and the
+ * driver's memory must never be mapped into the VM (it is IOAccelerator memory; openrosetta's hard rule).
+ * VK_EXT_map_memory_placed must not be used there either: it remaps driver memory over a guest range that is already
+ * stage-2 mapped (gmm rule R2), so the guest would keep the old pages and GPU data would be lost silently.
+ * So host-visible memory is Wine's own guest memory imported with VK_EXT_external_memory_host (the WoW64 route,
+ * proven live in openrosetta's hvf_proto step 3d), but only when the driver also has a memory type that is not host
+ * visible, where optimal-tiled images go: a no-copy MTLBuffer over imported memory cannot hold them
+ * (KosmicKrisp: PMW_KK_SPLIT_MEMORY_TYPES=1). Otherwise a mapped pointer is reported once (win32u_vkMapMemory2KHR)
+ * and guest access to it faults. */
 static BOOL vcpu_mode(void)
 {
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -136,7 +138,20 @@ static BOOL vcpu_mode(void)
 
 static BOOL use_external_memory(void)
 {
-    return zero_bits != 0;
+    return zero_bits != 0 || vcpu_mode();
+}
+
+/* vCPU mode: whether host-visible allocations can be imported from Wine memory (see vcpu_mode) */
+static BOOL vcpu_import_ok( const VkPhysicalDeviceMemoryProperties *props )
+{
+    uint32_t i;
+
+    if (!vcpu_mode()) return FALSE;
+    for (i = 0; i < props->memoryTypeCount; i++)
+        if (!(props->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) return TRUE;
+    ERR( "vCPU mode: the driver has no non-host-visible memory type (KosmicKrisp: PMW_KK_SPLIT_MEMORY_TYPES=1); "
+         "mapped memory will not be guest-visible\n" );
+    return FALSE;
 }
 
 struct mempool
@@ -356,6 +371,8 @@ static VkResult allocate_external_host_memory( struct vulkan_device *device, VkM
             FIXME( "Not found compatible memory type\n" );
             alloc_size = 0;
             NtFreeVirtualMemory( GetCurrentProcess(), &mapping, &alloc_size, MEM_RELEASE );
+            /* vCPU mode: an allocation the guest could map but not reach is worse than a failed one */
+            if (vcpu_mode()) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
     }
 
@@ -796,7 +813,8 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
         }
     }
 
-    if (zero_bits && physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
+    if ((zero_bits || vcpu_import_ok( &physical_device->memory_properties )) &&
+        physical_device->extensions.has_VK_EXT_external_memory_host && !physical_device->map_placed_align)
     {
         VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_mem_props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT};
         VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &host_mem_props};
@@ -1336,7 +1354,8 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
 
     /* For host visible memory, we try to use VK_EXT_external_memory_host on wow64 to ensure that mapped pointer is 32-bit. */
     mem_flags = physical_device->memory_properties.memoryTypes[alloc_info->memoryTypeIndex].propertyFlags;
-    if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info)
+    if (physical_device->external_memory_align && (mem_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) && !pointer_info &&
+        !(vcpu_mode() && (import_win32 || export_info)))  /* a shared resource stays the driver's (Metal heap) */
     {
         if ((res = allocate_external_host_memory( device, alloc_info, mem_flags, &host_pointer_info ))) return res;
         /* the imported allocation is the mapping: map returns it, free releases it */
@@ -1712,8 +1731,8 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
     {
         /* the driver's pointer, outside the VM (see vcpu_mode) */
         static int once;
-        if (!once++) ERR( "vCPU mode: mapping %p is not guest-visible (driver memory is not mapped into the VM yet); "
-                          "guest access will fault\n", *data );
+        if (!once++) ERR( "vCPU mode: mapping %p is not guest-visible (not imported from Wine memory, see vcpu_mode "
+                          "in win32u/vulkan.c); guest access will fault\n", *data );
     }
 
 #ifdef _WIN64
@@ -1928,7 +1947,9 @@ static VkResult win32u_vkCreateImage( VkDevice client_device, const VkImageCreat
         }
     }
 
-    if (physical_device->external_memory_align && !external_info)
+    /* vCPU mode: only a linear image can be bound to imported memory (see vcpu_mode) */
+    if (physical_device->external_memory_align && !external_info &&
+        !(vcpu_mode() && create_info->tiling != VK_IMAGE_TILING_LINEAR))
     {
         host_external_info.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
         host_external_info.pNext = create_info->pNext;
