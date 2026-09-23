@@ -400,6 +400,9 @@ static void vcpu_selftest(void)
     fprintf( stderr, "vcpu selftest: guest stub on this thread: %s, %.1f us\n", ret ? "FAIL" : "ok",
              ticks_to_us( mach_absolute_time() - start ));
     if (ret) exit( 1 );
+    /* vCPUs belong to their creating thread, and on macOS the Windows main thread (where the memory selftest runs)
+     * is not this one (loader.c: apple_wine_thread): give this one back, the probe makes its own */
+    if ((ret = vel1_vcpu_destroy( v ))) fprintf( stderr, "vcpu selftest: vel1_vcpu_destroy %d\n", ret );
     fprintf( stderr, "vcpu selftest: hardware PASS (VM %d-bit IPA, hardware TSO %s, sys page %p, KUSER host %p, "
              "ttbr0 %#llx)\n", VCPU_IPA_BITS, atomic_load( &tso_unavailable ) ? "NO" : "yes", sys_page, kuser_host,
              (unsigned long long)gmm_ttbr0( gmm ));
@@ -417,14 +420,38 @@ vel1_exit_kind vcpu_selftest_probe( uint64_t va, uint64_t value, uint64_t *old, 
     vel1_vcpu *v = &selftest_vcpu;
     vel1_regs regs;
     vel1_exit_kind kind;
+    int ret;
 
+    memset( e, 0, sizeof(*e) );
+    if (!atomic_load( &v->live ))  /* first probe: a vCPU on this (the calling) thread */
+    {
+        vel1_vcpu_cfg cfg;
+
+        memset( &cfg, 0, sizeof(cfg) );
+        cfg.ttbr0 = gmm_ttbr0( gmm );
+        cfg.blob_va = (uint64_t)sys_page + SYS_BLOB_OFF;
+        cfg.pc = (uint64_t)sys_page + SYS_PROBE_OFF;
+        cfg.hostcall_lo = (uint64_t)sys_page + SYS_TLBI_OFF;
+        cfg.hostcall_hi = cfg.hostcall_lo + 0x1000;
+        if ((ret = vcpu_create( v, &cfg )))
+        {
+            fprintf( stderr, "vcpu selftest: probe vCPU create failed %d (hv %#x)\n", ret, v->last_hv_err );
+            return VEL1_EXIT_ERROR;
+        }
+    }
     memset( &regs, 0, sizeof(regs) );
     regs.x[0] = va;
     regs.x[1] = value;
     regs.x[3] = 0xdeadbeefdeadbeefull;
-    if (vel1_resume_at( v, (uint64_t)sys_page + SYS_PROBE_OFF, 0 ) ||
-        vel1_regs_set( v, &regs, VEL1_R_X(0) | VEL1_R_X(1) | VEL1_R_X(3), 0 )) return VEL1_EXIT_ERROR;
+    if ((ret = vel1_resume_at( v, (uint64_t)sys_page + SYS_PROBE_OFF, 0 )) ||
+        (ret = vel1_regs_set( v, &regs, VEL1_R_X(0) | VEL1_R_X(1) | VEL1_R_X(3), 0 )))
+    {
+        fprintf( stderr, "vcpu selftest: probe setup failed %d (hv %#x)\n", ret, v->last_hv_err );
+        return VEL1_EXIT_ERROR;
+    }
     kind = vel1_run( v, e );
+    if (kind == VEL1_EXIT_ERROR)
+        fprintf( stderr, "vcpu selftest: probe vel1_run error %d (hv %#x)\n", e->err, e->hv_err );
     if (kind == VEL1_EXIT_HOSTCALL && e->hvc_imm != VCPU_HVC_PROBE_DONE) return VEL1_EXIT_UNKNOWN;
     if (kind == VEL1_EXIT_HOSTCALL && old)
     {
