@@ -403,23 +403,30 @@ static inline BOOL is_vprot_exec_write( BYTE vprot )
     return (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY));
 }
 
-/* the mmap() fd argument for anonymous memory: in the vCPU mode every fixed anonymous mapping carries the tag gmm's
- * backing guard requires of memory it maps into the guest (openrosetta gmm README, rule R1) */
-static inline int anon_mmap_tag(void)
+/* the mmap() fd argument for anonymous memory. vCPU mode: memory that backs a guest view carries the tag gmm's
+ * backing guard requires (openrosetta gmm README, rule R1); nothing else may: the kernel refuses PROT_EXEC on
+ * tagged memory, and to gmm the tag means plain guest memory */
+static inline int anon_mmap_tag( BOOL guest )
 {
 #if defined(__APPLE__) && defined(__aarch64__)
-    if (vcpu_mode) return VM_MAKE_TAG( 250 );
+    if (vcpu_mode && guest) return VM_MAKE_TAG( 250 );
 #endif
     return -1;
+}
+
+/* mmap() anonymous memory at a fixed address; guest: it backs a guest view (vCPU mode) */
+static void *anon_mmap_fixed_tag( void *start, size_t size, int prot, int flags, BOOL guest )
+{
+    assert( !((UINT_PTR)start & host_page_mask) );
+    assert( !(size & host_page_mask) );
+
+    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, anon_mmap_tag( guest ), 0 );
 }
 
 /* mmap() anonymous memory at a fixed address */
 void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
 {
-    assert( !((UINT_PTR)start & host_page_mask) );
-    assert( !(size & host_page_mask) );
-
-    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, anon_mmap_tag(), 0 );
+    return anon_mmap_fixed_tag( start, size, prot, flags, FALSE );
 }
 
 /* allocate anonymous mmap() memory at any address */
@@ -739,7 +746,7 @@ static size_t unmap_area_above_user_limit( void *addr, size_t size )
 }
 
 
-static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
+static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags, BOOL guest )
 {
     void *ptr;
 
@@ -757,7 +764,7 @@ static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
 
     if (!ret)
     {
-        if ((ptr = anon_mmap_fixed( start, size, prot, flags )) == MAP_FAILED)
+        if ((ptr = anon_mmap_fixed_tag( start, size, prot, flags, guest )) == MAP_FAILED)
             mach_vm_deallocate( mach_task_self(), result, size );
     }
     else
@@ -859,7 +866,7 @@ static void reserve_area( void *addr, void *end )
 
     if (!size) return;
 
-    if (anon_mmap_tryfixed( addr, size, PROT_NONE, MAP_NORESERVE ) != MAP_FAILED)
+    if (anon_mmap_tryfixed( addr, size, PROT_NONE, MAP_NORESERVE, FALSE ) != MAP_FAILED)
     {
         mmap_add_reserved_area( addr, size );
         return;
@@ -1770,6 +1777,7 @@ struct alloc_area
     UINT_PTR align_mask;
     char *native_mapped;
     size_t native_mapped_size;
+    BOOL guest;  /* vCPU mode: the memory backs a guest view */
 };
 
 /***********************************************************************
@@ -1787,7 +1795,7 @@ static void* try_map_free_area( struct alloc_area *area, void *base, void *end, 
 
     while (start && base <= start && (char*)start + size <= (char*)end)
     {
-        if (anon_mmap_tryfixed( start, size, unix_prot, 0 ) != MAP_FAILED) return start;
+        if (anon_mmap_tryfixed( start, size, unix_prot, 0, area->guest ) != MAP_FAILED) return start;
         TRACE( "Found free area is already mapped, start %p.\n", start );
         if (errno != EEXIST)
         {
@@ -1906,7 +1914,7 @@ static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE 
  *
  * vCPU mode: set gmm's stage-1 state of every 4K page in the range from its protection byte, with set/clear
  * applied (the vCPU-mode body of mprotect_range: the host mapping stays RW, all protection is in stage 1).
- * Pages that become executable get their I-cache lines invalidated: the host wrote them through the D-cache.
+ * I-cache: see vcpu_icache_sync.
  */
 /* no SIGQUIT may end the thread inside gmm (its mutex) or HVF (its locks); server signals are already blocked
  * under virtual_mutex */
@@ -1923,6 +1931,39 @@ static int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear 
     return res;
 }
 
+/* whether the guest can execute the 4K page now and nobody can write it (neither the guest nor, by Wine's own
+ * rule, the host: unix code writes guest memory only while it is writable, e.g. an image before its sections are
+ * protected). gmm_walk reads the live tables without gmm's mutex: safe here, every change to them after vCPU-mode
+ * init is made under virtual_mutex, and the page-table pool never moves. */
+static BOOL vcpu_page_is_rx( const char *addr )
+{
+    gmm_xlat_t x;
+
+    gmm_walk( vcpu_gmm(), (UINT_PTR)addr, &x );
+    return x.valid && !x.pxn && x.ap_ro;
+}
+
+/* invalidate the I-cache lines of the pages of [addr, addr + npages pages) that are about to become executable
+ * (s1[i], or target when s1 is NULL), except those already executable and read-only: anything else may have been
+ * written through the D-cache since it was last fetched from. Runs BEFORE the gmm call that makes them executable,
+ * so no vCPU can fetch a stale line from them. Writes to an executable page without a protection change are the
+ * writer's to flush (NtFlushInstructionCache), as on Windows. */
+static void vcpu_icache_sync( char *addr, size_t npages, const unsigned char *s1, unsigned char target )
+{
+    size_t i, run = 0;
+
+    for (i = 0; i <= npages; i++)
+    {
+        if (i < npages && ((s1 ? s1[i] : target) & GMM_S1_X) && !vcpu_page_is_rx( addr + (i << page_shift) ))
+        {
+            run++;
+            continue;
+        }
+        if (run) sys_icache_invalidate( addr + ((i - run) << page_shift), run << page_shift );
+        run = 0;
+    }
+}
+
 static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE clear )
 {
     unsigned char s1[512];
@@ -1935,22 +1976,19 @@ static int vcpu_sync_pages_nosig( const void *base, size_t size, BYTE set, BYTE 
     if (get_vprot_range_size( addr, npages << page_shift, ~0, &vprot ) == npages << page_shift)
     {
         unsigned char target = vcpu_vprot_to_s1( (vprot & ~clear) | set );
+        if (target & GMM_S1_X) vcpu_icache_sync( addr, npages, NULL, target );
         if ((ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, npages << page_shift, target )))
         {
             ERR( "gmm_vm_range_set %p-%p %#x failed %d\n", addr, addr + (npages << page_shift), target, ret );
             return -1;
         }
-        if (target & GMM_S1_X) sys_icache_invalidate( addr, npages << page_shift );
         return 0;
     }
     while (npages)
     {
         n = min( npages, ARRAY_SIZE(s1) );
-        for (i = 0; i < n; i++)
-        {
-            s1[i] = vcpu_vprot_to_s1( (get_page_vprot( addr + (i << page_shift) ) & ~clear) | set );
-            if (s1[i] & GMM_S1_X) sys_icache_invalidate( addr + (i << page_shift), page_size );
-        }
+        for (i = 0; i < n; i++) s1[i] = vcpu_vprot_to_s1( (get_page_vprot( addr + (i << page_shift) ) & ~clear) | set );
+        vcpu_icache_sync( addr, n, s1, 0 );
         if ((ret = gmm_vm_range_set_pages( vcpu_gmm(), (UINT_PTR)addr, n, s1 )))
         {
             ERR( "gmm_vm_range_set_pages %p-%p failed %d\n", addr, addr + (n << page_shift), ret );
@@ -1979,6 +2017,26 @@ static void vcpu_revoke_pages( const void *base, size_t size )
     {
         ERR( "gmm_vm_range_set %p-%p NONE failed %d\n", addr, addr + size, ret );
         abort();  /* the host mapping change that follows would pull memory out from under the guest */
+    }
+}
+
+/* vCPU mode, gmm rule R2: before Wine changes the host mapping of [start, start + size) (whole host pages), none of
+ * them may still be stage-2 mapped. Checked when vcpu_check_s2 is set. */
+static void vcpu_assert_s2_unmapped( const void *start, size_t size )
+{
+    const char *p = ROUND_ADDR( start, host_page_mask ), *end = (const char *)start + size;
+    const char *bad = NULL;
+
+    if (!vcpu_check_s2 || !size) return;
+    {
+        VCPU_GMM_BEGIN();
+        for (; p < end && !bad; p += host_page_size) if (gmm_vm_s2_mapped( vcpu_gmm(), (UINT_PTR)p )) bad = p;
+        VCPU_GMM_END();
+    }
+    if (bad)
+    {
+        ERR( "host page %p of %p-%p is still stage-2 mapped (gmm rule R2)\n", bad, start, (const char *)start + size );
+        abort();
     }
 }
 
@@ -2091,6 +2149,7 @@ static void vcpu_view_deleted( struct file_view *view )
 #else
 static inline int vcpu_sync_pages( const void *base, size_t size, BYTE set, BYTE clear ) { return 0; }
 static inline void vcpu_revoke_pages( const void *base, size_t size ) {}
+static inline void vcpu_assert_s2_unmapped( const void *start, size_t size ) {}
 static inline NTSTATUS vcpu_view_created( struct file_view *view ) { return STATUS_SUCCESS; }
 static inline void vcpu_view_deleted( struct file_view *view ) {}
 static inline NTSTATUS vcpu_add_writeback( const struct file_view *view, char *addr, size_t size, int fd, off_t offset )
@@ -2156,7 +2215,11 @@ static void unregister_view( struct file_view *view )
  */
 static void delete_view( struct file_view *view ) /* [in] View */
 {
-    if (is_guest_view( view )) vcpu_view_deleted( view );
+    if (is_guest_view( view ))
+    {
+        vcpu_view_deleted( view );
+        vcpu_assert_s2_unmapped( view->base, ROUND_SIZE( 0, view->size, host_page_mask ));
+    }
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     set_page_vprot( view->base, view->size, 0 );
     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
@@ -2524,7 +2587,8 @@ static void *alloc_free_area_in_range( struct alloc_area *area, char *base, char
                 alloc_start = ROUND_ADDR( intersect_end - area->size, align_mask );
                 if (alloc_start >= intersect_start)
                 {
-                    if ((result = anon_mmap_fixed( alloc_start, area->size, area->unix_prot, 0 )) != alloc_start)
+                    if ((result = anon_mmap_fixed_tag( alloc_start, area->size, area->unix_prot, 0,
+                                                       area->guest )) != alloc_start)
                         ERR("Could not map in reserved area, alloc_start %p, size %p.\n",
                                 alloc_start, (void *)area->size);
                     return result;
@@ -2560,7 +2624,8 @@ static void *alloc_free_area_in_range( struct alloc_area *area, char *base, char
             alloc_start = ROUND_ADDR( intersect_start + align_mask, align_mask );
             if (alloc_start + area->size <= intersect_end)
             {
-                if ((result = anon_mmap_fixed( alloc_start, area->size, area->unix_prot, 0 )) != alloc_start)
+                if ((result = anon_mmap_fixed_tag( alloc_start, area->size, area->unix_prot, 0,
+                                                       area->guest )) != alloc_start)
                     ERR("Could not map in reserved area, alloc_start %p, size %p.\n", alloc_start, (void *)area->size);
                 return result;
             }
@@ -2571,7 +2636,8 @@ static void *alloc_free_area_in_range( struct alloc_area *area, char *base, char
     return try_map_free_area_range( area, base, end );
 }
 
-static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BOOL top_down, int unix_prot, UINT_PTR align_mask )
+static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BOOL top_down, int unix_prot,
+                              UINT_PTR align_mask, BOOL guest )
 {
     struct range_entry *range, *ranges_start, *ranges_end;
     char *reserve_start, *reserve_end;
@@ -2602,6 +2668,7 @@ static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BO
     area.top_down = top_down;
     area.unix_prot = unix_prot;
     area.align_mask = align_mask;
+    area.guest = guest;
 
     reserve_start = preload_reserve_start;
     reserve_end = preload_reserve_end;
@@ -2697,7 +2764,7 @@ static void *alloc_free_area( char *limit_low, char *limit_high, size_t size, BO
  * Map a memory area at a fixed address.
  * virtual_mutex must be held by caller.
  */
-static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
+static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot, BOOL guest )
 {
     struct reserved_area *area;
     NTSTATUS status;
@@ -2715,19 +2782,19 @@ static NTSTATUS map_fixed_area( void *base, size_t size, int unix_prot )
         if (area_end <= start) continue;
         if (area_start > start)
         {
-            if (anon_mmap_tryfixed( start, area_start - start, unix_prot, 0 ) == MAP_FAILED) goto failed;
+            if (anon_mmap_tryfixed( start, area_start - start, unix_prot, 0, guest ) == MAP_FAILED) goto failed;
             start = area_start;
         }
         if (area_end >= end)
         {
-            if (anon_mmap_fixed( start, end - start, unix_prot, 0 ) == MAP_FAILED) goto failed;
+            if (anon_mmap_fixed_tag( start, end - start, unix_prot, 0, guest ) == MAP_FAILED) goto failed;
             return STATUS_SUCCESS;
         }
-        if (anon_mmap_fixed( start, area_end - start, unix_prot, 0 ) == MAP_FAILED) goto failed;
+        if (anon_mmap_fixed_tag( start, area_end - start, unix_prot, 0, guest ) == MAP_FAILED) goto failed;
         start = area_end;
     }
 
-    if (anon_mmap_tryfixed( start, end - start, unix_prot, 0 ) == MAP_FAILED) goto failed;
+    if (anon_mmap_tryfixed( start, end - start, unix_prot, 0, guest ) == MAP_FAILED) goto failed;
     return STATUS_SUCCESS;
 
 failed:
@@ -2793,6 +2860,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
     int top_down = alloc_type & MEM_TOP_DOWN;
     void *ptr;
     int unix_prot = get_unix_prot( vprot );
+    BOOL guest;
     NTSTATUS status;
     const void *effective_user_space_limit = !is_win64 && wine_allocs_2g_limit ?
         (void *)0x7fff0000 : min( user_space_limit, host_addr_space_limit);
@@ -2829,8 +2897,10 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         unix_prot = get_unix_prot( vprot & ~VPROT_WRITEWATCH );
 
     unix_prot &= ~PROT_EXEC;
-    /* vCPU mode: guest memory is RW on the host from reservation on; stage 1 does the protection (gmm rule R1) */
-    if (vcpu_mode && !(vprot & (VPROT_SYSTEM | VPROT_HOSTONLY))) unix_prot = PROT_READ | PROT_WRITE;
+    /* vCPU mode: guest memory is RW and tagged on the host from reservation on; stage 1 does the protection (gmm
+     * rule R1) */
+    guest = vcpu_mode && !(vprot & (VPROT_SYSTEM | VPROT_HOSTONLY));
+    if (guest) unix_prot = PROT_READ | PROT_WRITE;
 
     if (base)
     {
@@ -2838,7 +2908,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (limit_low && base < (void *)limit_low) return STATUS_CONFLICTING_ADDRESSES;
         if (limit_high && is_beyond_limit( base, size, (void *)limit_high )) return STATUS_CONFLICTING_ADDRESSES;
         if (is_beyond_limit( base, size, host_addr_space_limit )) return STATUS_CONFLICTING_ADDRESSES;
-        if ((status = map_fixed_area( base, size, unix_prot ))) return status;
+        if ((status = map_fixed_area( base, size, unix_prot, guest ))) return status;
         if (is_beyond_limit( base, size, working_set_limit )) working_set_limit = address_space_limit;
         ptr = base;
     }
@@ -2851,13 +2921,14 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
 
-        if (!(ptr = alloc_free_area( start, end, host_size, top_down, unix_prot, align_mask )))
+        if (!(ptr = alloc_free_area( start, end, host_size, top_down, unix_prot, align_mask, guest )))
         {
             WARN("Allocation failed, clearing native views.\n");
 
             clear_native_views();
             if (!is_win64) increase_try_map_step = FALSE;
-            ptr = alloc_free_area( (void *)limit_low, (void *)limit_high, size, top_down, unix_prot, align_mask );
+            ptr = alloc_free_area( (void *)limit_low, (void *)limit_high, size, top_down, unix_prot, align_mask,
+                                   guest );
             if (!is_win64) increase_try_map_step = TRUE;
             if (!ptr) return STATUS_NO_MEMORY;
         }
@@ -3029,7 +3100,8 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size 
         vcpu_revoke_pages( start, end - start );
         if (host_start < host_end)
         {
-            anon_mmap_fixed( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0 );
+            vcpu_assert_s2_unmapped( host_start, host_end - host_start );
+            anon_mmap_fixed_tag( host_start, host_end - host_start, PROT_READ | PROT_WRITE, 0, TRUE );
             if (start < host_start) memset( start, 0, host_start - start );
             if (host_end < end) memset( host_end, 0, end - host_end );
         }
@@ -3115,9 +3187,11 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
             return STATUS_CONFLICTING_ADDRESSES;
         }
 
-        if (is_guest_view( view )) vcpu_revoke_pages( base, size );
+        /* the view split can fail (out of memory): only then revoke, so a failure leaves gmm unchanged; still
+         * before create_view maps the range as a new view and before any host mapping change (rule R5) */
         status = remove_pages_from_view( view, base, size );
         if (status) return status;
+        if (is_guest_view( view )) vcpu_revoke_pages( base, size );
 
         status = create_view( &view, base, size, VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER );
         if (status) return status;
@@ -3126,8 +3200,9 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
     if (is_guest_view( view )) vcpu_revoke_pages( view->base, view->size );
     view->protect = VPROT_PLACEHOLDER | VPROT_FREE_PLACEHOLDER;
     set_page_vprot( view->base, view->size, 0 );
-    anon_mmap_fixed( view->base, ROUND_SIZE( 0, view->size, host_page_mask ),
-                     is_guest_view( view ) ? PROT_READ | PROT_WRITE : PROT_NONE, 0 );
+    if (is_guest_view( view )) vcpu_assert_s2_unmapped( view->base, ROUND_SIZE( 0, view->size, host_page_mask ));
+    anon_mmap_fixed_tag( view->base, ROUND_SIZE( 0, view->size, host_page_mask ),
+                         is_guest_view( view ) ? PROT_READ | PROT_WRITE : PROT_NONE, 0, is_guest_view( view ) );
     return STATUS_SUCCESS;
 }
 
@@ -3170,13 +3245,20 @@ static NTSTATUS free_pages( struct file_view *view, char *base, size_t size )
         }
     }
 
-    if (is_guest_view( view )) vcpu_revoke_pages( base, size );  /* before the host unmap (rule R5) */
     status = remove_pages_from_view( view, base, size );
     if (!status)
     {
+        /* after the view split, which can fail (out of memory) and must then leave gmm unchanged; before the host
+         * unmap (rule R5) */
+        if (is_guest_view( view )) vcpu_revoke_pages( base, size );
         set_page_vprot( base, size, 0 );
         if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( base, size );
-        if (host_base < host_end) unmap_area( host_base, host_end - host_base );
+        if (host_base < host_end)
+        {
+            if (is_guest_view( view ))
+                vcpu_assert_s2_unmapped( host_base, ROUND_SIZE( 0, host_end - host_base, host_page_mask ));
+            unmap_area( host_base, host_end - host_base );
+        }
     }
     return status;
 }
@@ -3246,11 +3328,15 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
 
     if (find_view_range( 0, dosmem_size )) return STATUS_CONFLICTING_ADDRESSES;
 
+    /* vCPU mode: nothing can be mapped below the 4 GiB PAGEZERO, and guest memory must be map_view's (tagged RW,
+     * gmm rule R1); take the fallback the low mapping failure takes below */
+    if (vcpu_mode) return map_view( view, NULL, dosmem_size, 0, vprot, 0, 0, 0 );
+
     /* check without the first 64K */
 
     if (mmap_is_in_reserved_area( low_64k, dosmem_size - 0x10000 ) != 1)
     {
-        addr = anon_mmap_tryfixed( low_64k, dosmem_size - 0x10000, unix_prot, 0 );
+        addr = anon_mmap_tryfixed( low_64k, dosmem_size - 0x10000, unix_prot, 0, FALSE );
         if (addr == MAP_FAILED) return map_view( view, NULL, dosmem_size, 0, vprot, 0, 0, 0 );
     }
 
@@ -3258,7 +3344,7 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
 
     if (mmap_is_in_reserved_area( NULL, 0x10000 ) != 1)
     {
-        addr = anon_mmap_tryfixed( (void *)host_page_size, 0x10000 - host_page_size, unix_prot, 0 );
+        addr = anon_mmap_tryfixed( (void *)host_page_size, 0x10000 - host_page_size, unix_prot, 0, FALSE );
         if (addr != MAP_FAILED)
         {
             if (!anon_mmap_fixed( NULL, host_page_size, unix_prot, 0 ))
