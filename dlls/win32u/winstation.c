@@ -116,8 +116,14 @@ static NTSTATUS map_shared_session_block( SIZE_T offset, SIZE_T size, struct ses
     OBJECT_ATTRIBUTES attr;
     unsigned int status;
     HANDLE handle;
+    ULONG alloc_type = 0;
 
     assert( offset + size > offset );
+#ifdef MEM_WINE_HOST_ONLY
+    /* arm64 vCPU mode: the server keeps writing this memory and only this unix side reads it, so it must be
+     * mapped live on the host, not copied into the guest once at map time (unixlib.h) */
+    alloc_type = MEM_WINE_HOST_ONLY;
+#endif
 
     if (!(block = calloc( 1, sizeof(*block) ))) return STATUS_NO_MEMORY;
 
@@ -129,7 +135,7 @@ static NTSTATUS map_shared_session_block( SIZE_T offset, SIZE_T size, struct ses
     else
     {
         if ((status = NtMapViewOfSection( handle, GetCurrentProcess(), (void **)&block->data, 0, 0,
-                                          &off, &block->size, ViewUnmap, 0, PAGE_READONLY )))
+                                          &off, &block->size, ViewUnmap, alloc_type, PAGE_READONLY )))
             ERR( "Failed to map shared session block: offset=%#lx aligned_off=%#llx "
                  "status=%#x - class/window registrations in this block will fail.\n",
                  (unsigned long)offset, (unsigned long long)off.QuadPart, status );
