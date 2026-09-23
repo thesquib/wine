@@ -93,6 +93,11 @@ NTSYSAPI void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pai
 /* arm64 vCPU mode: the process's KUSER_SHARED_DATA as the host sees it. 0x7ffe0000 exists only in the guest (it is
  * below the loader's 4 GiB PAGEZERO); unix-side readers take this pointer instead. */
 NTSYSAPI const struct _KUSER_SHARED_DATA *__wine_user_shared_data(void);
+
+/* arm64 vCPU mode: 1 if every vCPU of this process runs with hardware TSO (ACTLR_EL1.EnTSO; a process's vCPUs have
+ * it all or none), else 0 (not in vCPU mode, or no TSO). For an x86 emulator's unix-side helper, which may then drop
+ * software TSO: nothing else is needed to turn it on. Out-of-tree callers find it with dlsym(RTLD_DEFAULT). */
+NTSYSAPI int __wine_vcpu_hardware_tso(void);
 #endif
 NTSYSAPI void ntdll_add_syscall_debug_info( UINT idx, const char **syscall_names,
                                             const char **usercall_names );
