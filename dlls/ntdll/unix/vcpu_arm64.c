@@ -790,6 +790,17 @@ const struct _KUSER_SHARED_DATA *__wine_user_shared_data(void)
 }
 
 /***********************************************************************
+ *           __wine_vcpu_hardware_tso
+ *
+ * Whether this process's vCPUs run with hardware TSO (include/wine/unixlib.h). Decided by the process's first vCPU,
+ * the TLB-shootdown executor created in vcpu_init_process, before any Windows code runs (vcpu_create).
+ */
+int __wine_vcpu_hardware_tso(void)
+{
+    return vcpu_mode && atomic_load( &tso_state ) > 0;
+}
+
+/***********************************************************************
  *           vcpu_syscall_target
  *
  * The function to call for a syscall: its Apple-ABI shim when it has one (ntdll's vcpu_shims_arm64.c for table
