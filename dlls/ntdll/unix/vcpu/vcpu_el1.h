@@ -47,15 +47,22 @@
  *                    A=0 and SA=0 (no alignment or SP-alignment checks), WXN=0, BT1=0 (no BTI enforcement at EL1).
  *        CPACR_EL1 = 3<<20 (FPEN: FP/SIMD does not trap; vk:968). SMEN (bits 24-25) stays 0.
  *        ACTLR_EL1 = 2 (bit 1 = EnTSO, hardware TSO; vk:970) and READ BACK (vk:971-975); a mismatch fails the create.
+ *                    SDK GATE (Wine M1a, proton-darwin vcpu-m1a-first-light-2026-09-23.md): EnTSO only reads back when
+ *                    the HOST BINARY is linked against a current SDK. With `-platform_version macos 11.0 11.0` (the pin
+ *                    Wine's EL0 build uses to keep x18) the write is silently dropped, and create returns VEL1_E_ENTSO.
+ *                    vCPU mode doesn't need the x18 pin, so link the host with the current SDK. VEL1_CFG_NO_ENTSO is a
+ *                    fallback that loses hardware TSO (x86 guests then need FEX's software TSO).
  *        CPSR      = 0x3c5 (M=EL1h, DAIF masked; vk:976).
  *        VBAR_EL1  = the blob's guest VA (vector table at blob offset 0, 2 KiB aligned; vk:967).
- * [D4] hv_vcpu_set_trap_debug_exceptions(false) after the ACTLR read-back, so BRK (EC 0x3C) is taken at EL1 through the
- *      vector instead of exiting to the host. NEVER called in this codebase (rungs R4a/R4b), so it is behind
- *      VEL1_CFG_KEEP_DEBUG_TRAP_DEFAULT. Either way the decoder accepts an EC 0x3C host exit (FAULT_SYNC, via_exit).
+ * [D4] Create does NOT call hv_vcpu_set_trap_debug_exceptions: live rung R4a (2026-09-23) proved that with HVF's
+ *      default setting BRK (EC 0x3C) is already taken at EL1 through the guest vector. VEL1_CFG_CLEAR_DEBUG_TRAP adds
+ *      the call (set_trap_debug_exceptions(false), after the ACTLR read-back) for rung R4b only; it has never run
+ *      live. Either way the decoder accepts an EC 0x3C host exit (FAULT_SYNC, via_exit).
  * [D5] The blob (vcpu_el1_blob.S) is one position-independent 4 KiB page image:
  *        +0x000..0x7FF  vector table, 16 slots x 128 B; slot i = { hvc #(VEL1_HVC_VEC_BASE+i); b . }
  *        +0x800         syscall stub   { bti c; hvc #VEL1_HVC_SYSCALL;   ret; udf }
  *        +0x810         unix-call stub { bti c; hvc #VEL1_HVC_UNIX_CALL; ret; udf }
+ *        +0x820..0x88F  the TLBI stub [D18] (vel1_run_tlbi only)
  *      The vector touches NO register and NO memory: the host reads ESR/FAR/ELR/SPSR_EL1 (vk:1050-1053) and "plays
  *      eret" by setting PC/CPSR (vk:1080/1137). The proven page used hvc #1 in every slot (vk:1161); a distinct
  *      immediate per slot is new (rung R1 proves reading ISS[15:0]).
@@ -77,7 +84,8 @@
  *      VEL1_EXIT_NESTED_FAULT — fatal, never SEH. Only a kick ends the recursion, so a watchdog vel1_kick_remote is
  *      what turns that hang into this exit. (c) After ANY exit that leaves the real PC inside the blob (vector slots
  *      and both stubs), vel1_run refuses to re-enter (VEL1_E_NOT_RESUMED) until the caller writes PC; every PC write
- *      into the blob is refused (VEL1_E_PC_IN_BLOB) except vel1_state_restore of a state saved by vel1_state_save.
+ *      into the blob is refused (VEL1_E_PC_IN_BLOB) except vel1_state_restore of a state saved by vel1_state_save,
+ *      and vel1_run_tlbi's own entry into (and restore from) the TLBI stub [D18].
  *      So no path re-enters with PC on an hvc or a `b .`.
  * [D8] Kicks. hv_vcpus_exit is NOT async-signal-safe: it takes Hypervisor.framework's global vcpus os_unfair_lock and
  *      then a per-vCPU pthread_mutex (force_exit_vtimer_wait), and hv_vcpu_run's own entry may take the same global
@@ -152,6 +160,40 @@
  *      ID register HVF traps) is a TRAP with the decoded Rt/direction so Wine can emulate or skip it.
  *      The PC an hvc exit reports is taken as the hvc + 4 (VEL1_HVC_PC_IS_NEXT, inferred from the hvf_proto smoke:
  *      re-entering with PC untouched resumes AFTER the hvc; rung R1 measures it and the decoder records it).
+ * [D18] The initiator TLBI executor (gmm's "G11"; m1/README.md). vel1_run_tlbi(v, va, n) runs the blob's TLBI stub
+ *      (+0x820) on the CALLER'S OWN vCPU, which must be stopped at an exit (any vel1_run return; Wine is then
+ *      dispatching a syscall or a fault with its in-syscall mark set [D15]). No second thread, no wake, no slot.
+ *      OWNERSHIP: vel1 owns the saved-register contract, because only vel1 knows its own bookkeeping (pc_in_blob,
+ *      the logical PC/CPSR [D14], v->last). The gmm backend (Wine's, or m1/m1_exec.c) only decides WHO executes.
+ *      THE CONTRACT: the stub reads x0..x(k-1) (VA >> 12, k <= 8 per stub run; n <= 64 per call, run in chunks of 8)
+ *      and touches no memory and no other register. vel1 saves exactly what it writes: x0..x(k-1), PC and CPSR
+ *      (raw), sets x0..x(k-1), PC = the entry for k, CPSR = 0x3c5, runs to the stub's `hvc #0x102`, checks that
+ *      exit (EC 0x16, imm 0x102, PC == stub hvc + 4), and restores the saved values raw — the one other documented
+ *      bypass of [D7]/[D13] besides vel1_state_restore. pc_in_blob, the logical PC/CPSR and v->last are untouched,
+ *      so the caller's frame and every resume helper behave exactly as if the stub had never run.
+ *      COST: 3k + 7 accessors + one exit round trip (n = 1: 10 accessors).
+ *      ELR/SPSR (the vector-window question, reply Ask 2): the rule forbids switching the vCPU while it is INSIDE
+ *      the window (exception taken, the slot's hvc not yet executed). vel1_run normally re-enters in that state
+ *      (G3), but after 64 spurious cancels it can return VEL1_EXIT_CANCELED without looking at PC, so the argument
+ *      does NOT rest on the window: it rests on the stub never taking an exception, so the stub may run even while ELR_EL1 /
+ *      SPSR_EL1 / ESR_EL1 / FAR_EL1 hold a latched fault (a FAULT_SYNC exit: Wine's write-watch handler lowers
+ *      nothing but RAISES a valid descriptor, which the eager policy shoots down). The stub cannot clobber them:
+ *      only an EL1 exception writes them, and nothing in the stub can take one — every fetch is from the blob page,
+ *      which the vCPU already fetches for its vector and never changes [D7]; dsb/isb/tlbi do not fault at EL1 (HVF
+ *      does not trap TLBI: gmm G3b/G4b/G9); hvc exits to EL2; DAIF is masked (CPSR 0x3c5) and the vtimer is an EL2
+ *      exit. So vel1 does NOT save/restore them; it VERIFIES the assumption instead: any exit other than the stub's
+ *      own hvc at the expected PC — a vector hvc, a stage-2 abort, any other EC — returns VEL1_E_STUB, which is
+ *      fatal: the vCPU is left unresumable (NOT_RESUMED) and nothing is restored, so it can never resume with a
+ *      clobbered ELR/SPSR.
+ *      KICKS: in_run is set around each stub hv_vcpu_run (as vel1_run does), so the kicker and vel1_kick_remote can
+ *      exit it; a watchdog can still end a (never expected) stuck stub. A CANCELED inside the stub — latched or
+ *      from a kick — is absorbed: vel1 reads PC (it must lie in the stub, else VEL1_E_STUB), sets PC back to the
+ *      chunk's entry and re-enters, re-issuing every TLBI of the chunk and its final `dsb ish` on whichever PE runs
+ *      it. kick_pending is NEVER consumed here: the kick stays pending and the caller's next vel1_run reports it
+ *      (KICK, before entering). More than VEL1_MAX_SPURIOUS_CANCELED cancels in one chunk: the state is restored and
+ *      VEL1_E_BUSY returned (the shootdown did not complete; the caller uses another executor).
+ *      NOT BUILT: the whole-VMID form (`tlbi vmalle1is`, gmm's n > 64 request): it has never run in a vCPU, so there
+ *      is no stub for it and n > 64 is VEL1_E_ARG.
  */
 #ifndef VCPU_EL1_H
 #define VCPU_EL1_H
@@ -189,9 +231,19 @@ extern "C" {
 #define VEL1_STUB_SIZE 0x10u
 #define VEL1_STUB_HVC_INSN 1u /* instruction index of the hvc inside a stub (0 = bti c) */
 #define VEL1_STUB_RET_INSN 2u
+/* [D18] the TLBI stub: 8 entries `dsb ish; b t_k` (entry for k VAs at +0x820 + (8-k)*8), the chain of 8
+   `tlbi vale1is, x7..x0`, then `dsb ish; isb; hvc #0x102; b .` */
+#define VEL1_TLBI_STUB_OFF 0x820u
+#define VEL1_TLBI_ENTRY_SIZE 8u
+#define VEL1_TLBI_REGS 8u      /* VAs per stub run: x0..x7 */
+#define VEL1_TLBI_HVC_OFF 0x888u
+#define VEL1_TLBI_STUB_END 0x890u
+#define VEL1_TLBI_MAX_VA 64u   /* per vel1_run_tlbi call; gmm asks for the (unbuilt) whole-VMID form above 64 */
+#define VEL1_TLBI_ENTRY_OFF(k) (VEL1_TLBI_STUB_OFF + (VEL1_TLBI_REGS - (k)) * VEL1_TLBI_ENTRY_SIZE)
 
 #define VEL1_HVC_SYSCALL 0x0100u
 #define VEL1_HVC_UNIX_CALL 0x0101u
+#define VEL1_HVC_TLBI_DONE 0x0102u /* [D18] the TLBI stub's hvc (foreign, i.e. ILLEGAL, if vel1_run ever sees it) */
 #define VEL1_HVC_VEC_BASE 0x0200u /* + slot 0..15 */
 #define VEL1_HVC_USER_MIN 0x8000u /* 0x8000..0xFFFF: HOSTCALL, only inside cfg.hostcall_lo..hi [D17] */
 
@@ -216,6 +268,8 @@ enum {
   VEL1_E_PC_IN_BLOB = -8,  /* a PC write into the blob [D7] */
   VEL1_E_EXEC_MEMORY = -9, /* vel1_blob_install: destination is executable host memory [D5] */
   VEL1_E_NO_KICKER = -10,  /* the kicker thread or its semaphore could not be created */
+  VEL1_E_STUB = -11,       /* [D18] the TLBI stub ended in an unexpected exit: FATAL, the vCPU is left NOT_RESUMED */
+  VEL1_E_BUSY = -12,       /* [D18] too many CANCELEDs inside the stub: state restored, shootdown NOT done */
 };
 
 /* ---- the hv ops table [D1] -------------------------------------------------------------------------------- */
@@ -406,8 +460,10 @@ bool vel1_cancel_needs_elr(uint64_t pc, const vel1_layout* lay);
 
 /* ---- vCPU ------------------------------------------------------------------------------------------------ */
 #define VEL1_CFG_NO_ENTSO 1u
-#define VEL1_CFG_KEEP_DEBUG_TRAP_DEFAULT 2u
+/* 2u was VEL1_CFG_KEEP_DEBUG_TRAP_DEFAULT: keeping HVF's debug-trap default is now the default (R4a) [D4]. */
+#define VEL1_CFG_KEEP_DEBUG_TRAP_DEFAULT 2u /* deprecated no-op, accepted for old callers */
 #define VEL1_CFG_SYSCALL_MINIMAL_UNSAFE 4u /* 12-accessor SYSCALL plan; NOT safe for Wine [D9] */
+#define VEL1_CFG_CLEAR_DEBUG_TRAP 8u /* adds hv_vcpu_set_trap_debug_exceptions(false); NEVER run live (R4b) [D4] */
 
 typedef struct {
   uint64_t ttbr0;
@@ -429,6 +485,7 @@ typedef struct {
   uint64_t runs, exits, vtimer, canceled_spurious, canceled_window, wfx_stepped, kicks_reported;
   uint64_t kick_queued, kick_flag_only, kick_not_live, kick_wrong_thread, kick_signal_failed, kick_remote_sent;
   uint64_t kicker_exits; /* hv_vcpus_exit calls the kicker thread made for this vCPU */
+  uint64_t tlbi_calls, tlbi_runs, tlbi_canceled, tlbi_vtimer; /* [D18] vel1_run_tlbi */
 } vel1_stats;
 
 /* Caller-allocated in host-only memory; zero it before first use [D12]. Fields are private. */
@@ -453,6 +510,10 @@ typedef struct vel1_vcpu {
   _Atomic uint64_t kick_queued, kick_flag_only, kick_not_live, kick_wrong_thread, kick_signal_failed,
       kick_remote_sent, kicker_exits;
   uint64_t runs, exits, vtimer, canceled_spurious, canceled_window, wfx_stepped, kicks_reported;
+  /* [D18] appended: vel1_run_tlbi counters, and what an unexpected stub exit looked like (VEL1_E_STUB) */
+  uint64_t tlbi_calls, tlbi_runs, tlbi_canceled, tlbi_vtimer;
+  uint32_t tlbi_bad_reason;
+  uint64_t tlbi_bad_syndrome, tlbi_bad_pc;
 } vel1_vcpu;
 
 int vel1_vcpu_create(vel1_vcpu* v, const vel1_vcpu_cfg* cfg);
@@ -491,6 +552,16 @@ typedef struct {
 } vel1_state;
 int vel1_state_save(vel1_vcpu* v, vel1_state* s);
 int vel1_state_restore(vel1_vcpu* v, const vel1_state* s);
+
+/* ---- the initiator TLBI executor [D18] ---------------------------------------------------------------------- */
+/* On the owning thread, with the vCPU stopped at an exit (not from a handler inside vel1_run): `tlbi vale1is` for
+   each of va[0..n-1] (n = 1..VEL1_TLBI_MAX_VA; ASID 0), then `dsb ish; isb`, executed by this vCPU. On VEL1_OK every
+   VA is invalidated on every PE of the inner-shareable domain and the vCPU's registers, PC, CPSR and vel1's
+   bookkeeping are exactly as before; a pending kick is still pending. VEL1_E_STATE / VEL1_E_WRONG_THREAD /
+   VEL1_E_ARG / VEL1_E_BUSY: nothing to undo, the shootdown was not (or not certainly) done, use another executor.
+   VEL1_E_STUB: fatal for the vCPU (left NOT_RESUMED). VEL1_E_HV: fatal; if it failed while SAVING (before any write)
+   the vCPU is untouched and not marked NOT_RESUMED, otherwise it is left NOT_RESUMED. (Review 2026-09-23 #5.) */
+int vel1_run_tlbi(vel1_vcpu* v, const uint64_t* va, size_t n);
 
 /* ---- kicks [D8][D15] ------------------------------------------------------------------------------------ */
 typedef enum {
