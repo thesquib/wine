@@ -20,6 +20,27 @@
 #include <string.h>
 #include <sys/mman.h>
 
+// GMM_PROFILE (gmm.h TEST SUPPORT): per-phase wall time of thin_apply_locked, for gmm_bench only. Without the
+// macro every PROF_* below compiles to nothing.
+#ifdef GMM_PROFILE
+#include <time.h>
+static uint64_t g_prof_ns[GMM_PROF_N];
+static uint64_t g_prof_last;
+static inline uint64_t prof_now(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static inline void prof_lap(int ph) {
+  const uint64_t t = prof_now();
+  g_prof_ns[ph] += t - g_prof_last;
+  g_prof_last = t;
+}
+void gmm_debug_prof_get(uint64_t ns[GMM_PROF_N]) { memcpy(ns, g_prof_ns, sizeof g_prof_ns); }
+void gmm_debug_prof_reset(void) { memset(g_prof_ns, 0, sizeof g_prof_ns); }
+#define PROF_MARK() (g_prof_last = prof_now())
+#define PROF_LAP(ph) prof_lap(GMM_PROF_##ph)
+#else
+#define PROF_MARK() ((void)0)
+#define PROF_LAP(ph) ((void)0)
+#endif
+
 // ================================================================================================================
 // Backing guard (§2). VM_MAKE_TAG'd anonymous memory only; checked with mach_vm_region right before every
 // backend->s2_map(), exactly as required. This is the one place gmm.c talks to the kernel about memory *shape*
@@ -39,23 +60,45 @@ static void *gmm_host_alloc(size_t sz) {
 static void gmm_host_free(void *p, size_t sz) {
   if (p) munmap(p, sz);
 }
+// The shape of the ONE host VM map entry containing va (or, if va is in a gap, the next one above it: callers
+// check start <= va). PER-CHUNK OVERHEAD FIX (2026-09-23): this was mach_vm_region(VM_REGION_EXTENDED_INFO), whose
+// kernel side (vm_map_region_walk) visits every resident page of the entry to fill pages_resident & co. -- O(entry
+// size): measured 0.46 us at 16K, 29-45 us at 64 MiB, 178 us at 256 MiB. G12a's per-16K view_map loop over one
+// 64 MiB caller mmap therefore paid ~45 us per chunk for fields gmm never reads (gmm/README.md "Per-chunk
+// overhead"). mach_vm_region_recurse(VM_REGION_SUBMAP_SHORT_INFO_64) returns the same user_tag, protection and
+// external_pager (the kernel fills them from the same entry/object, just without the page loop) in ~0.85 us flat.
+// Measured to agree with EXTENDED on every class the guards care about: tag-250 anonymous RW (private, shared,
+// touched or not), read-only, file MAP_SHARED/MAP_PRIVATE (external_pager 1, tag 0), and the dyld shared region
+// (which it reports as a submap, refused below). nesting depth 0: a submap is never descended into, only refused.
+typedef struct {
+  uint64_t start, end;
+  unsigned tag, prot, external_pager, is_submap;
+} host_region_t;
+static int host_region_at(uint64_t va, host_region_t *out) {
+  mach_vm_address_t addr = (mach_vm_address_t)va;
+  mach_vm_size_t regsz = 0;
+  natural_t depth = 0;
+  vm_region_submap_short_info_data_64_t info;
+  mach_msg_type_number_t count = VM_REGION_SUBMAP_SHORT_INFO_COUNT_64;
+  const kern_return_t kr =
+      mach_vm_region_recurse(mach_task_self(), &addr, &regsz, &depth, (vm_region_recurse_info_t)&info, &count);
+  if (kr != KERN_SUCCESS) return -1;
+  *out = (host_region_t){.start = addr, .end = addr + regsz, .tag = info.user_tag, .prot = (unsigned)info.protection,
+                         .external_pager = info.external_pager, .is_submap = info.is_submap};
+  return 0;
+}
 // Returns 0 if [host, host+sz) is entirely our own VM_MAKE_TAG'd, non-executable anonymous memory; -1 otherwise.
 // Callers abort() on -1 (§2: "before every s2_map, mach_vm_region must show the GMM tag and no VM_PROT_EXECUTE,
 // else abort" — extends hvf_fex_vk.cpp:367-374's executable-anonymous-memory guard with the tag check).
 static int gmm_backing_check(void *host, size_t sz) {
-  mach_vm_address_t addr = (mach_vm_address_t)(uintptr_t)host;
-  mach_vm_size_t regsz = 0;
-  vm_region_extended_info_data_t info;
-  mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT;
-  mach_port_t obj = MACH_PORT_NULL;
-  kern_return_t kr =
-      mach_vm_region(mach_task_self(), &addr, &regsz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &count, &obj);
-  if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-  if (kr != KERN_SUCCESS) return -1;
-  if (addr > (mach_vm_address_t)(uintptr_t)host) return -1;         // nothing mapped at host: a gap
-  if (addr + regsz < (mach_vm_address_t)(uintptr_t)host + sz) return -1; // region doesn't cover the whole chunk
-  if (info.user_tag != GMM_VM_TAG) return -1;
-  if (info.protection & VM_PROT_EXECUTE) return -1;
+  const uint64_t va = (uint64_t)(uintptr_t)host;
+  host_region_t hr;
+  if (host_region_at(va, &hr) != 0) return -1;
+  if (hr.start > va) return -1;       // nothing mapped at host: a gap
+  if (hr.end < va + sz) return -1;    // region doesn't cover the whole chunk
+  if (hr.is_submap) return -1;
+  if (hr.tag != GMM_VM_TAG) return -1;
+  if (hr.prot & VM_PROT_EXECUTE) return -1;
   return 0;
 }
 
@@ -67,21 +110,11 @@ static int gmm_backing_check(void *host, size_t sz) {
 // the tag rides mmap's fd argument, but this does not rely on that). The region may be larger than the chunk (a
 // Wine view is one mmap). max_protection is NOT checked: mmap gives VM_PROT_ALL there, and the kernel already
 // refuses to add EXECUTE to a tag-250 mapping later (gmm/README.md "Design issues" 4).
-static int gmm_backing_check_caller(uint64_t va, size_t sz) {
-  mach_vm_address_t addr = (mach_vm_address_t)va;
-  mach_vm_size_t regsz = 0;
-  vm_region_extended_info_data_t ext;
-  mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT;
-  mach_port_t obj = MACH_PORT_NULL;
-  kern_return_t kr =
-      mach_vm_region(mach_task_self(), &addr, &regsz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&ext, &count, &obj);
-  if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-  if (kr != KERN_SUCCESS) return -1;
-  if (addr > va || addr + regsz < va + sz) return -1;  // a gap, or the chunk spans two regions
-  if (ext.user_tag != GMM_VM_TAG) return -1;
-  if (ext.external_pager != 0) return -1;
-  if ((ext.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_WRITE)) return -1;
-  return 0;
+// These are the region tests; the coverage test (the page lies wholly inside hr) is done by caller_region_end()
+// and caller_range_ok() below, the only two users.
+static int caller_region_shape_ok(const host_region_t *hr) {
+  return !hr->is_submap && hr->tag == GMM_VM_TAG && hr->external_pager == 0 &&
+         (hr->prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_READ | VM_PROT_WRITE);
 }
 
 // ================================================================================================================
@@ -300,6 +333,162 @@ typedef struct {
               // a sub-range unmap (split), so unmapping it is itself a sub-range unmap of the original call
 } s2rec_t;
 
+// ================================================================================================================
+// Ordered sets (PER-CHUNK OVERHEAD FIX, 2026-09-23): a treap over an index-linked node pool, used for the run
+// records (key: va) and the IPA free extents (key: lo; every node also carries the largest extent length in its
+// subtree, so a first fit is one O(log n) descent). They replace address-sorted arrays whose insert/remove was an
+// O(n) memmove (and whose first fit / "how much is free" were O(n) scans): 3.7 us per insert at 16k records in
+// descending order, measured (gmm/README.md "Per-chunk overhead"). Priorities come from a per-set xorshift, so the
+// shape is independent of the key pattern and the tree is deterministic run to run.
+// Nodes never move except when the pool grows, which happens ONLY in tset_reserve(). So a payload pointer stays
+// valid across inserts and removes of OTHER nodes, and a caller that reserved first can insert with no failure
+// path (the records' rule: reserve before anything in a call is mutated). Node 0 is the nil sentinel (all zero).
+typedef struct {
+  uint64_t key;     // rec.va / ext.lo
+  uint64_t len;     // ext.hi - ext.lo (IPA extents; 0 for records)
+  uint64_t maxlen;  // the largest len in this subtree
+  uint32_t l, r, pri, pad_;
+  union {
+    s2rec_t rec;
+    ipa_ext_t ext;
+  } u;
+} tnode_t;
+typedef struct {
+  tnode_t *n;
+  uint32_t cap, used, freel, nfree;  // pool: [1, used) handed out at some point, freel = LIFO list of freed ones
+  uint32_t root, count, seed;
+} tset_t;
+static void tn_pull(tnode_t *n, uint32_t x) {
+  uint64_t m = n[x].len;
+  if (n[n[x].l].maxlen > m) m = n[n[x].l].maxlen;
+  if (n[n[x].r].maxlen > m) m = n[n[x].r].maxlen;
+  n[x].maxlen = m;
+}
+// Splits subtree x into keys < key (*lo) and keys >= key (*hi).
+static void tn_split(tnode_t *n, uint32_t x, uint64_t key, uint32_t *lo, uint32_t *hi) {
+  if (!x) {
+    *lo = *hi = 0;
+    return;
+  }
+  if (n[x].key < key) {
+    *lo = x;
+    tn_split(n, n[x].r, key, &n[x].r, hi);
+  } else {
+    *hi = x;
+    tn_split(n, n[x].l, key, lo, &n[x].l);
+  }
+  tn_pull(n, x);
+}
+static uint32_t tn_merge(tnode_t *n, uint32_t a, uint32_t b) {  // every key in a < every key in b
+  if (!a || !b) return a ? a : b;
+  if (n[a].pri >= n[b].pri) {
+    n[a].r = tn_merge(n, n[a].r, b);
+    tn_pull(n, a);
+    return a;
+  }
+  n[b].l = tn_merge(n, a, n[b].l);
+  tn_pull(n, b);
+  return b;
+}
+// Makes `extra` more inserts possible without allocating. 0, or -1 (set unchanged) on allocation failure.
+static int tset_reserve(tset_t *t, size_t extra) {
+  const size_t used = t->used ? t->used : 1;  // index 0 is the sentinel
+  if ((size_t)t->nfree + (t->cap > used ? t->cap - used : 0) >= extra) return 0;
+  size_t nc = t->cap ? t->cap : 16;
+  while ((size_t)t->nfree + (nc - used) < extra) nc *= 2;
+  if (nc > UINT32_MAX) return -1;
+  tnode_t *nn = realloc(t->n, nc * sizeof(tnode_t));
+  if (!nn) return -1;
+  if (!t->n) memset(&nn[0], 0, sizeof nn[0]);
+  t->n = nn;
+  t->cap = (uint32_t)nc;
+  t->used = (uint32_t)used;
+  if (!t->seed) t->seed = 0x9E3779B9u;
+  return 0;
+}
+// Inserts a node with a key not already present (the caller guarantees it) and returns it; the caller fills u.
+static uint32_t tset_insert(tset_t *t, uint64_t key, uint64_t len) {
+  uint32_t x;
+  if (t->freel) {
+    x = t->freel;
+    t->freel = t->n[x].l;
+    t->nfree--;
+  } else if (t->used < t->cap) {
+    x = t->used++;
+  } else {
+    fprintf(stderr, "gmm: BUG: ordered-set insert without a reserved node -- aborting\n");
+    abort();
+  }
+  t->seed ^= t->seed << 13, t->seed ^= t->seed >> 17, t->seed ^= t->seed << 5;
+  tnode_t *n = t->n;
+  n[x] = (tnode_t){.key = key, .len = len, .maxlen = len, .pri = t->seed};
+  uint32_t a, b;
+  tn_split(n, t->root, key, &a, &b);
+  t->root = tn_merge(n, tn_merge(n, a, x), b);
+  t->count++;
+  return x;
+}
+static void tset_remove(tset_t *t, uint64_t key) {
+  tnode_t *n = t->n;
+  uint32_t a, m, b;
+  tn_split(n, t->root, key, &a, &b);
+  tn_split(n, b, key + 1, &m, &b);  // keys are 16K-aligned addresses: key + 1 never wraps
+  if (!m || n[m].l || n[m].r || n[m].key != key) {
+    fprintf(stderr, "gmm: BUG: ordered-set remove of absent key 0x%llx -- aborting\n", (unsigned long long)key);
+    abort();
+  }
+  n[m].l = t->freel;
+  n[m].r = 0;
+  t->freel = m;
+  t->nfree++;
+  t->root = tn_merge(n, a, b);
+  t->count--;
+}
+static uint32_t tset_floor(const tset_t *t, uint64_t key) {  // the node with the largest key <= key, or 0
+  uint32_t best = 0;
+  for (uint32_t x = t->root; x;) {
+    if (t->n[x].key <= key) {
+      best = x;
+      x = t->n[x].r;
+    } else {
+      x = t->n[x].l;
+    }
+  }
+  return best;
+}
+static uint32_t tset_first_fit(const tset_t *t, uint64_t len) {  // the lowest-keyed node with len >= len, or 0
+  for (uint32_t x = t->root; x;) {
+    const tnode_t *n = t->n;
+    if (n[n[x].l].maxlen >= len) x = n[x].l;
+    else if (n[x].len >= len) return x;
+    else if (n[n[x].r].maxlen >= len) x = n[x].r;
+    else return 0;
+  }
+  return 0;
+}
+// In-order node indices into out[] (at most max; returns how many nodes there are, max + 1 if more). Test support
+// only (gmm_debug_check).
+static size_t tn_inorder(const tnode_t *n, uint32_t x, uint32_t *out, size_t k, size_t max) {
+  if (!x || k > max) return k;
+  k = tn_inorder(n, n[x].l, out, k, max);
+  if (k < max) out[k] = x;
+  return tn_inorder(n, n[x].r, out, k + 1, max);
+}
+// Test support: the treap's own invariants (heap order, maxlen). Key order is checked by the caller in order.
+static int tn_check(const tnode_t *n, uint32_t x) {
+  if (!x) return 0;
+  int bad = 0;
+  uint64_t m = n[x].len;
+  for (int c = 0; c < 2; c++) {
+    const uint32_t y = c ? n[x].r : n[x].l;
+    if (!y) continue;
+    if (n[y].pri > n[x].pri) bad++;
+    if (n[y].maxlen > m) m = n[y].maxlen;
+    bad += tn_check(n, y);
+  }
+  return bad + (m != n[x].maxlen);
+}
+
 struct gmm {
   gmm_config_t cfg;
   gmm_backend_t backend;
@@ -316,8 +505,10 @@ struct gmm {
   // coalesced list of [lo, hi) extents so a run can get a CONTIGUOUS range. Allocation is first-fit (lowest
   // address), then the untouched top; a freed extent that reaches ipa_bump folds back into it. With one free
   // entry (G5b's recommit, N4) the result equals the old LIFO: the freed IPA comes straight back.
-  ipa_ext_t *ifree;
-  size_t nifree, capifree;
+  // PER-CHUNK OVERHEAD FIX: an ordered set (tset_t, above), with the total of its chunks kept alongside so
+  // ipa_available() is O(1).
+  tset_t ifree;
+  uint64_t ifree_chunks;
 
   gmm_region_t *regions;  // sorted by base, no overlaps
   size_t nregions, cap_regions;
@@ -325,8 +516,7 @@ struct gmm {
   tchunk_tab_t thin;  // Wine M1 thin API: stage-2-mapped identity chunks (see tchunk_t)
   // FAST MAPPING: the thin API's live stage-2 mappings ("run records"), sorted by va, disjoint, no holes. Every
   // thin chunk lies in exactly one record and its IPA is rec.ipa + (chunk va - rec.va).
-  s2rec_t *recs;
-  size_t nrecs, caprecs;
+  tset_t recs;  // PER-CHUNK OVERHEAD FIX: an ordered set keyed by va (was a sorted array)
   gmm_s2_stats_t st;  // counters (records/mapped/retained are computed on demand by gmm_vm_s2_stats)
 
   gmm_ev_t *trace;
@@ -426,11 +616,17 @@ int gmm_foreign_s2_map(gmm_t *gmm, void *host, uint64_t ipa, size_t sz, int perm
 // ================================================================================================================
 // Trace (TEST SUPPORT, gmm.h).
 static void trace_push_sz(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa, uint64_t sz) {
+#ifdef GMM_PROFILE
+  const uint64_t pt0 = prof_now();
+#endif
   if (g->ntrace == g->cap_trace) {
     g->cap_trace = g->cap_trace ? g->cap_trace * 2 : 256;
     g->trace = realloc(g->trace, g->cap_trace * sizeof(gmm_ev_t));
   }
   g->trace[g->ntrace++] = (gmm_ev_t){.kind = kind, .va = va, .ipa = ipa, .sz = sz};
+#ifdef GMM_PROFILE
+  g_prof_ns[GMM_PROF_TRACE] += prof_now() - pt0;
+#endif
 }
 // Every pre-FAST-MAPPING stage-2 event is one 16K chunk.
 static void trace_push(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa) {
@@ -599,68 +795,62 @@ static int ensure_range(gmm_t *g, const gmm_region_t *r, uint64_t va, uint64_t s
 // IPA allocator (§2).
 // FAST MAPPING: contiguous ranges. First-fit over the free extents (lowest address), then the untouched top.
 // Returns GMM_IPA_NONE if no free range of `n` contiguous chunks exists (there may still be n chunks in total).
+static void ext_insert(gmm_t *g, uint64_t lo, uint64_t hi) {  // a node must be available (reserved or just freed)
+  const uint32_t x = tset_insert(&g->ifree, lo, hi - lo);
+  g->ifree.n[x].u.ext = (ipa_ext_t){lo, hi};
+  g->ifree_chunks += (hi - lo) / 16384;
+}
+static void ext_remove(gmm_t *g, uint32_t x) {
+  const ipa_ext_t e = g->ifree.n[x].u.ext;
+  tset_remove(&g->ifree, e.lo);
+  g->ifree_chunks -= (e.hi - e.lo) / 16384;
+}
 static uint64_t alloc_ipa_range(gmm_t *g, uint64_t n) {
   const uint64_t sz = n * 16384;
-  for (size_t i = 0; i < g->nifree; i++) {
-    ipa_ext_t *e = &g->ifree[i];
-    if (e->hi - e->lo < sz) continue;
-    const uint64_t ipa = e->lo;
-    e->lo += sz;
-    if (e->lo == e->hi) {
-      memmove(e, e + 1, (g->nifree - i - 1) * sizeof *e);
-      g->nifree--;
-    }
-    return ipa;
+  const uint32_t x = tset_first_fit(&g->ifree, sz);
+  if (x) {
+    const ipa_ext_t e = g->ifree.n[x].u.ext;
+    ext_remove(g, x);
+    if (e.lo + sz < e.hi) ext_insert(g, e.lo + sz, e.hi);  // reuses the node just freed: cannot fail
+    return e.lo;
   }
   if (g->ipa_bump + sz < g->ipa_bump || g->ipa_bump + sz > g->cfg.ipa_hi) return GMM_IPA_NONE;
   const uint64_t ipa = g->ipa_bump;
   g->ipa_bump += sz;
   return ipa;
 }
-// Returns [ipa, ipa + n*16K) to the allocator: sorted insert, coalesced with both neighbours, folded into the top
-// if it reaches ipa_bump. Only ever called for a range that is provably NOT stage-2 mapped (never mapped, or after
-// its s2_unmap returned) -- an IPA whose map FAILED is never freed (quarantined forever, GMM_ES2).
+// Returns [ipa, ipa + n*16K) to the allocator: coalesced with both neighbours, folded into the top if it reaches
+// ipa_bump. Only ever called for a range that is provably NOT stage-2 mapped (never mapped, or after its s2_unmap
+// returned) -- an IPA whose map FAILED is never freed (quarantined forever, GMM_ES2).
 static void free_ipa_range(gmm_t *g, uint64_t ipa, uint64_t n) {
   uint64_t lo = ipa, hi = ipa + n * 16384;
-  size_t i = 0;
-  while (i < g->nifree && g->ifree[i].lo < lo) i++;
-  if (i > 0 && g->ifree[i - 1].hi == lo) {  // merge into the previous extent
-    i--;
-    lo = g->ifree[i].lo;
-    memmove(&g->ifree[i], &g->ifree[i + 1], (g->nifree - i - 1) * sizeof(ipa_ext_t));
-    g->nifree--;
+  const uint32_t p = tset_floor(&g->ifree, lo);
+  if (p && g->ifree.n[p].u.ext.hi == lo) {  // merge into the previous extent
+    lo = g->ifree.n[p].u.ext.lo;
+    ext_remove(g, p);
   }
-  if (i < g->nifree && g->ifree[i].lo == hi) {  // merge with the next extent
-    hi = g->ifree[i].hi;
-    memmove(&g->ifree[i], &g->ifree[i + 1], (g->nifree - i - 1) * sizeof(ipa_ext_t));
-    g->nifree--;
+  const uint32_t q = tset_floor(&g->ifree, hi);
+  if (q && g->ifree.n[q].u.ext.lo == hi) {  // merge with the next extent
+    hi = g->ifree.n[q].u.ext.hi;
+    ext_remove(g, q);
   }
   if (hi == g->ipa_bump) {  // reaches the untouched top: fold it back
     g->ipa_bump = lo;
     return;
   }
-  if (g->nifree == g->capifree) {
-    g->capifree = g->capifree ? g->capifree * 2 : 16;
-    ipa_ext_t *ni = realloc(g->ifree, g->capifree * sizeof(ipa_ext_t));
-    if (!ni) {  // cannot happen in practice (a few bytes); losing IPA space silently would be worse than stopping
-      fprintf(stderr, "gmm: out of memory growing the IPA free list -- aborting\n");
-      abort();
-    }
-    g->ifree = ni;
+  // Reserve only on the path that inserts (review 2026-09-23 #10): a merge above freed a node, so this cannot grow
+  // the pool then; only a lone new extent can. Nothing points into the pool here (lo/hi are values).
+  if (tset_reserve(&g->ifree, 1) != 0) {  // cannot happen in practice; losing IPA space silently would be worse
+    fprintf(stderr, "gmm: out of memory growing the IPA free list -- aborting\n");
+    abort();
   }
-  memmove(&g->ifree[i + 1], &g->ifree[i], (g->nifree - i) * sizeof(ipa_ext_t));
-  g->ifree[i] = (ipa_ext_t){lo, hi};
-  g->nifree++;
+  ext_insert(g, lo, hi);
 }
 static uint64_t alloc_ipa(gmm_t *g) { return alloc_ipa_range(g, 1); }
 static void free_ipa(gmm_t *g, uint64_t ipa) { free_ipa_range(g, ipa, 1); }
 // How many single-chunk alloc_ipa() calls are guaranteed to succeed right now (pre-check, Wine M1 fix 1b). An IPA
 // whose map FAILED is never freed (quarantined forever, GMM_ES2), so it is simply not counted here.
-static uint64_t ipa_available(const gmm_t *g) {
-  uint64_t n = (g->cfg.ipa_hi - g->ipa_bump) / 16384;
-  for (size_t i = 0; i < g->nifree; i++) n += (g->ifree[i].hi - g->ifree[i].lo) / 16384;
-  return n;
-}
+static uint64_t ipa_available(const gmm_t *g) { return (g->cfg.ipa_hi - g->ipa_bump) / 16384 + g->ifree_chunks; }
 
 // ================================================================================================================
 // TLBI batching helper: gathers up to two VAs (canonical + alias) per touched page into a caller-owned scratch
@@ -811,8 +1001,8 @@ void gmm_destroy(gmm_t *g) {
   }
   free(g->regions);
   free(g->thin.slots);  // thin chunks' host memory is the caller's: nothing to unmap here
-  free(g->ifree);
-  free(g->recs);
+  free(g->ifree.n);
+  free(g->recs.n);
   free(g->trace);
   pthread_mutex_destroy(&g->mtx);
   free(g);
@@ -1534,67 +1724,40 @@ static int thin_overlap_forbidden(gmm_t *g, uint64_t va, uint64_t sz) {
 
 // ================================================================================================================
 // FAST MAPPING (2026-09-23): run records (gmm.h "run record"; DESIGN-guest-memory-manager.md "Fast mapping").
-// Sorted by va; lookups are a binary search. Pointers into g->recs are invalidated by insert/remove, so callers
-// hold VAs, not pointers, across mutations.
-static size_t rec_upper(const gmm_t *g, uint64_t va) {  // first index with recs[i].va > va
-  size_t lo = 0, hi = g->nrecs;
-  while (lo < hi) {
-    const size_t mid = (lo + hi) / 2;
-    if (g->recs[mid].va <= va) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
+// An ordered set keyed by va (PER-CHUNK OVERHEAD FIX: was a sorted array with an O(n) memmove per insert/remove).
+// A record pointer stays valid until that record is removed; callers copy what they need before rec_remove().
 static s2rec_t *rec_find(gmm_t *g, uint64_t va) {
-  const size_t i = rec_upper(g, va);
-  if (!i) return NULL;
-  s2rec_t *r = &g->recs[i - 1];
-  return (va >= r->va && va < r->va + r->nchunks * 16384) ? r : NULL;
+  const uint32_t x = tset_floor(&g->recs, va);
+  if (!x) return NULL;
+  s2rec_t *r = &g->recs.n[x].u.rec;
+  return (va < r->va + r->nchunks * 16384) ? r : NULL;
 }
-static int rec_reserve(gmm_t *g, size_t extra) {
-  if (g->nrecs + extra <= g->caprecs) return 0;
-  size_t nc = g->caprecs ? g->caprecs : 16;
-  while (nc < g->nrecs + extra) nc *= 2;
-  s2rec_t *n = realloc(g->recs, nc * sizeof(s2rec_t));
-  if (!n) return -1;
-  g->recs = n;
-  g->caprecs = nc;
-  return 0;
-}
+static int rec_reserve(gmm_t *g, size_t extra) { return tset_reserve(&g->recs, extra); }
 static void rec_insert(gmm_t *g, s2rec_t r) {  // capacity reserved by the caller
-  const size_t i = rec_upper(g, r.va);
-  memmove(&g->recs[i + 1], &g->recs[i], (g->nrecs - i) * sizeof(s2rec_t));
-  g->recs[i] = r;
-  g->nrecs++;
+  const uint32_t x = tset_insert(&g->recs, r.va, 0);
+  g->recs.n[x].u.rec = r;
 }
-static void rec_remove(gmm_t *g, s2rec_t *r) {
-  const size_t i = (size_t)(r - g->recs);
-  memmove(&g->recs[i], &g->recs[i + 1], (g->nrecs - i - 1) * sizeof(s2rec_t));
-  g->nrecs--;
-}
+static void rec_remove(gmm_t *g, s2rec_t *r) { tset_remove(&g->recs, r->va); }
 
-// The caller-backing guard for a run: the host region containing va passes gmm_backing_check_caller's tests (tag
+// The caller-backing guard for a run: the host region containing va passes caller_region_shape_ok's tests (tag
 // 250, not file-backed, exactly READ|WRITE) and covers at least va's whole 16K page. Returns that region's end in
 // *end (a run never extends past it: one backend->s2_map call never spans two VM map entries). 0 or -1.
 static int caller_region_end(uint64_t va, uint64_t *end) {
-  mach_vm_address_t addr = (mach_vm_address_t)va;
-  mach_vm_size_t regsz = 0;
-  vm_region_extended_info_data_t ext;
-  mach_msg_type_number_t count = VM_REGION_EXTENDED_INFO_COUNT;
-  mach_port_t obj = MACH_PORT_NULL;
-  kern_return_t kr =
-      mach_vm_region(mach_task_self(), &addr, &regsz, VM_REGION_EXTENDED_INFO, (vm_region_info_t)&ext, &count, &obj);
-  if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
-  if (kr != KERN_SUCCESS || addr > va || addr + regsz < va + 16384) return -1;
-  if (ext.user_tag != GMM_VM_TAG || ext.external_pager != 0) return -1;
-  if ((ext.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_WRITE)) return -1;
-  *end = addr + regsz;
+  host_region_t hr;
+  if (host_region_at(va, &hr) != 0 || hr.start > va || hr.end < va + 16384 || !caller_region_shape_ok(&hr)) return -1;
+  *end = hr.end;
   return 0;
 }
 // Every 16K page of [va, va+sz) passes the caller guard (the range may span regions: used by PARANOID re-checks).
+// One query per host REGION, not per 16K page (a page passes iff the region containing it passes and covers it
+// whole; regions are 16K-aligned, so the next page not covered by this region starts exactly at its end). Was one
+// O(region) query per page: a PARANOID unmap of an N-chunk run inside one big caller mmap cost O(N x region).
 static int caller_range_ok(uint64_t va, uint64_t sz) {
-  for (uint64_t p = va; p < va + sz; p += 16384)
-    if (gmm_backing_check_caller(p, 16384) != 0) return 0;
+  for (uint64_t p = va; p < va + sz;) {
+    host_region_t hr;
+    if (host_region_at(p, &hr) != 0 || hr.start > p || hr.end < p + 16384 || !caller_region_shape_ok(&hr)) return 0;
+    p = hr.end & ~16383ull;  // every page of [p, that) lies wholly inside hr
+  }
   return 1;
 }
 static void paranoid_before_unmap(gmm_t *g, uint64_t va, uint64_t sz, uint64_t ipa) {
@@ -1629,6 +1792,7 @@ typedef struct {
 // emptied chunk.
 static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t *s1arr, unsigned s1uni,
                              int refuse_committed) {
+  PROF_MARK();
   if (!npages || (va % 4096) != 0) return GMM_EINVAL;
   const uint64_t sz = (uint64_t)npages * 4096;
   const uint64_t va_limit = 1ull << (64 - g->cfg.t0sz);
@@ -1653,6 +1817,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     rc = GMM_ENOMEM;
     goto out;
   }
+  PROF_LAP(ARGS);
   // ---- (A) plan + validate + reserve. Nothing observable changes in this phase. ----
   size_t need_map = 0;
   for (size_t ci = 0; ci < nchunks; ci++) {
@@ -1684,12 +1849,14 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     rc = GMM_ENOIPA;
     goto out;
   }
+  PROF_LAP(PLAN);
   for (size_t i = 0; i < npages; i++) {  // tables for every descriptor that will be valid (one lookup per 2 MiB)
     const uint64_t pva = va + i * 4096;
     if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
     if (pt_lookup_slot(g, pva)) continue;
     if ((rc = pt_ensure(g, pva)) != 0) goto out;
   }
+  PROF_LAP(PT);
   // Runs: maximal stretches of chunks gaining their first committed page, cut at the cap and at the end of the host
   // region the run starts in (the backing guard, checked once per region instead of once per chunk).
   for (size_t ci = 0; ci < nchunks; ci++) {
@@ -1704,6 +1871,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     grp[ngrp++] = (tgroup_t){.ci = ci, .n = n, .ipa = GMM_IPA_NONE};
     ci += n - 1;
   }
+  PROF_LAP(GUARD);
   // A contiguous IPA range per run. If the free space is fragmented, a run is split in halves until each piece
   // finds one (so only a genuine shortage -- already excluded above -- could fail; the loop keeps that honest).
   for (size_t gi = 0; gi < ngrp; gi++) {
@@ -1722,6 +1890,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     }
     grp[gi].ipa = ipa;
   }
+  PROF_LAP(IPA);
   // The run records this call will empty chunks of (plan and records are both VA-ordered: dedupe consecutively).
   for (size_t ci = 0; ci < nchunks; ci++) {
     if (!plan[ci].need_unmap) continue;
@@ -1756,6 +1925,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       nsaved_cap += 4 * surv;
     }
   }
+  PROF_LAP(URECS);
   tlbi_va = malloc((npages + nsaved_cap + 1) * sizeof(uint64_t));
   saved = malloc((nsaved_cap + 1) * sizeof(tsaved_t));
   if (!tlbi_va || !saved || tchunk_reserve(&g->thin, need_map) != 0 ||
@@ -1767,6 +1937,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
   for (size_t ci = 0; ci < nchunks; ci++)  // the reserve may have rehashed: re-resolve existing entries
     if (plan[ci].e) plan[ci].e = tchunk_find(&g->thin, plan[ci].va);
 
+  PROF_LAP(RESERVE);
   // ---- (B) stage-2 map every run. All-or-nothing. ----
   for (size_t gi = 0; gi < ngrp; gi++) {
     tgroup_t *gr = &grp[gi];
@@ -1795,6 +1966,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     trace_push_sz(g, GMM_EV_S2_MAP, gva, gr->ipa, gr->n * 16384);
     gr->mapped = 1;
   }
+  PROF_LAP(S2MAP);
   for (size_t gi = 0; gi < ngrp; gi++) {
     const tgroup_t *gr = &grp[gi];
     for (uint64_t k = 0; k < gr->n; k++) {
@@ -1808,6 +1980,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     g->st.map_bytes += gr->n * 16384;
   }
   // (insert never rehashes -- reserved above -- so every plan[].e stays valid from here on)
+  PROF_LAP(INSERT);
 
   // ---- (C) descriptors. Nothing below can fail. ----
   size_t ntlbi = 0;
@@ -1858,8 +2031,10 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     }
   }
 
+  PROF_LAP(DESC);
   // ---- (D) one batched shootdown for every descriptor that was valid and changed ----
   if (ntlbi) do_tlbi(g, tlbi_va, ntlbi);
+  PROF_LAP(TLBI);
 
   // ---- (E) stage-2 unmap what no committed page needs any more; free each IPA only after its unmap returned ----
   for (size_t k = 0; k < nurec; k++) {
@@ -1980,12 +2155,14 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     }
   }
   rc = 0;
+  PROF_LAP(UNMAP);
 out:
   free(plan);
   free(grp);
   free(urec);
   free(tlbi_va);
   free(saved);
+  PROF_LAP(FREE);
   return rc;
 }
 
@@ -2067,7 +2244,7 @@ int gmm_vm_s2_run(gmm_t *g, uint64_t va, uint64_t *run_va, uint64_t *run_ipa, ui
 void gmm_vm_s2_stats(gmm_t *g, gmm_s2_stats_t *out) {
   pthread_mutex_lock(&g->mtx);
   *out = g->st;
-  out->records = g->nrecs;
+  out->records = g->recs.count;
   out->mapped_chunks = g->thin.n;
   out->retained_chunks = 0;
   for (size_t i = 0; i < g->thin.cap; i++)
@@ -2089,9 +2266,8 @@ uint64_t gmm_debug_ipa_available(gmm_t *g) {
 }
 static int ipa_in_free(const gmm_t *g, uint64_t ipa) {
   if (ipa >= g->ipa_bump && ipa < g->cfg.ipa_hi) return 1;
-  for (size_t i = 0; i < g->nifree; i++)
-    if (ipa >= g->ifree[i].lo && ipa < g->ifree[i].hi) return 1;
-  return 0;
+  const uint32_t x = tset_floor(&g->ifree, ipa);
+  return x && ipa < g->ifree.n[x].u.ext.hi;
 }
 static int cmp_rec_ipa(const void *a, const void *b) {
   const s2rec_t *x = a, *y = b;
@@ -2101,20 +2277,49 @@ int gmm_debug_check(gmm_t *g) {
   int bad = 0;
 #define DBAD(...) (bad++, fprintf(stderr, "gmm_debug_check: " __VA_ARGS__), fputc('\n', stderr))
   pthread_mutex_lock(&g->mtx);
+  // Both ordered sets, flattened in key order (their treap invariants -- heap order, subtree max -- checked too).
+  const size_t nifree = g->ifree.count, nrecs = g->recs.count;
+  ipa_ext_t *ifree = malloc((nifree + 1) * sizeof(ipa_ext_t));
+  s2rec_t *recs = malloc((nrecs + 1) * sizeof(s2rec_t));
+  uint32_t *idx = malloc((nifree + nrecs + 1) * sizeof(uint32_t));
+  if (!ifree || !recs || !idx) {
+    DBAD("out of memory");
+    free(ifree), free(recs), free(idx);
+    pthread_mutex_unlock(&g->mtx);
+    return bad;
+  }
+  if (tn_inorder(g->ifree.n, g->ifree.root, idx, 0, nifree) != nifree) DBAD("free-extent set count %zu != its nodes", nifree);
+  for (size_t i = 0; i < nifree; i++) {
+    ifree[i] = g->ifree.n[idx[i]].u.ext;
+    if (g->ifree.n[idx[i]].key != ifree[i].lo || g->ifree.n[idx[i]].len != ifree[i].hi - ifree[i].lo)
+      DBAD("free extent %zu: node key/len disagree with its extent", i);
+  }
+  if (tn_inorder(g->recs.n, g->recs.root, idx, 0, nrecs) != nrecs) DBAD("record set count %zu != its nodes", nrecs);
+  for (size_t i = 0; i < nrecs; i++) {
+    recs[i] = g->recs.n[idx[i]].u.rec;
+    if (g->recs.n[idx[i]].key != recs[i].va) DBAD("record %zu: node key != its va", i);
+  }
+  if (nifree && tn_check(g->ifree.n, g->ifree.root)) DBAD("free-extent treap invariants broken");
+  if (nrecs && tn_check(g->recs.n, g->recs.root)) DBAD("record treap invariants broken");
   // free list: sorted, coalesced, aligned, inside [ipa_lo, bump), never touching the bump (it would have folded)
-  for (size_t i = 0; i < g->nifree; i++) {
-    const ipa_ext_t *e = &g->ifree[i];
+  uint64_t free_chunks = 0;
+  for (size_t i = 0; i < nifree; i++) {
+    const ipa_ext_t *e = &ifree[i];
     if (e->lo >= e->hi || (e->lo | e->hi) % 16384 || e->lo < g->cfg.ipa_lo || e->hi >= g->ipa_bump)
       DBAD("free extent %zu [0x%llx,0x%llx) malformed (bump 0x%llx)", i, (unsigned long long)e->lo,
            (unsigned long long)e->hi, (unsigned long long)g->ipa_bump);
-    if (i + 1 < g->nifree && e->hi >= g->ifree[i + 1].lo) DBAD("free extents %zu/%zu not sorted+coalesced", i, i + 1);
+    if (i + 1 < nifree && e->hi >= ifree[i + 1].lo) DBAD("free extents %zu/%zu not sorted+coalesced", i, i + 1);
+    free_chunks += (e->hi - e->lo) / 16384;
   }
+  if (free_chunks != g->ifree_chunks)
+    DBAD("free-extent total %llu chunks != the kept counter %llu", (unsigned long long)free_chunks,
+         (unsigned long long)g->ifree_chunks);
   // records: sorted, disjoint in VA, every chunk present with the record's IPA arithmetic, never in the free list
   uint64_t rec_chunks = 0;
-  for (size_t i = 0; i < g->nrecs; i++) {
-    const s2rec_t *r = &g->recs[i];
+  for (size_t i = 0; i < nrecs; i++) {
+    const s2rec_t *r = &recs[i];
     if (!r->nchunks || r->va % 16384 || r->ipa % 16384) DBAD("record %zu malformed", i);
-    if (i + 1 < g->nrecs && r->va + r->nchunks * 16384 > g->recs[i + 1].va) DBAD("records %zu/%zu overlap in VA", i, i + 1);
+    if (i + 1 < nrecs && r->va + r->nchunks * 16384 > recs[i + 1].va) DBAD("records %zu/%zu overlap in VA", i, i + 1);
     rec_chunks += r->nchunks;
     for (uint64_t c = 0; c < r->nchunks; c++) {
       const tchunk_t *t = tchunk_find(&g->thin, r->va + c * 16384);
@@ -2141,17 +2346,13 @@ int gmm_debug_check(gmm_t *g) {
   }
   if (rec_chunks != g->thin.n)
     DBAD("records cover %llu chunks, chunk table has %zu", (unsigned long long)rec_chunks, g->thin.n);
-  if (g->nrecs) {  // disjoint in IPA
-    s2rec_t *by_ipa = malloc(g->nrecs * sizeof(s2rec_t));
-    if (by_ipa) {
-      memcpy(by_ipa, g->recs, g->nrecs * sizeof(s2rec_t));
-      qsort(by_ipa, g->nrecs, sizeof(s2rec_t), cmp_rec_ipa);
-      for (size_t i = 0; i + 1 < g->nrecs; i++)
-        if (by_ipa[i].ipa + by_ipa[i].nchunks * 16384 > by_ipa[i + 1].ipa)
-          DBAD("records overlap in IPA at 0x%llx", (unsigned long long)by_ipa[i + 1].ipa);
-      free(by_ipa);
-    }
+  if (nrecs) {  // disjoint in IPA (recs is our own copy: sort it in place)
+    qsort(recs, nrecs, sizeof(s2rec_t), cmp_rec_ipa);
+    for (size_t i = 0; i + 1 < nrecs; i++)
+      if (recs[i].ipa + recs[i].nchunks * 16384 > recs[i + 1].ipa)
+        DBAD("records overlap in IPA at 0x%llx", (unsigned long long)recs[i + 1].ipa);
   }
+  free(ifree), free(recs), free(idx);
   // legacy chunks and section chunks: never in the free list
   for (size_t i = 0; i < g->nregions; i++) {
     const gmm_region_t *r = &g->regions[i];

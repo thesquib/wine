@@ -100,7 +100,7 @@ enum {
   // PARANOID ORDERING CHECK (thin/identity API only): re-run the caller-backing guard on a chunk right before
   // every stage-2 unmap of it. If the caller changed or removed its host mapping while gmm still had the chunk
   // stage-2 mapped (i.e. broke the "gmm hook first, host mapping change after" rule, README "Wine M1 fixes"),
-  // gmm aborts instead of unmapping and freeing the IPA. Costs one mach_vm_region per 16K unmap. On in tests.
+  // gmm aborts instead of unmapping and freeing the IPA. Costs one region query per host VM entry the unmap spans. On in tests.
   GMM_CFG_PARANOID = 0x2,
   // FAST MAPPING, revoke policy for a chunk inside a multi-chunk stage-2 run (only matters with s2_run_chunks > 1).
   // Without this flag (the default, "split"): hv_vm_unmap of just the emptied sub-range. If the backend REFUSES a
@@ -447,6 +447,33 @@ typedef struct {
 size_t gmm_trace_count(gmm_t *gmm);
 gmm_ev_t gmm_trace_get(gmm_t *gmm, size_t i);
 void gmm_trace_clear(gmm_t *gmm);
+
+#ifdef GMM_PROFILE
+// TEST SUPPORT, compiled in only with -DGMM_PROFILE (gmm_bench.c; never the harness or the test suite): wall time
+// per phase of the thin mutator (thin_apply_locked), accumulated process-wide since the last reset. Each phase
+// boundary is one clock read (CLOCK_UPTIME_RAW, 24 MHz on Apple silicon, so single laps are quantised to ~42 ns;
+// only sums over many calls mean anything). GMM_PROF_TRACE is nested inside the other phases (mostly DESC): it is
+// reported on its own and is ALSO included in its enclosing phase.
+typedef enum {
+  GMM_PROF_ARGS,       // lock taken -> arguments validated, legacy-region/alias overlap checked
+  GMM_PROF_PLAN,       // per-chunk plan (chunk-hash lookups, masks) + ipa_available
+  GMM_PROF_PT,         // stage-1 table allocation (pt_ensure)
+  GMM_PROF_GUARD,      // runs: caller_region_end (the host-region query, once per run)
+  GMM_PROF_IPA,        // contiguous IPA allocation per run
+  GMM_PROF_URECS,      // which run records lose chunks (+ the remap policy's survivor scan)
+  GMM_PROF_RESERVE,    // scratch buffers, chunk-hash and record reservation
+  GMM_PROF_S2MAP,      // backend->s2_map calls
+  GMM_PROF_INSERT,     // chunk-hash inserts + run-record inserts
+  GMM_PROF_DESC,       // descriptor writes (+ committed masks, + the remap policy's survivor invalidation)
+  GMM_PROF_TLBI,       // the batched shootdown
+  GMM_PROF_UNMAP,      // stage-2 unmaps, record removal/split, IPA free
+  GMM_PROF_FREE,       // scratch frees
+  GMM_PROF_TRACE,      // trace_push (nested: see above)
+  GMM_PROF_N
+} gmm_prof_phase_t;
+void gmm_debug_prof_get(uint64_t ns[GMM_PROF_N]);  // copies the sums
+void gmm_debug_prof_reset(void);
+#endif
 
 #ifdef __cplusplus
 }
