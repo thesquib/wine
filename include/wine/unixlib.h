@@ -89,6 +89,10 @@ NTSYSAPI void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pai
  * keeps writing (the server's session shared memory) must therefore stay a host mapping to be read live. Never
  * visible to PE code; ignored outside vCPU mode. Unused by Windows (0x0200_0000-0x0800_0000 are free). */
 #define MEM_WINE_HOST_ONLY 0x08000000
+
+/* arm64 vCPU mode: the process's KUSER_SHARED_DATA as the host sees it. 0x7ffe0000 exists only in the guest (it is
+ * below the loader's 4 GiB PAGEZERO); unix-side readers take this pointer instead. */
+NTSYSAPI const struct _KUSER_SHARED_DATA *__wine_user_shared_data(void);
 #endif
 NTSYSAPI void ntdll_add_syscall_debug_info( UINT idx, const char **syscall_names,
                                             const char **usercall_names );
