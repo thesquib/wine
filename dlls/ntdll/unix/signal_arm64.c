@@ -180,19 +180,7 @@ C_ASSERT( offsetof(struct apc_stack_layout, context) == 0x30 );
 C_ASSERT( sizeof(struct apc_stack_layout) == 0x3d0 );
 
 /* stack layout when calling KiUserCallbackDispatcher */
-struct callback_stack_layout
-{
-    void                *args;           /* 000 arguments */
-    ULONG                len;            /* 008 arguments len */
-    ULONG                id;             /* 00c function id */
-    ULONG64              unknown;        /* 010 */
-    ULONG64              lr;             /* 018 */
-    ULONG64              sp;             /* 020 sp+pc (machine frame) */
-    ULONG64              pc;             /* 028 */
-    BYTE                 args_data[0];   /* 030 copied argument data*/
-};
-C_ASSERT( offsetof(struct callback_stack_layout, sp) == 0x20 );
-C_ASSERT( sizeof(struct callback_stack_layout) == 0x30 );
+/* struct callback_stack_layout is in vcpu_arm64.h, shared with the vCPU mode */
 
 /* struct syscall_frame and RESTORE_FLAGS_EMULATION are in vcpu_arm64.h, shared with the vCPU mode */
 
@@ -859,6 +847,21 @@ void vcpu_raise_exception( struct syscall_frame *frame, EXCEPTION_RECORD *rec, U
     frame->sp = (ULONG_PTR)stack;
     frame->pc = (ULONG_PTR)pKiUserExceptionDispatcher;
     frame->x[18] = (ULONG_PTR)NtCurrentTeb();
+}
+
+/***********************************************************************
+ *           vcpu_raise_exception_second_chance
+ *
+ * vCPU mode: what the EL0 handler does for __fastfail (brk #0xf003): straight to the second chance, no user
+ * handlers. NtRaiseException either terminates the process or, when a debugger continued, has set the frame.
+ */
+void vcpu_raise_exception_second_chance( struct syscall_frame *frame, EXCEPTION_RECORD *rec )
+{
+    CONTEXT context;
+
+    context_from_frame( &context, frame );
+    context.ContextFlags |= CONTEXT_FLOATING_POINT;
+    NtRaiseException( rec, &context, FALSE );
 }
 
 
