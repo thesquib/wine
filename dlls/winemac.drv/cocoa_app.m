@@ -56,6 +56,21 @@ bool macdrv_err_on;
  * the mouse + cursor unconditionally. */
 BOOL macdrv_mouse_disassociated = NO;
 
+/* PROTON_CURSOR_DIAG=1: log the cursor hide/show decisions as [CURSOR-DIAG] lines on stderr (transitions only).
+ * For the "macOS pointer stays visible and frozen in-game" report (KCD2, 2026-09-23): tells whether the game ever
+ * hides the cursor, sets a (possibly blank) cursor image instead, or winemac unhides a cursor the game wants hidden
+ * because no Wine window is under the frozen pointer. */
+static BOOL cursor_diag(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_CURSOR_DIAG");
+        cached = (v && v[0] && strcmp(v, "0")) ? 1 : 0;
+    }
+    return cached;
+}
+
 void macdrv_restore_mouse_association(void)
 {
     /* Safe to call from any thread / context, including atexit on a
@@ -1336,6 +1351,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
             }
             if (cursorHidden)
             {
+                if (clientWantsCursorHidden && cursor_diag())
+                    fprintf(stderr, "[CURSOR-DIAG] unhiding a cursor the app wants hidden: no Wine window under the "
+                            "pointer (mouse disassociated %d, clipping %d)\n", macdrv_mouse_disassociated,
+                            self.clippingCursor);
                 [NSCursor unhide];
                 cursorHidden = FALSE;
             }
@@ -1347,6 +1366,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (!clientWantsCursorHidden)
         {
             clientWantsCursorHidden = TRUE;
+            if (cursor_diag())
+                fprintf(stderr, "[CURSOR-DIAG] app hides the cursor (Wine window under the pointer %d, mouse "
+                        "disassociated %d, clipping %d)\n", lastTargetWindow != nil, macdrv_mouse_disassociated,
+                        self.clippingCursor);
             [self updateCursor:TRUE];
         }
     }
@@ -1356,6 +1379,9 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (clientWantsCursorHidden)
         {
             clientWantsCursorHidden = FALSE;
+            if (cursor_diag())
+                fprintf(stderr, "[CURSOR-DIAG] app shows the cursor (mouse disassociated %d, clipping %d)\n",
+                        macdrv_mouse_disassociated, self.clippingCursor);
             [self updateCursor:FALSE];
         }
     }
@@ -1410,6 +1436,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
         if (self.cursorFrames == frames || [self.cursorFrames isEqualToArray:frames])
             return;
 
+        if (cursor_diag())
+            fprintf(stderr, "[CURSOR-DIAG] app sets a cursor image (%lu frame(s); hidden-wanted %d, mouse "
+                    "disassociated %d)\n", (unsigned long)[frames count], clientWantsCursorHidden,
+                    macdrv_mouse_disassociated);
         self.cursorFrames = frames;
         cursorFrame = 0;
         [cursorTimer invalidate];
