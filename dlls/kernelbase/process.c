@@ -589,6 +589,28 @@ static int battleye_launcher_redirect_hack( const WCHAR *app_name, WCHAR *new_na
     return 1;
 }
 
+/* Proton macOS 2026-09-25: PMW_CEF_EXTRA_FLAGS appends its value to the main steamwebhelper.exe browser process's
+ * command line (not to --type= children), after any injected flags: Chromium diagnostics such as
+ * "--enable-logging --v=1" for the vCPU route, where the webhelper never launches a renderer. */
+static const WCHAR *cef_extra_flags( const WCHAR *cmd, const WCHAR *full_cmdline, const WCHAR *append )
+{
+    static WCHAR buffer[2048];
+    char extra[1024];
+    DWORD len;
+
+    if (!cmd || !wcsstr( cmd, L"steamwebhelper.exe" ) || (full_cmdline && wcsstr( full_cmdline, L"--type=" )))
+        return append;
+    if (!(len = GetEnvironmentVariableA( "PMW_CEF_EXTRA_FLAGS", extra, sizeof(extra) )) || len >= sizeof(extra))
+        return append;
+    buffer[0] = 0;
+    if (append) lstrcpynW( buffer, append, ARRAY_SIZE(buffer) - 2 );
+    len = wcslen( buffer );
+    buffer[len++] = ' ';
+    MultiByteToWideChar( CP_ACP, 0, extra, -1, buffer + len, ARRAY_SIZE(buffer) - len );
+    FIXME( "HACK: PMW_CEF_EXTRA_FLAGS, appending %s to command line.\n", debugstr_w(buffer) );
+    return buffer;
+}
+
 static const WCHAR *hack_append_command_line( const WCHAR *cmd, const WCHAR *full_cmdline )
 {
     static const struct
@@ -691,10 +713,10 @@ static const WCHAR *hack_append_command_line( const WCHAR *cmd, const WCHAR *ful
                     continue;
             }
             FIXME( "HACK: appending %s to command line.\n", debugstr_w(options[i].append) );
-            return options[i].append;
+            return cef_extra_flags( cmd, full_cmdline, options[i].append );
         }
     }
-    return NULL;
+    return cef_extra_flags( cmd, full_cmdline, NULL );
 }
 
 static void sync_env_var_to_unix( WCHAR *env, const char *name )
