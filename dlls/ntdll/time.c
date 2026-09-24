@@ -382,6 +382,24 @@ LONGLONG WINAPI RtlGetSystemTimePrecise( void )
  */
 BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter )
 {
+#if defined(__aarch64__) || defined(__arm64ec__)
+    /* PROTON_DARWIN, vCPU mode (PMW_VCPU_FAST_QPC): the virtual counter instead of a syscall, which there is a VM
+     * exit (DOOM Eternal: ~4,700 a frame). The vCPU KUSER publisher sets QpcFrequency to TICKSPERSEC only while
+     * QpcBias holds mach_continuous_time() - mach_absolute_time(), and every vCPU reads CNTVCT_EL0 as
+     * mach_absolute_time() (vcpu_el1 [D19]): so this is the unix side's mach_continuous_time() * 125 / 3 / 100,
+     * i.e. the same value NtQueryPerformanceCounter returns. The bias only ever moves forward, so readings stay
+     * monotonic. Everywhere else QpcFrequency is 0 and nothing changes. */
+    if (__atomic_load_n( &user_shared_data->QpcFrequency, __ATOMIC_ACQUIRE ) == TICKSPERSEC)
+    {
+        ULONG64 cnt, freq;
+
+        __asm__ __volatile__( "isb; mrs %0, cntvct_el0" : "=r" (cnt) :: "memory" );
+        __asm__ ( "mrs %0, cntfrq_el0" : "=r" (freq) );
+        cnt += __atomic_load_n( &user_shared_data->QpcBias, __ATOMIC_RELAXED );
+        counter->QuadPart = cnt / freq * TICKSPERSEC + cnt % freq * TICKSPERSEC / freq;
+        return TRUE;
+    }
+#endif
     NtQueryPerformanceCounter( counter, NULL );
     return TRUE;
 }
