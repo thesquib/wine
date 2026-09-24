@@ -779,7 +779,10 @@ VkResult WINAPI vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferA
  * externally synchronized, so its queue needs no lock. 64-bit only.
  */
 #define VK_BATCH_MIN   (64 * 1024)
-#define VK_BATCH_MAX   (4 * 1024 * 1024)
+/* capped well below the heap's large-block size: a bigger queue buys almost nothing (a replay per ~4,000 calls is
+ * one exit in 4,000) and costs virtual memory calls, which in the vCPU mode serialize on virtual_mutex (4 recording
+ * threads growing 4 MB queues ran 1.2-3x slower than without batching) */
+#define VK_BATCH_MAX   (256 * 1024)
 
 BOOL vk_batch_enabled;
 
@@ -823,8 +826,9 @@ void *vk_batch_begin(VkCommandBuffer buffer, UINT32 code, const void *params, SI
         vk_batch_flush(buffer);
         size = buffer->batch_size ? min(buffer->batch_size * 2, VK_BATCH_MAX) : VK_BATCH_MIN;
         while (size < need && size < VK_BATCH_MAX) size *= 2;
-        if (size > buffer->batch_size && (batch = realloc(buffer->batch, size)))
+        if (size > buffer->batch_size && (batch = malloc(size)))  /* empty now: nothing to carry over */
         {
+            free(buffer->batch);
             buffer->batch = batch;
             buffer->batch_size = size;
         }
