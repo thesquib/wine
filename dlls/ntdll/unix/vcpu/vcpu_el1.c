@@ -441,6 +441,15 @@ static int program_vcpu(vel1_vcpu* v, const vel1_vcpu_cfg* c, uint32_t ips) {
   HVCHK(v, o->set_sys_reg(id, HV_SYS_REG_VBAR_EL1, c->blob_va + VEL1_VECTORS_OFF));
   HVCHK(v, o->set_sys_reg(id, HV_SYS_REG_CPACR_EL1, VEL1_CPACR_EL1));
   HVCHK(v, o->set_sys_reg(id, HV_SYS_REG_SCTLR_EL1, VEL1_SCTLR_EL1));
+  /* [D19] guest CNTVCT_EL0 == mach_absolute_time(): HVF's default first (for the stats), then 0, read back. Here, not
+     after the EnTSO block, so the ACTLR read-back stays immediately followed by R4b's debug-trap call [D4]. */
+  HVCHK(v, o->get_vtimer_offset(id, &v->vtimer_default));
+  if (!(c->flags & VEL1_CFG_KEEP_VTIMER)) {
+    HVCHK(v, o->set_vtimer_offset(id, VEL1_VTIMER_OFFSET));
+    uint64_t off = ~VEL1_VTIMER_OFFSET;
+    HVCHK(v, o->get_vtimer_offset(id, &off));
+    if (off != VEL1_VTIMER_OFFSET) return VEL1_E_VTIMER; /* the create's caller destroys the vCPU, as for ENTSO */
+  }
   if (!(c->flags & VEL1_CFG_NO_ENTSO)) {
     HVCHK(v, o->set_sys_reg(id, HV_SYS_REG_ACTLR_EL1, VEL1_ACTLR_EL1_ENTSO));
     uint64_t actlr = 0; /* vk:971-975 */
@@ -1173,4 +1182,5 @@ void vel1_get_stats(vel1_vcpu* v, vel1_stats* s) {
   s->tlbi_canceled = v->tlbi_canceled;
   s->tlbi_vtimer = v->tlbi_vtimer;
   s->tlbi_all_calls = v->tlbi_all_calls;
+  s->vtimer_default = v->vtimer_default;
 }
