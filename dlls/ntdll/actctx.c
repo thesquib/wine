@@ -3200,7 +3200,9 @@ static WCHAR *lookup_manifest_file( HANDLE dir, struct assembly_identity *ai )
     RtlInitUnicodeString( &lookup_us, lookup );
 
 #ifdef __arm64ec__
-    if (!wcsncmp( lookup, L"amd64_", 6 )) memcpy( lookup, L"a??", 3 * sizeof(WCHAR) );
+    /* both ways: "*" resolves to arm64, while an ARM64EC-only build installs its manifests as amd64 */
+    if (!wcsncmp( lookup, L"amd64_", 6 ) || !wcsncmp( lookup, L"arm64_", 6 ))
+        memcpy( lookup, L"a??", 3 * sizeof(WCHAR) );
 #endif
 
     if (!NtQueryDirectoryFile( dir, 0, NULL, NULL, &io, buffer, sizeof(buffer),
