@@ -587,7 +587,7 @@ static struct prof_bucket *prof_sys_bucket( UINT id )
 
 struct prof_row
 {
-    const char *name;
+    const char *name;                   /* NULL: buf (rows are sorted, so never point into one) */
     char        buf[24];
     uint64_t    count, ticks;
 };
@@ -645,17 +645,17 @@ static void *prof_thread( void *arg )
             if (i < NSYS)
             {
                 UINT id = ((i / 4096) << 12) | (i % 4096);
-                if (!(r->name = ntdll_syscall_name( id )))
+                if (!(r->name = ntdll_syscall_name( id )) || !r->name[0])
                 {
+                    r->name = NULL;
                     snprintf( r->buf, sizeof(r->buf), "syscall %04x", id );
-                    r->name = r->buf;
                 }
                 if (prof_is_wait( r->name )) wait += r->ticks;
             }
             else
             {
                 snprintf( r->buf, sizeof(r->buf), "exit:%s", vel1_exit_kind_name( i - NSYS ));
-                r->name = r->buf;
+                r->name = NULL;
             }
             host += r->ticks;
             n++;
@@ -664,12 +664,13 @@ static void *prof_thread( void *arg )
         guest_t = atomic_load_explicit( &prof_guest.ticks, memory_order_relaxed );
         qsort( rows, n, sizeof(rows[0]), prof_row_cmp );
 
-        fprintf( stderr, "[VCPU-PROF] t=%.1f s: guest %.3f s (%llu entries) | host after exits %.3f s, of it waits "
-                 "%.3f s | process CPU %.3f s over %u s\n", (prof_now() - start) / hz,
+        fprintf( stderr, "[VCPU-PROF] pid %d t=%.1f s: guest %.3f s (%llu entries) | host after exits %.3f s, of it waits "
+                 "%.3f s | process CPU %.3f s over %u s\n", (int)getpid(), (prof_now() - start) / hz,
                  (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
                  host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
         for (i = 0; i < n && i < 14; i++)
-            fprintf( stderr, "[VCPU-PROF]   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n", rows[i].name,
+            fprintf( stderr, "[VCPU-PROF] pid %d   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n",
+                     (int)getpid(), rows[i].name ? rows[i].name : rows[i].buf,
                      (unsigned long long)rows[i].count, rows[i].ticks / hz, rows[i].ticks / hz * 1e6 / rows[i].count,
                      prof_is_wait( rows[i].name ) ? "  (wait)" : "" );
         last_count[NROWS] = guest_c;
