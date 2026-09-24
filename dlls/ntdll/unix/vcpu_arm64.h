@@ -48,6 +48,8 @@ enum vcpu_prof_id
     VCPU_PROF_FAULT_RETRY,   /* fault:retry      gmm says the live descriptor allows it: resumed */
     VCPU_PROF_FAULT_HANDLED, /* fault:handled    virtual_handle_fault (guard, write watch, stack): resumed */
     VCPU_PROF_FAULT_RAISED,  /* fault:raised     an exception delivered to the guest */
+    VCPU_PROF_S2_MAP,        /* in:hv_vm_map     gmm's stage-2 map backend */
+    VCPU_PROF_S2_UNMAP,      /* in:hv_vm_unmap   gmm's stage-2 unmap backend */
     VCPU_PROF_IDS
 };
 
