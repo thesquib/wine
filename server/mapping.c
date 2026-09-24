@@ -430,7 +430,7 @@ static int create_temp_file( file_pos_t size )
 }
 
 #ifdef __APPLE__
-/* PMW_VCPU_SHARED_SECTIONS=1 (the arm64 vCPU route): back anonymous sections with POSIX shared memory instead of an
+/* PMW_VCPU_SHARED_SECTIONS (default on for arm64, the vCPU route; =0 turns it off): back anonymous sections with POSIX shared memory instead of an
  * unlinked temp file. On macOS a shm object is anonymous memory, which the vCPU route can map into every process's VM
  * (gmm accepts a tagged alias of it; a file's vnode pages it refuses), so views of one section in two processes see
  * the same bytes (relay fex-side-shared-sections-2026-09-25: Chromium's IPC shared memory, shmtest). A shm object can
@@ -447,8 +447,14 @@ static int create_shm_file( file_pos_t size )
 
     if (enabled == -1)
     {
+        /* default on for the arm64 build (the vCPU route: shmtest, Steam's CEF IPC, STS2 validated 2026-09-25),
+         * off for x86_64 (Rosetta), whose non-vCPU paths still pread section fds; the variable overrides both */
         const char *env = getenv( "PMW_VCPU_SHARED_SECTIONS" );
+#ifdef __aarch64__
+        enabled = !env || atoi( env ) > 0;
+#else
         enabled = env && atoi( env ) > 0;
+#endif
     }
     if (!enabled || session_mapping_creating || size != (off_t)size) return -1;
     for (tries = 0; tries < 16 && fd == -1; tries++)
