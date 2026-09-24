@@ -132,14 +132,15 @@ BOOL WINAPI DECLSPEC_HOTPATCH FlushViewOfFile( const void *base, SIZE_T size )
 /****************************************************************************
  *           FlushInstructionCache   (kernelbase.@)
  */
-#if defined(__i386__) || defined(__x86_64__)
+#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
 BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID addr, SIZE_T size )
 {
-    /* X86 processors have coherent instruction and data caches, no need to do anything */
+    /* X86 processors have coherent instruction and data caches, no need to do anything. Not under ARM64EC (whose
+     * compilers define __x86_64__ too): the emulator learns of a code write through another mapping only here */
     return TRUE;
 }
 #else
-static BOOL flush_instruction_cache( HANDLE process, LPCVOID addr, SIZE_T size )
+static BOOL __attribute__((used)) flush_instruction_cache( HANDLE process, LPCVOID addr, SIZE_T size )
 {
     CROSS_PROCESS_WORK_LIST *list;
 
@@ -157,9 +158,9 @@ BOOL WINAPI __attribute__((naked)) FlushInstructionCache( HANDLE process, LPCVOI
 {
     asm( ".seh_proc \"#FlushInstructionCache\"\n\t"
          "stp x29, x30, [sp, #-32]!\n\t"
-         "str x1, [sp, #16]\n\t"
          ".seh_save_fplr_x 32\n\t"
          ".seh_endprologue\n\t"
+         "str x1, [sp, #16]\n\t"
          "bl \"#flush_instruction_cache\"\n\t"
          "ldr x1, [sp, #16]\n\t"
          "ldp x29, x30, [sp], #32\n\t"
