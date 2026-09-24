@@ -423,11 +423,14 @@ static void *anon_mmap_fixed_tag( void *start, size_t size, int prot, int flags,
     assert( !((UINT_PTR)start & host_page_mask) );
     assert( !(size & host_page_mask) );
 
-    /* vCPU mode: guest memory stays inheritable for now. A fork() child sharing it makes it copy-on-write
-     * (openrosetta relay fex-side-gmm-v3-inherit-answers-2026-09-24), but VM_INHERIT_NONE here made the m1b boot
-     * chain ~3x slower in the VM (2.8 s -> 8.4 s, first user32 init 1.3 s -> 4.2 s), with no host-side cost
-     * (2026-09-24). The process-creation children no longer read guest memory (process.c). */
     ptr = mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, anon_mmap_tag( guest ), 0 );
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* vCPU mode: a fork() child (Wine starts processes with one; they exec at once) sharing guest memory would make
+     * it copy-on-write, and the host's next write could then land in a new page while stage 2 still maps the old
+     * one (openrosetta relay fex-side-gmm-v3-inherit-answers-2026-09-24) */
+    if (ptr != MAP_FAILED && anon_mmap_tag( guest ) != -1 && minherit( ptr, size, VM_INHERIT_NONE ))
+        ERR( "vCPU mode: minherit of guest memory %p-%p failed: %s\n", ptr, (char *)ptr + size, strerror( errno ));
+#endif
     return ptr;
 }
 
