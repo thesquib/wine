@@ -713,6 +713,12 @@ class VkFunction(object):
     # The queue copies that data, since the caller may reuse it as soon as the call returns. Returns the list of
     # (param name, element type, C length expression) to copy, or None.
     def batch_plan(self):
+        # Returns a list of copy items, or None when the call cannot be queued:
+        #   ("array", name, elem, length, chain)   const array param; chain: elements are structs whose only pointer is
+        #                                          pNext, which must be NULL at the call (checked, else no queueing)
+        #   ("struct", name, type, members)         pointer to ONE struct whose pNext must be NULL at the call and whose
+        #                                          pointer members are arrays as above: members = [(member, elem,
+        #                                          length expression, chain)]
         if not self.name.startswith("vkCmd") or self.type != "void":
             return None
         if not self.params or self.params[0].type != "VkCommandBuffer" or self.params[0].is_pointer():
@@ -720,26 +726,81 @@ class VkFunction(object):
         if self.name in MANUAL_LOADER_THUNKS | MANUAL_LOADER_FUNCTIONS:
             return None
 
+        def unsafe_type(v):
+            return v.type.startswith("PFN") or v.type in ("size_t", "HANDLE", "HWND", "HINSTANCE", "char")
+
         def pod(struct, depth=0):
             if depth > 8:
                 return False
             for m in struct.members:
-                if m.is_pointer() or m.type.startswith("PFN") or m.type in ("size_t", "HANDLE", "HWND", "HINSTANCE"):
+                if m.is_pointer() or unsafe_type(m):
                     return False
                 if (m.is_struct() or m.is_union()) and not pod(m.struct, depth + 1):
                     return False
             return True
 
+        def chain_free(struct):
+            # only pointer is pNext (checked NULL at runtime); anything nested is plain data
+            has_pnext = False
+            for m in struct.members:
+                if m.name == "pNext":
+                    has_pnext = True
+                    continue
+                if m.is_pointer() or unsafe_type(m):
+                    return False
+                if (m.is_struct() or m.is_union()) and not pod(m.struct):
+                    return False
+            return has_pnext
+
+        def element(v):
+            # (elem type, chain) for data a pointer v leads to, or None
+            if v.is_pointer_pointer() or not v.is_const() or unsafe_type(v) or v.type == "void":
+                return None
+            if v.is_struct() or v.is_union():
+                if pod(v.struct):
+                    return (v.type, False)
+                if chain_free(v.struct):
+                    return (v.type, True)
+                return None
+            return (v.type, False)
+
+        def nested(struct, pname):
+            # a struct whose pNext is checked NULL and whose other pointers are arrays of plain or chain-free data
+            if not any(m.name == "pNext" for m in struct.members):
+                return None
+            names = [m.name for m in struct.members]
+            members = []
+            for m in struct.members:
+                if m.name == "pNext":
+                    continue
+                if not m.is_pointer():
+                    if unsafe_type(m) or ((m.is_struct() or m.is_union()) and not pod(m.struct)):
+                        return None
+                    continue
+                el = element(m)
+                if el is None:
+                    return None
+                if m.dyn_array_len is None:
+                    length = "1"
+                elif isinstance(m.dyn_array_len, int):
+                    length = str(m.dyn_array_len)
+                elif isinstance(m.dyn_array_len, str) and m.dyn_array_len in names and \
+                        not struct.members[names.index(m.dyn_array_len)].is_pointer():
+                    length = "{0}->{1}".format(pname, m.dyn_array_len)
+                else:
+                    return None
+                members.append((m.name, el[0], length, el[1]))
+            return members
+
         names = [p.name for p in self.params]
         plan = []
         for p in self.params[1:]:
-            if p.type.startswith("PFN") or p.type in ("size_t", "HANDLE", "HWND", "HINSTANCE"):
+            if unsafe_type(p):
                 return None
             if p.is_static_array():
-                length = " * ".join(str(l) for l in p.array_lens)
                 if (p.is_struct() or p.is_union()) and not pod(p.struct):
                     return None
-                plan.append((p.name, p.type, length))
+                plan.append(("array", p.name, p.type, " * ".join(str(l) for l in p.array_lens), False))
                 continue
             if not p.is_pointer():
                 if (p.is_struct() or p.is_union()) and not pod(p.struct):
@@ -748,15 +809,10 @@ class VkFunction(object):
             if p.is_pointer_pointer() or not p.is_const():
                 return None
             if p.type == "void":
-                elem = "BYTE"
                 if not isinstance(p.dyn_array_len, str) or p.dyn_array_len not in names:
                     return None
-            elif p.is_struct() or p.is_union():
-                if not pod(p.struct):
-                    return None
-                elem = p.type
-            else:
-                elem = p.type
+                plan.append(("array", p.name, "BYTE", p.dyn_array_len, False))
+                continue
             if p.dyn_array_len is None:
                 length = "1"
             elif isinstance(p.dyn_array_len, int):
@@ -765,7 +821,16 @@ class VkFunction(object):
                 length = p.dyn_array_len
             else:
                 return None
-            plan.append((p.name, elem, length))
+            el = element(p)
+            if el is not None:
+                plan.append(("array", p.name, el[0], length, el[1]))
+                continue
+            if (p.is_struct()) and length == "1":
+                members = nested(p.struct, p.name)
+                if members is not None:
+                    plan.append(("struct", p.name, p.type, members))
+                    continue
+            return None
         return plan
 
     def loader_body(self):
@@ -777,18 +842,48 @@ class VkFunction(object):
         # replays its queue first, so every entry point keeps the buffer's order.
         plan = self.batch_plan()
         if plan is not None:
-            sizes = ["(SIZE_T)({0}) * sizeof({1})".format(length, elem) for (_, elem, length) in plan]
+            conds, extras, copies = [], [], []
+            for item in plan:
+                if item[0] == "array":
+                    _, name, elem, length, chain = item
+                    size = "(SIZE_T)({0}) * sizeof({1})".format(length, elem)
+                    if chain:
+                        conds.append("vk_batch_chain_free({0}, {1}, sizeof({2}))".format(name, length, elem))
+                    extras.append("VK_BATCH_ALIGN({0})".format(size))
+                    copies.append("            queued->{0} = vk_batch_data(commandBuffer, {0}, {1});\n".format(name, size))
+                else:
+                    _, name, stype, members = item
+                    conds.append("{0} && !{0}->pNext".format(name))
+                    extras.append("VK_BATCH_ALIGN(sizeof({0}))".format(stype))
+                    body_c = "            {\n"
+                    body_c += "                {0} *copy = (void *)vk_batch_data(commandBuffer, {1}, sizeof({0}));\n".format(stype, name)
+                    for (m, elem, length, chain) in members:
+                        size = "(SIZE_T)({0}) * sizeof({1})".format(length, elem)
+                        if chain:
+                            conds.append("vk_batch_chain_free({0}->{1}, {2}, sizeof({3}))".format(name, m, length, elem))
+                        extras.append("VK_BATCH_ALIGN({0})".format(size))
+                        body_c += "                copy->{0} = vk_batch_data(commandBuffer, {1}->{0}, {2});\n".format(m, name, size)
+                    body_c += "                queued->{0} = copy;\n".format(name)
+                    body_c += "            }\n"
+                    copies.append(body_c)
+            extra = " + ".join(extras) if extras else "0"
+            ind = "    " if conds else ""
             body += "#ifdef _WIN64\n"
             body += "    if (vk_batch_enabled)\n"
             body += "    {\n"
-            body += "        struct {0}_params *queued;\n".format(self.name)
-            extra = " + ".join("VK_BATCH_ALIGN({0})".format(sz) for sz in sizes) if sizes else "0"
-            body += "        if ((queued = vk_batch_begin(commandBuffer, unix_{0}, &params, sizeof(params), {1})))\n".format(self.name, extra)
-            body += "        {\n"
-            for (name, elem, length), sz in zip(plan, sizes):
-                body += "            queued->{0} = vk_batch_data(commandBuffer, {0}, {1});\n".format(name, sz)
-            body += "            return;\n"
-            body += "        }\n"
+            if conds:
+                body += "        if ({0})\n".format(" &&\n            ".join(conds))
+                body += "        {\n"
+            body += ind + "        struct {0}_params *queued;\n".format(self.name)
+            body += ind + "        if ((queued = vk_batch_begin(commandBuffer, unix_{0}, &params, sizeof(params), {1})))\n".format(self.name, extra)
+            body += ind + "        {\n"
+            for c in copies:
+                body += "".join(ind + line + "\n" for line in c.rstrip("\n").split("\n"))
+            body += ind + "            return;\n"
+            body += ind + "        }\n"
+            if conds:
+                body += "        }\n"
+                body += "        else vk_batch_flush(commandBuffer);  /* a pNext chain: not queued, so replay first */\n"
             body += "    }\n"
             body += "#endif\n"
         elif self.params and self.params[0].type == "VkCommandBuffer" and not self.params[0].is_pointer():
