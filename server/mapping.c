@@ -429,6 +429,47 @@ static int create_temp_file( file_pos_t size )
     return fd;
 }
 
+#ifdef __APPLE__
+/* PMW_VCPU_SHARED_SECTIONS=1 (the arm64 vCPU route): back anonymous sections with POSIX shared memory instead of an
+ * unlinked temp file. On macOS a shm object is anonymous memory, which the vCPU route can map into every process's VM
+ * (gmm accepts a tagged alias of it; a file's vnode pages it refuses), so views of one section in two processes see
+ * the same bytes (relay fex-side-shared-sections-2026-09-25: Chromium's IPC shared memory, shmtest). A shm object can
+ * be sized only once, and pwrite does not work on it: the session mapping (it grows) and shared image data (written
+ * with pwrite) keep the temp file. */
+static int session_mapping_creating;
+
+static int create_shm_file( file_pos_t size )
+{
+    static int enabled = -1;
+    static unsigned int counter;
+    char name[32];
+    int fd = -1, tries;
+
+    if (enabled == -1)
+    {
+        const char *env = getenv( "PMW_VCPU_SHARED_SECTIONS" );
+        enabled = env && atoi( env ) > 0;
+    }
+    if (!enabled || session_mapping_creating || size != (off_t)size) return -1;
+    for (tries = 0; tries < 16 && fd == -1; tries++)
+    {
+        snprintf( name, sizeof(name), "/wine-%x-%x", (unsigned int)getpid(), counter++ );  /* PSHMNAMLEN 31 */
+        if ((fd = shm_open( name, O_RDWR | O_CREAT | O_EXCL, 0600 )) == -1 && errno != EEXIST) break;
+    }
+    if (fd == -1) return -1;
+    shm_unlink( name );
+    /* whole host pages: a view's anchor maps the object in 16K pages (the section keeps its own size) */
+    if (ftruncate( fd, round_size( size, host_page_mask )) == -1)
+    {
+        close( fd );
+        return -1;
+    }
+    return fd;
+}
+#else
+static int create_shm_file( file_pos_t size ) { return -1; }
+#endif
+
 /* find a memory view from its base address */
 struct memory_view *find_mapped_view( struct process *process, client_ptr_t base )
 {
@@ -1156,7 +1197,8 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
         }
         if ((flags & SEC_RESERVE) && !(mapping->committed = create_ranges())) goto error;
         mapping->size = round_size( mapping->size, page_mask );
-        if ((unix_fd = create_temp_file( mapping->size )) == -1) goto error;
+        if ((unix_fd = create_shm_file( mapping->size )) == -1 &&
+            (unix_fd = create_temp_file( mapping->size )) == -1) goto error;
         if (!(mapping->fd = create_anonymous_fd( &mapping_fd_ops, unix_fd, &mapping->obj,
                                                  FILE_SYNCHRONOUS_IO_NONALERT ))) goto error;
         allow_fd_caching( mapping->fd );
@@ -1377,8 +1419,17 @@ struct mapping *create_session_mapping( struct object *root, const struct unicod
     static const unsigned int access = FILE_READ_DATA | FILE_WRITE_DATA;
     size_t size = max( sizeof(*shared_session) + sizeof(object_shm_t) * 512, 0x10000 );
 
+    struct mapping *mapping;
+
     size = round_size( size, host_page_mask );
-    return create_mapping( root, name, attr, size, SEC_COMMIT, 0, access, sd );
+#ifdef __APPLE__
+    session_mapping_creating = 1;  /* it grows: create_shm_file must not back it */
+#endif
+    mapping = create_mapping( root, name, attr, size, SEC_COMMIT, 0, access, sd );
+#ifdef __APPLE__
+    session_mapping_creating = 0;
+#endif
+    return mapping;
 }
 
 void set_session_mapping( struct mapping *mapping )

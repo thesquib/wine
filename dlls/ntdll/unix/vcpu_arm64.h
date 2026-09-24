@@ -122,6 +122,7 @@ extern int vcpu_check_s2;
  * off, and every section view is then a copy */
 #define VCPU_GMM_SECT 1
 extern int vcpu_sect_alias;
+extern int vcpu_shared_sections;
 extern uint64_t vcpu_blob_va(void);
 extern void *vcpu_kuser_host(void);
 extern void vcpu_note_entered(void);
