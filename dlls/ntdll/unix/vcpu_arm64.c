@@ -768,6 +768,28 @@ static void *prof_thread( void *arg )
                      (int)getpid(), rows[i].name ? rows[i].name : rows[i].buf,
                      (unsigned long long)rows[i].count, rows[i].ticks / hz, rows[i].ticks / hz * 1e6 / rows[i].count,
                      prof_is_wait( rows[i].name ) ? "  (wait)" : "" );
+        {
+            /* gmm's thin mutator by phase (vcpu_gmm_arm64.c builds it with GMM_PROFILE); the view path is not split */
+            static const char * const names[GMM_PROF_N] = { "args", "plan", "pt", "guard", "ipa", "urecs", "reserve",
+                                                            "s2map", "insert", "desc", "tlbi", "unmap", "free", "trace" };
+            static uint64_t last_gmm[GMM_PROF_N];
+            uint64_t now_gmm[GMM_PROF_N], total = 0;
+            char line[512];
+            int len = 0;
+
+            gmm_debug_prof_get( now_gmm );
+            for (i = 0; i < GMM_PROF_N; i++) if (i != GMM_PROF_TRACE) total += now_gmm[i] - last_gmm[i];
+            if (total)
+            {
+                for (i = 0; i < GMM_PROF_N && len < sizeof(line) - 32; i++)
+                    if (now_gmm[i] - last_gmm[i] >= 1000000)
+                        len += snprintf( line + len, sizeof(line) - len, " %s %.0f", names[i],
+                                         (now_gmm[i] - last_gmm[i]) / 1e6 );
+                fprintf( stderr, "[VCPU-PROF] pid %d   gmm thin phases (ms): total %.0f |%s\n", (int)getpid(),
+                         total / 1e6, line );
+            }
+            memcpy( last_gmm, now_gmm, sizeof(last_gmm) );
+        }
         last_count[NROWS] = guest_c;
         last_ticks[NROWS] = guest_t;
         last_cpu = cpu;
