@@ -1592,13 +1592,28 @@ void vcpu_init_process(void)
     cfg.pt_pool_host = pool;
     cfg.pt_pool_sz = VCPU_PT_POOL_SIZE;
     cfg.t0sz = 16;
-    cfg.flags = GMM_CFG_PARANOID;
-    /* multi-chunk runs (> 1) also need GMM_CFG_S2_REMAP, or virtual.c skipping the host change of a retained chunk:
-     * without them a refused sub-range unmap retains chunks, and vcpu_assert_s2_unmapped aborts on the next
-     * ordinary decommit or free there */
-    cfg.s2_run_chunks = 1;
-    if ((ret = gmm_init( &gmm, &cfg, &backend ))) vcpu_fatal( "gmm_init: %d\n", ret );
-    vcpu_check_s2 = cfg.s2_run_chunks > 1 || ((env = getenv( "PMW_VCPU_PARANOID" )) && !strcmp( env, "1" ));
+    /* gmm's load cost (docs/macos/relay-to-openrosetta-gmm-cost-2026-09-24.md, answered in openrosetta
+     * docs/relays/fex-side-reply-tso-gmm-qpc-2026-09-24.md): Slay the Spire 2's ~240 us per stage-1 sync was
+     * GMM_CFG_PARANOID (a region query per chunk before every stage-2 map and unmap) plus one stage-2 map, and so one
+     * backing guard query, per 16K chunk. gmm alone, 128 chunks: 208-284 -> 14 us a commit, 134-187 -> 15 us a
+     * decommit with both changed. PARANOID is a debugging cross-check of the ordering rule and stays available
+     * (PMW_VCPU_PARANOID=1); the backing guard before every stage-2 map is not affected by it.
+     * Multi-chunk runs revoke with GMM_CFG_S2_REMAP: a revoke inside a run unmaps the whole run and re-maps its
+     * survivors, so no chunk is ever left stage-2 mapped behind a revoke ("retained", the split policy's answer to a
+     * refused sub-range unmap), and virtual.c may change the host mapping as soon as the revoke returns.
+     * PMW_VCPU_S2_RUN=<chunks> sets the run cap (1 = the old per-chunk mapping). */
+    {
+        BOOL paranoid = (env = getenv( "PMW_VCPU_PARANOID" )) && !strcmp( env, "1" );
+        long run = (env = getenv( "PMW_VCPU_S2_RUN" )) ? strtol( env, NULL, 10 ) : 128;
+
+        cfg.flags = paranoid ? GMM_CFG_PARANOID : 0;
+        cfg.s2_run_chunks = run > 1 ? (run > 4096 ? 4096 : (unsigned)run) : 1;
+        if (cfg.s2_run_chunks > 1) cfg.flags |= GMM_CFG_S2_REMAP;
+        if ((ret = gmm_init( &gmm, &cfg, &backend ))) vcpu_fatal( "gmm_init: %d\n", ret );
+        /* with S2_REMAP nothing is retained, so virtual.c's stage-2 assertion is a paranoid check like gmm's */
+        vcpu_check_s2 = paranoid;
+        TRACE( "gmm: s2_run_chunks %u, flags %#x\n", cfg.s2_run_chunks, cfg.flags );
+    }
     vcpu_sect_alias = VCPU_GMM_SECT && !((env = getenv( "PMW_VCPU_SECT_ALIAS" )) && !strcmp( env, "0" ));
 
     init_sys_page();
