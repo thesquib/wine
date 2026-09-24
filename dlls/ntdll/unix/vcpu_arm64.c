@@ -287,7 +287,21 @@ static void *tlbi_thread( void *arg )
 static uint64_t tlbi_initiator_count, tlbi_initiator_ticks, tlbi_initiator_refused;
 static int tlbi_initiator( const uint64_t *va, size_t count, int all );  /* after struct vcpu_thread */
 
+static int tlbi_sync_impl( void *ctx, const uint64_t *va, size_t count, int all );
+
 static int tlbi_sync( void *ctx, const uint64_t *va, size_t count, int all )
+{
+    uint64_t t0;
+    int ret;
+
+    if (!vcpu_prof_interval) return tlbi_sync_impl( ctx, va, count, all );
+    t0 = vcpu_prof_now();
+    ret = tlbi_sync_impl( ctx, va, count, all );
+    vcpu_prof_add( VCPU_PROF_TLBI, vcpu_prof_now() - t0 );
+    return ret;
+}
+
+static int tlbi_sync_impl( void *ctx, const uint64_t *va, size_t count, int all )
 {
     uint64_t *mailbox = (uint64_t *)(sys_page + SYS_MAILBOX_OFF);
     uint64_t start;
@@ -559,24 +573,32 @@ struct prof_bucket
 
 #define PROF_KINDS VEL1_EXIT__COUNT
 
-static unsigned int prof_interval;
+unsigned int vcpu_prof_interval;
+#define prof_interval vcpu_prof_interval
 static struct prof_bucket prof_guest;
 static struct prof_bucket prof_kind[PROF_KINDS];
 static struct prof_bucket prof_sys[2][4096];
+static struct prof_bucket prof_extra[VCPU_PROF_IDS];
+
+static const char * const prof_extra_names[VCPU_PROF_IDS] =
+{
+    "in:s1 sync", "in:s1 revoke", "in:icache sync", "in:tlbi", "in:gmm_vm_fault", "lock:virtual_mutex",
+    "fault:retry", "fault:handled", "fault:raised",
+};
 
 extern const char *ntdll_syscall_name( UINT id );
 
-static inline uint64_t prof_now(void)
-{
-    uint64_t v;
-    __asm__ volatile( "mrs %0, cntvct_el0" : "=r" (v) );
-    return v;
-}
+#define prof_now vcpu_prof_now
 
 static inline void prof_add( struct prof_bucket *b, uint64_t ticks )
 {
     atomic_fetch_add_explicit( &b->count, 1, memory_order_relaxed );
     atomic_fetch_add_explicit( &b->ticks, ticks, memory_order_relaxed );
+}
+
+void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks )
+{
+    prof_add( &prof_extra[id], ticks );
 }
 
 static struct prof_bucket *prof_sys_bucket( UINT id )
@@ -612,7 +634,7 @@ static BOOL prof_is_wait( const char *name )
 
 static void *prof_thread( void *arg )
 {
-    enum { NSYS = 2 * 4096, NROWS = NSYS + PROF_KINDS };
+    enum { NSYS = 2 * 4096, NROWS = NSYS + PROF_KINDS + VCPU_PROF_IDS };
     static uint64_t last_count[NROWS + 1], last_ticks[NROWS + 1];
     static struct prof_row rows[NROWS];
     uint64_t freq, start = prof_now(), last_cpu = 0;
@@ -632,7 +654,8 @@ static void *prof_thread( void *arg )
 
         for (i = 0; i < NROWS; i++)
         {
-            struct prof_bucket *b = i < NSYS ? &prof_sys[i / 4096][i % 4096] : &prof_kind[i - NSYS];
+            struct prof_bucket *b = i < NSYS ? &prof_sys[i / 4096][i % 4096]
+                                    : i < NSYS + PROF_KINDS ? &prof_kind[i - NSYS] : &prof_extra[i - NSYS - PROF_KINDS];
             uint64_t c = atomic_load_explicit( &b->count, memory_order_relaxed );
             uint64_t t = atomic_load_explicit( &b->ticks, memory_order_relaxed );
             struct prof_row *r = &rows[n];
@@ -652,6 +675,12 @@ static void *prof_thread( void *arg )
                 }
                 if (prof_is_wait( r->name )) wait += r->ticks;
             }
+            else if (i >= NSYS + PROF_KINDS)
+            {
+                r->name = prof_extra_names[i - NSYS - PROF_KINDS];
+                /* nested in (or, for faults, replacing) what the rows above charge: not added to host */
+                if (i - NSYS - PROF_KINDS < VCPU_PROF_FAULT_RETRY) { n++; continue; }
+            }
             else
             {
                 snprintf( r->buf, sizeof(r->buf), "exit:%s", vel1_exit_kind_name( i - NSYS ));
@@ -668,7 +697,7 @@ static void *prof_thread( void *arg )
                  "%.3f s | process CPU %.3f s over %u s\n", (int)getpid(), (prof_now() - start) / hz,
                  (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
                  host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
-        for (i = 0; i < n && i < 14; i++)
+        for (i = 0; i < n && i < 20; i++)
             fprintf( stderr, "[VCPU-PROF] pid %d   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n",
                      (int)getpid(), rows[i].name ? rows[i].name : rows[i].buf,
                      (unsigned long long)rows[i].count, rows[i].ticks / hz, rows[i].ticks / hz * 1e6 / rows[i].count,
@@ -1086,11 +1115,27 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
     ULONG64 pc_adjust;
 
     vt->faults++;
+    if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_RAISED];
     if (e->kind == VEL1_EXIT_FAULT_SYNC && (e->fclass == VEL1_FC_DATA_ABORT || e->fclass == VEL1_FC_INSN_ABORT))
     {
-        switch (gmm_vm_fault( gmm, e->far, e->esr ))
+        uint64_t t0 = prof_interval ? prof_now() : 0;
+        gmm_vfault_t vf = gmm_vm_fault( gmm, e->far, e->esr );
+
+        if (prof_interval) vcpu_prof_add( VCPU_PROF_VM_FAULT, prof_now() - t0 );
+        switch (vf)
         {
         case GMM_VF_RETRY:  /* a concurrent protection change already allows it */
+            if (prof_interval)
+            {
+                static _Atomic uint64_t retries;
+                uint64_t nr = atomic_fetch_add_explicit( &retries, 1, memory_order_relaxed );
+                vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_RETRY];
+                if (!(nr & 0x3fff))
+                    fprintf( stderr, "[VCPU-PROF] pid %d retry fault #%llu: %s far %#llx pc %#llx esr %#llx (dfsc %#x%s)\n",
+                             (int)getpid(), (unsigned long long)nr, vel1_fault_class_name( e->fclass ),
+                             (unsigned long long)e->far, (unsigned long long)frame->pc, (unsigned long long)e->esr,
+                             (UINT)(e->esr & 0x3f), (e->esr >> 6) & 1 ? " write" : "" );
+            }
             vcpu_store_full( vt, frame );
             return;
         case GMM_VF_FATAL:
@@ -1104,6 +1149,7 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
            rec.ExceptionAddress, (unsigned long long)e->far );
     if (rec.ExceptionCode == STATUS_ACCESS_VIOLATION && !virtual_handle_fault( &rec, (void *)frame->sp ))
     {
+        if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_HANDLED];
         vcpu_store_full( vt, frame );  /* guard page, write watch or stack growth handled: retry */
         return;
     }
