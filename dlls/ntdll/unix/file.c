@@ -6516,6 +6516,10 @@ static NTSTATUS cancel_async_file_read( HANDLE handle, IO_STATUS_BLOCK *io )
     return count ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
+/* a regular-file read or write moves at most this many bytes per unix call: macOS read()/write() and pread()/pwrite()
+ * fail with EINVAL above INT_MAX instead of transferring part of it, and result is an int */
+#define MAX_RW_CHUNK 0x40000000
+
 /******************************************************************************
  *              NtReadFile   (NTDLL.@)
  */
@@ -6566,18 +6570,22 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
         if (offset && offset->QuadPart != FILE_USE_FILE_POINTER_POSITION)
         {
             /* async I/O doesn't make sense on regular files */
-            while ((result = virtual_locked_pread( unix_handle, buffer, length, offset->QuadPart )) == -1)
+            for (total = 0; total < length; total += result)
             {
-                if (errno != EINTR)
+                while ((result = virtual_locked_pread( unix_handle, (char *)buffer + total,
+                                                       min( length - total, MAX_RW_CHUNK ),
+                                                       offset->QuadPart + total )) == -1 && errno == EINTR);
+                if (result == -1)
                 {
+                    if (total) break;
                     status = errno_to_status( errno );
                     goto done;
                 }
+                if (!result) break;  /* end of file */
             }
             if (!async_read) /* update file pointer position */
-                lseek( unix_handle, offset->QuadPart + result, SEEK_SET );
+                lseek( unix_handle, offset->QuadPart + total, SEEK_SET );
 
-            total = result;
             status = (total || !length) ? STATUS_SUCCESS : STATUS_END_OF_FILE;
             goto done;
         }
@@ -6613,7 +6621,8 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
 
     for (;;)
     {
-        if ((result = virtual_locked_read( unix_handle, (char *)buffer + total, length - total )) >= 0)
+        if ((result = virtual_locked_read( unix_handle, (char *)buffer + total,
+                                           min( length - total, MAX_RW_CHUNK ) )) >= 0)
         {
             total += result;
             if (!result || total == length)
@@ -6882,20 +6891,23 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
             }
 
             /* async I/O doesn't make sense on regular files */
-            while ((result = pwrite( unix_handle, buffer, length, off )) == -1)
+            for (total = 0; total < length; total += result)
             {
-                if (errno != EINTR)
+                while ((result = pwrite( unix_handle, (const char *)buffer + total,
+                                         min( length - total, MAX_RW_CHUNK ), off + total )) == -1 && errno == EINTR);
+                if (result == -1)
                 {
+                    if (total) break;
                     if (errno == EFAULT) status = STATUS_INVALID_USER_BUFFER;
                     else status = errno_to_status( errno );
                     goto done;
                 }
+                if (!result) break;
             }
 
             if (!async_write) /* update file pointer position */
-                lseek( unix_handle, off + result, SEEK_SET );
+                lseek( unix_handle, off + total, SEEK_SET );
 
-            total = result;
             status = STATUS_SUCCESS;
             goto done;
         }
@@ -6918,7 +6930,7 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
 
     for (;;)
     {
-        result = write( unix_handle, (const char *)buffer + total, length - total );
+        result = write( unix_handle, (const char *)buffer + total, min( length - total, MAX_RW_CHUNK ) );
 
         if (result >= 0)
         {
