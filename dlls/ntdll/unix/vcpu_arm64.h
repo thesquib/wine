@@ -97,6 +97,7 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 #if defined(__APPLE__)
 
 #include "vcpu/vcpu_el1.h"
+#define GMM_PROFILE 1  /* as vcpu_gmm_arm64.c builds gmm: PMW_VCPU_PROF reports its phases */
 #include "vcpu/gmm.h"
 
 /* virtual.c's page protection bits (VPROT_*), which are private to it; virtual.c checks they match */
