@@ -45,6 +45,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <mach/vm_statistics.h>
@@ -541,6 +542,160 @@ struct vcpu_level
     NTSTATUS            cb_status;
 };
 
+/***********************************************************************
+ * PMW_VCPU_PROF=<seconds>: where the vCPU threads' time goes
+ *
+ * Every <seconds>, one [VCPU-PROF] block on stderr with the interval's deltas: time inside vel1_run (the guest:
+ * translated x86 code, FEX's JIT, native ARM64EC code, all together), and host time after each exit until the next
+ * entry, charged to the exit that caused it (per syscall, by name where the table has names; unix calls; faults;
+ * kicks), plus the whole process's CPU time, which also covers threads that never run guest code (the driver's
+ * compile threads, the KUSER publisher). Waits are host time too: a parked NtWaitForSingleObject shows as its
+ * wall time. Host-side clock reads only (CNTVCT_EL0, ~1 ns); no hv_* call is added.
+ */
+struct prof_bucket
+{
+    _Atomic uint64_t count, ticks;
+};
+
+#define PROF_KINDS VEL1_EXIT__COUNT
+
+static unsigned int prof_interval;
+static struct prof_bucket prof_guest;
+static struct prof_bucket prof_kind[PROF_KINDS];
+static struct prof_bucket prof_sys[2][4096];
+
+extern const char *ntdll_syscall_name( UINT id );
+
+static inline uint64_t prof_now(void)
+{
+    uint64_t v;
+    __asm__ volatile( "mrs %0, cntvct_el0" : "=r" (v) );
+    return v;
+}
+
+static inline void prof_add( struct prof_bucket *b, uint64_t ticks )
+{
+    atomic_fetch_add_explicit( &b->count, 1, memory_order_relaxed );
+    atomic_fetch_add_explicit( &b->ticks, ticks, memory_order_relaxed );
+}
+
+static struct prof_bucket *prof_sys_bucket( UINT id )
+{
+    UINT idx = (id >> 12) & 3;
+    return idx < 2 ? &prof_sys[idx][id & 0xfff] : &prof_kind[VEL1_EXIT_SYSCALL];
+}
+
+struct prof_row
+{
+    const char *name;
+    char        buf[24];
+    uint64_t    count, ticks;
+};
+
+static int prof_row_cmp( const void *a, const void *b )
+{
+    const struct prof_row *x = a, *y = b;
+    return x->ticks < y->ticks ? 1 : x->ticks > y->ticks ? -1 : 0;
+}
+
+static BOOL prof_is_wait( const char *name )
+{
+    static const char * const waits[] = { "NtWaitFor", "NtRemoveIoCompletion", "NtDelayExecution",
+                                          "NtSignalAndWait", "NtYieldExecution", "NtUserMsgWaitForMultipleObjectsEx",
+                                          "NtReplyWaitReceivePort", "NtWaitForAlertByThreadId" };
+    unsigned int i;
+
+    for (i = 0; name && i < ARRAY_SIZE(waits); i++)
+        if (!strncmp( name, waits[i], strlen( waits[i] ))) return TRUE;
+    return FALSE;
+}
+
+static void *prof_thread( void *arg )
+{
+    enum { NSYS = 2 * 4096, NROWS = NSYS + PROF_KINDS };
+    static uint64_t last_count[NROWS + 1], last_ticks[NROWS + 1];
+    static struct prof_row rows[NROWS];
+    uint64_t freq, start = prof_now(), last_cpu = 0;
+    double hz;
+
+    __asm__ volatile( "mrs %0, cntfrq_el0" : "=r" (freq) );
+    hz = freq;
+    for (;;)
+    {
+        struct rusage ru;
+        uint64_t cpu, guest_c, guest_t, host = 0, wait = 0;
+        unsigned int i, n = 0;
+
+        sleep( prof_interval );
+        getrusage( RUSAGE_SELF, &ru );
+        cpu = (ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000ull + ru.ru_utime.tv_usec + ru.ru_stime.tv_usec;
+
+        for (i = 0; i < NROWS; i++)
+        {
+            struct prof_bucket *b = i < NSYS ? &prof_sys[i / 4096][i % 4096] : &prof_kind[i - NSYS];
+            uint64_t c = atomic_load_explicit( &b->count, memory_order_relaxed );
+            uint64_t t = atomic_load_explicit( &b->ticks, memory_order_relaxed );
+            struct prof_row *r = &rows[n];
+
+            r->count = c - last_count[i];
+            r->ticks = t - last_ticks[i];
+            last_count[i] = c;
+            last_ticks[i] = t;
+            if (!r->count) continue;
+            if (i < NSYS)
+            {
+                UINT id = ((i / 4096) << 12) | (i % 4096);
+                if (!(r->name = ntdll_syscall_name( id )))
+                {
+                    snprintf( r->buf, sizeof(r->buf), "syscall %04x", id );
+                    r->name = r->buf;
+                }
+                if (prof_is_wait( r->name )) wait += r->ticks;
+            }
+            else
+            {
+                snprintf( r->buf, sizeof(r->buf), "exit:%s", vel1_exit_kind_name( i - NSYS ));
+                r->name = r->buf;
+            }
+            host += r->ticks;
+            n++;
+        }
+        guest_c = atomic_load_explicit( &prof_guest.count, memory_order_relaxed );
+        guest_t = atomic_load_explicit( &prof_guest.ticks, memory_order_relaxed );
+        qsort( rows, n, sizeof(rows[0]), prof_row_cmp );
+
+        fprintf( stderr, "[VCPU-PROF] t=%.1f s: guest %.3f s (%llu entries) | host after exits %.3f s, of it waits "
+                 "%.3f s | process CPU %.3f s over %u s\n", (prof_now() - start) / hz,
+                 (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
+                 host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
+        for (i = 0; i < n && i < 14; i++)
+            fprintf( stderr, "[VCPU-PROF]   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n", rows[i].name,
+                     (unsigned long long)rows[i].count, rows[i].ticks / hz, rows[i].ticks / hz * 1e6 / rows[i].count,
+                     prof_is_wait( rows[i].name ) ? "  (wait)" : "" );
+        last_count[NROWS] = guest_c;
+        last_ticks[NROWS] = guest_t;
+        last_cpu = cpu;
+    }
+    return NULL;
+}
+
+static void prof_start(void)
+{
+    const char *env = getenv( "PMW_VCPU_PROF" );
+    pthread_t thread;
+    sigset_t old;
+
+    if (!env || (prof_interval = atoi( env )) <= 0)
+    {
+        prof_interval = 0;
+        return;
+    }
+    block_all_signals( &old );
+    if (!pthread_create( &thread, NULL, prof_thread, NULL )) pthread_detach( thread );
+    else prof_interval = 0;
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
 struct vcpu_thread
 {
     vel1_vcpu           vcpu;          /* host-only memory (D12); the thread finds it through vcpu_key */
@@ -549,6 +704,8 @@ struct vcpu_thread
     volatile sig_atomic_t hv_depth;    /* inside a vel1 call: never destroy the vCPU from a handler then */
     struct vcpu_level  *level;
     uint64_t            exits, syscalls, unix_calls, faults, kicks, kick_failures;
+    uint64_t            prof_mark;     /* PMW_VCPU_PROF: when the last exit came back to the host */
+    struct prof_bucket *prof_charge;   /* PMW_VCPU_PROF: what the host time since then is spent on */
 };
 
 static pthread_key_t vcpu_key;
@@ -648,10 +805,23 @@ static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
 
     for (;;)
     {
+        uint64_t t0 = 0;
+
+        if (prof_interval)
+        {
+            t0 = prof_now();
+            if (vt->prof_charge) prof_add( vt->prof_charge, t0 - vt->prof_mark );
+        }
         vt->hv_depth++;
         kind = vel1_run( &vt->vcpu, e );
         vt->hv_depth--;
         vt->exits++;
+        if (prof_interval)
+        {
+            vt->prof_mark = prof_now();
+            prof_add( &prof_guest, vt->prof_mark - t0 );
+            vt->prof_charge = &prof_kind[(unsigned int)kind < PROF_KINDS ? kind : 0];
+        }
         if (kind != VEL1_EXIT_CANCELED) return kind;  /* past vel1's spurious bound: just go again */
     }
 }
@@ -976,6 +1146,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         {
         case VEL1_EXIT_SYSCALL:
             vcpu_frame_from_syscall_exit( frame, &e );
+            if (prof_interval) vt->prof_charge = prof_sys_bucket( frame->syscall_id );
             break;
         case VEL1_EXIT_UNIX_CALL:
             vcpu_frame_from_unix_call_exit( frame, &e );
@@ -1296,6 +1467,7 @@ void vcpu_init_process(void)
 
     init_sys_page();
     init_kuser();
+    prof_start();
 
     block_all_signals( &old );
     ret = pthread_create( &thread, NULL, tlbi_thread, NULL );
