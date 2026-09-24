@@ -81,6 +81,18 @@ const void *vk_batch_data(VkCommandBuffer buffer, const void *src, SIZE_T size);
 void vk_batch_flush_slow(VkCommandBuffer buffer);
 void vk_batch_flush_pool(VkCommandPool pool);
 
+/* every element's pNext is NULL (a queued copy keeps no chain), or the array is absent */
+static inline BOOL vk_batch_chain_free(const void *array, SIZE_T count, SIZE_T stride)
+{
+    const BYTE *p = array;
+    SIZE_T i;
+
+    if (!p) return TRUE;
+    for (i = 0; i < count; i++, p += stride)
+        if (((const VkBaseInStructure *)p)->pNext) return FALSE;
+    return TRUE;
+}
+
 static inline void vk_batch_flush(VkCommandBuffer buffer)
 {
     if (buffer && buffer->batch_used) vk_batch_flush_slow(buffer);
