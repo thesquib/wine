@@ -214,6 +214,32 @@
  *      parked executor path ran it too (20 requests). Cost ~1.0–1.2 µs, the same as the VA form. Had HVF trapped it,
  *      the exit would not have been the entry's hvc, so the call would have returned VEL1_E_STUB (fatal, nothing
  *      restored); the ELR/SPSR argument above holds because a trapped TLBI is an EL2 exit, not an EL1 exception.
+ * [D19] The virtual counter (2026-09-25; for Wine's exit-free QueryPerformanceCounter, proton-darwin
+ *      docs/macos/relay-to-openrosetta-qpc-2026-09-24.md). THE CONTRACT: on every vel1 vCPU, guest CNTVCT_EL0 ==
+ *      the host's mach_absolute_time(). HVF defines (hv_vcpu.h, hv_vcpu_set_vtimer_offset):
+ *        CNTVCT_EL0 = mach_absolute_time() - vtimer_offset
+ *      and does not document its default offset (it may differ per vCPU), so create reads HVF's default once (kept
+ *      as vel1_stats.vtimer_default, for the record), sets VEL1_VTIMER_OFFSET (0) and READS IT BACK; a mismatch fails
+ *      the create with VEL1_E_VTIMER and the same cleanup as VEL1_E_ENTSO (the vCPU is destroyed on the creating
+ *      thread and never published). The three calls come right after the SCTLR_EL1 write, before the EnTSO block: the
+ *      offset is set before the first run with the rest of the per-vCPU system state, the CPSR/SP/X0/PC writes stay
+ *      last (vk:976-981), and the EnTSO read-back stays immediately followed by R4b's debug-trap call [D4].
+ *      What the guest (Wine's ntdll) may rely on:
+ *        - one relation for every vCPU of the process, known to the host with no query: guest count == host
+ *          mach_absolute_time(), from the first instruction;
+ *        - mach_absolute_time() STOPS during host sleep and mach_continuous_time() does not. Wine's unix-side QPC is
+ *          mach_continuous_time()-based (wine dlls/ntdll/unix/sync.c:145, per the relay), so a guest QPC built on
+ *          CNTVCT_EL0 needs the host-published bias (mach_continuous_time() - mach_absolute_time(), the time slept),
+ *          republished after a wake; vel1 publishes nothing itself;
+ *        - CNTFRQ_EL0 in the guest is the host's 24 MHz (rung RB live, 12/12: 0x16e3600);
+ *        - CNTVCT_EL0 / CNTVCTSS_EL0 / CNTFRQ_EL0 read at EL1 do not trap (RB live, 12/12). vel1 runs every vCPU at
+ *          EL1h [D13] and has no EL0, so CNTKCTL_EL1 (which only gates EL0 access) is NOT written; rung RQ reads
+ *          it once for the record.
+ *      vel1 never programs the virtual timer (CNTV_CTL_EL0 / CNTV_CVAL_EL0 are never written); a VTIMER exit is
+ *      re-entered as before [D6]. VEL1_CFG_KEEP_VTIMER skips the set and the read-back (the first get still runs, so
+ *      the default is still reported): rung RQ's `vtoff=keep` A/B only, NOT for Wine, which then gets HVF's
+ *      undocumented default. STATUS: LIVE (rung RQ 2026-09-25, 1+1+1+5 runs + R1: every guest read inside its
+ *      host window; HVF's own default was also 0 on every vCPU, so the set pins today's behaviour; README "RQ").
  */
 #ifndef VCPU_EL1_H
 #define VCPU_EL1_H
@@ -239,6 +265,7 @@ extern "C" {
 #define VEL1_ACTLR_EL1_ENTSO 2ull
 #define VEL1_CPSR_EL1H_MASKED 0x3c5ull
 #define VEL1_CPSR_NZCV_MASK 0xF0000000ull
+#define VEL1_VTIMER_OFFSET 0ull /* [D19] guest CNTVCT_EL0 = mach_absolute_time() - 0 on every vCPU */
 #define VEL1_HVC_PC_IS_NEXT 1 /* [D17] */
 
 /* ---- the blob [D5] ------------------------------------------------------------------------------------------ */
@@ -293,6 +320,7 @@ enum {
   VEL1_E_NO_KICKER = -10,  /* the kicker thread or its semaphore could not be created */
   VEL1_E_STUB = -11,       /* [D18] the TLBI stub ended in an unexpected exit: FATAL, the vCPU is left NOT_RESUMED */
   VEL1_E_BUSY = -12,       /* [D18] too many CANCELEDs inside the stub: state restored, shootdown NOT done */
+  VEL1_E_VTIMER = -13,     /* [D19] the vtimer offset did not read back as VEL1_VTIMER_OFFSET: create failed */
 };
 
 /* ---- the hv ops table [D1] -------------------------------------------------------------------------------- */
@@ -313,6 +341,10 @@ typedef struct vel1_hv_ops {
   int32_t (*get_simd)(uint64_t id, uint32_t reg, uint8_t out[16]);
   int32_t (*set_simd)(uint64_t id, uint32_t reg, const uint8_t in[16]);
   int32_t (*set_trap_debug_exceptions)(uint64_t id, bool trap);
+  /* [D19] appended (vel1-gmm-v4): hv_vcpu_get_vtimer_offset / hv_vcpu_set_vtimer_offset. Appended so the fields
+     above keep their offsets; every ops table (live, test stubs, harness wrappers) must fill both. */
+  int32_t (*get_vtimer_offset)(uint64_t id, uint64_t* off);
+  int32_t (*set_vtimer_offset)(uint64_t id, uint64_t off);
 } vel1_hv_ops;
 
 const vel1_hv_ops* vel1_hv_live_ops(void); /* vcpu_el1_live.c */
@@ -487,6 +519,7 @@ bool vel1_cancel_needs_elr(uint64_t pc, const vel1_layout* lay);
 #define VEL1_CFG_KEEP_DEBUG_TRAP_DEFAULT 2u /* deprecated no-op, accepted for old callers */
 #define VEL1_CFG_SYSCALL_MINIMAL_UNSAFE 4u /* 12-accessor SYSCALL plan; NOT safe for Wine [D9] */
 #define VEL1_CFG_CLEAR_DEBUG_TRAP 8u /* adds hv_vcpu_set_trap_debug_exceptions(false); NEVER run live (R4b) [D4] */
+#define VEL1_CFG_KEEP_VTIMER 16u /* [D19] keep HVF's default vtimer offset (no set, no read-back): rung RQ only, NOT for Wine */
 
 typedef struct {
   uint64_t ttbr0;
@@ -510,6 +543,7 @@ typedef struct {
   uint64_t kicker_exits; /* hv_vcpus_exit calls the kicker thread made for this vCPU */
   uint64_t tlbi_calls, tlbi_runs, tlbi_canceled, tlbi_vtimer; /* [D18] vel1_run_tlbi and vel1_run_tlbi_all */
   uint64_t tlbi_all_calls; /* [D18] appended: vel1_run_tlbi_all calls (also counted in tlbi_calls) */
+  uint64_t vtimer_default; /* [D19] appended: HVF's vtimer offset as create found it, before setting VEL1_VTIMER_OFFSET */
 } vel1_stats;
 
 /* Caller-allocated in host-only memory; zero it before first use [D12]. Fields are private. */
@@ -539,6 +573,7 @@ typedef struct vel1_vcpu {
   uint32_t tlbi_bad_reason;
   uint64_t tlbi_bad_syndrome, tlbi_bad_pc;
   uint64_t tlbi_all_calls; /* [D18] appended: vel1_run_tlbi_all */
+  uint64_t vtimer_default; /* [D19] appended: HVF's default vtimer offset, read by create */
 } vel1_vcpu;
 
 int vel1_vcpu_create(vel1_vcpu* v, const vel1_vcpu_cfg* cfg);

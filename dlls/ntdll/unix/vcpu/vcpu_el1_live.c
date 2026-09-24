@@ -10,6 +10,8 @@
  * NEW relative to every earlier run (see README "proven vs not"): hv_vm_config_create / hv_vm_config_set_ipa_size /
  * hv_vm_create(config) (only when ipa_bits != 0), hv_vm_config_get_default_ipa_size, and
  * hv_vcpu_set_trap_debug_exceptions. Everything else is a call hvf_fex_vk.cpp or hvf_sigtest already made live.
+ * NEW in vel1-gmm-v4: hv_vcpu_get_vtimer_offset / hv_vcpu_set_vtimer_offset [D19], called by EVERY vCPU create (the
+ * first live run is rung RQ).
  */
 #include "vcpu_el1.h"
 
@@ -70,6 +72,13 @@ static int32_t live_set_simd(uint64_t id, uint32_t reg, const uint8_t in[16]) {
 static int32_t live_set_trap_debug_exceptions(uint64_t id, bool trap) {
   return hv_vcpu_set_trap_debug_exceptions((hv_vcpu_t)id, trap);
 }
+/* [D19] HVF: CNTVCT_EL0 = mach_absolute_time() - vtimer_offset (hv_vcpu.h). NEW: never called by an earlier run. */
+static int32_t live_get_vtimer_offset(uint64_t id, uint64_t* off) {
+  return hv_vcpu_get_vtimer_offset((hv_vcpu_t)id, off);
+}
+static int32_t live_set_vtimer_offset(uint64_t id, uint64_t off) {
+  return hv_vcpu_set_vtimer_offset((hv_vcpu_t)id, off);
+}
 
 static const vel1_hv_ops k_live_ops = {
     .name = "LIVE",
@@ -88,6 +97,8 @@ static const vel1_hv_ops k_live_ops = {
     .get_simd = live_get_simd,
     .set_simd = live_set_simd,
     .set_trap_debug_exceptions = live_set_trap_debug_exceptions,
+    .get_vtimer_offset = live_get_vtimer_offset,
+    .set_vtimer_offset = live_set_vtimer_offset,
 };
 
 const vel1_hv_ops* vel1_hv_live_ops(void) { return &k_live_ops; }
