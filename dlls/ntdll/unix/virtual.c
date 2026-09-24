@@ -2151,6 +2151,7 @@ struct vcpu_section
     unsigned int       views;
     BOOL               written;    /* a view was mapped writable */
     BOOL               shared;     /* shm-backed: the anchor aliases the object every process maps, no fill/write-back */
+    uint64_t           object_id;  /* shared: the kernel's VM object id of the shm object (dev/ino are 0 for all) */
     struct vcpu_ranges filled;     /* section offsets read from the file into the anchor */
     struct vcpu_ranges committed;  /* section offsets committed through the views (collected) */
 };
@@ -2236,6 +2237,28 @@ static BOOL vcpu_stat_is_shm( const struct stat *st )
     return !(st->st_mode & S_IFMT) && !st->st_dev && !st->st_ino;
 }
 
+/* what identifies a shm object instead: the kernel's VM object id of a mapping of it (object_id_full), the same for
+ * every mapping, dup and process while the object lives (FEX side, measured; relay
+ * fex-side-shared-sections-reply-2026-09-25). One anchor per section per process: two anchors of one object would put
+ * its pages at two IPAs in one VM, a shape HVF was never tested with. 0: could not tell. */
+static uint64_t vcpu_shm_object_id( int fd )
+{
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    mach_vm_address_t addr;
+    mach_vm_size_t size;
+    natural_t depth = 0;
+    kern_return_t kr;
+    void *map;
+
+    if ((map = mmap( NULL, host_page_mask + 1, PROT_READ, MAP_SHARED, fd, 0 )) == MAP_FAILED) return 0;
+    addr = (mach_vm_address_t)(UINT_PTR)map;
+    kr = mach_vm_region_recurse( mach_task_self(), &addr, &size, &depth, (vm_region_recurse_info_t)&info, &count );
+    munmap( map, host_page_mask + 1 );
+    if (kr != KERN_SUCCESS || addr != (mach_vm_address_t)(UINT_PTR)map) return 0;
+    return info.object_id_full;
+}
+
 /* shared sections (relay fex-side-shared-sections-2026-09-25, their spike's backing C): the anchor is a gmm-tagged
  * alias of the shm object (MAP_SHARED view -> memory entry -> tagged mach_vm_map, not inherited), so it is the very
  * pages every other process's anchor and host view of the section are */
@@ -2256,7 +2279,7 @@ static char *vcpu_shm_anchor( int fd, size_t size )
                                     VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL );
     if (kr == KERN_SUCCESS && entry_size < size) kr = KERN_INVALID_ARGUMENT;
     if (kr == KERN_SUCCESS)
-        kr = mach_vm_map( mach_task_self(), &anchor, size, 0, VM_FLAGS_ANYWHERE | vcpu_gmm_sect_anchor_tag(), entry,
+        kr = mach_vm_map( mach_task_self(), &anchor, size, host_page_mask, VM_FLAGS_ANYWHERE | vcpu_gmm_sect_anchor_tag(), entry,
                           0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE );
     if (entry != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), entry );
     munmap( tmp, size );
@@ -2268,25 +2291,43 @@ static char *vcpu_shm_anchor( int fd, size_t size )
     return (char *)(UINT_PTR)anchor;
 }
 
-/* the section's anchor, created on its first view in this process (a shared section's, on each view) */
+/* the section's anchor, created on its first view in this process */
 static struct vcpu_section *vcpu_section_get( int fd, const struct stat *st, mem_size_t section_size )
 {
     struct vcpu_section *section;
     BOOL shm = vcpu_stat_is_shm( st );
+    uint64_t object_id = 0;
     int ret;
 
-    if (!shm)
-        LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
-            if (!section->shared && section->dev == st->st_dev && section->ino == st->st_ino) return section;
+    if (shm && vcpu_shared_sections && !(object_id = vcpu_shm_object_id( fd )))
+    {
+        ERR( "vCPU mode: no VM object id for a shared section's fd %d\n", fd );
+        return NULL;
+    }
+    LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
+    {
+        if (object_id ? section->shared && section->object_id == object_id
+                      : !shm && !section->shared && section->dev == st->st_dev && section->ino == st->st_ino)
+        {
+            if (section_size > section->size)
+            {
+                ERR( "vCPU mode: section view past its anchor (%#llx > %#zx)\n", (unsigned long long)section_size,
+                     section->size );
+                return NULL;
+            }
+            return section;
+        }
+    }
 
     if (!(section = calloc( 1, sizeof(*section) ))) return NULL;
     section->dev  = st->st_dev;
     section->ino  = st->st_ino;
     section->size = ROUND_SIZE( 0, section_size, host_page_mask );
     section->fd   = -1;
-    if (shm && vcpu_shared_sections)
+    if (object_id)
     {
         section->shared = TRUE;
+        section->object_id = object_id;
         if (!(section->anchor = vcpu_shm_anchor( fd, section->size )))
         {
             free( section );
