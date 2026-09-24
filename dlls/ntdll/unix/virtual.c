@@ -1932,6 +1932,26 @@ static inline BOOL is_guest_view( const struct file_view *view )
     return vcpu_mode && !(view->protect & (VPROT_SYSTEM | VPROT_HOSTONLY));
 }
 
+/* pread/pwrite a section's fd; a POSIX shm object (wineserver's anonymous sections under PMW_VCPU_SHARED_SECTIONS on
+ * macOS) supports neither (ESPIPE), so go through a MAP_SHARED window of it, host-page aligned */
+static ssize_t section_fd_rw( int fd, void *buf, size_t size, off_t offset, BOOL write )
+{
+    off_t start;
+    size_t len;
+    char *map;
+    ssize_t ret = write ? pwrite( fd, buf, size, offset ) : pread( fd, buf, size, offset );
+
+    if (ret != -1 || errno != ESPIPE || !size) return ret;
+    start = offset & ~(off_t)host_page_mask;
+    len = ROUND_SIZE( 0, size + (offset - start), host_page_mask );
+    map = mmap( NULL, len, write ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, fd, start );
+    if (map == MAP_FAILED) return -1;
+    if (write) memcpy( map + (offset - start), buf, size );
+    else memcpy( buf, map + (offset - start), size );
+    munmap( map, len );
+    return size;
+}
+
 #if defined(__APPLE__) && defined(__aarch64__)
 
 static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vprot );
@@ -2130,6 +2150,7 @@ struct vcpu_section
     void              *gmm_sect;   /* gmm's section over the anchor */
     unsigned int       views;
     BOOL               written;    /* a view was mapped writable */
+    BOOL               shared;     /* shm-backed: the anchor aliases the object every process maps, no fill/write-back */
     struct vcpu_ranges filled;     /* section offsets read from the file into the anchor */
     struct vcpu_ranges committed;  /* section offsets committed through the views (collected) */
 };
@@ -2208,19 +2229,71 @@ static struct vcpu_section_view *vcpu_section_view_find( const struct file_view 
     return NULL;
 }
 
-/* the section's anchor, created on its first view in this process */
+/* a POSIX shm object (wineserver's pagefile sections under PMW_VCPU_SHARED_SECTIONS): fstat gives no file type and
+ * dev/ino 0 for every one, so these are never matched by dev/ino */
+static BOOL vcpu_stat_is_shm( const struct stat *st )
+{
+    return !(st->st_mode & S_IFMT) && !st->st_dev && !st->st_ino;
+}
+
+/* shared sections (relay fex-side-shared-sections-2026-09-25, their spike's backing C): the anchor is a gmm-tagged
+ * alias of the shm object (MAP_SHARED view -> memory entry -> tagged mach_vm_map, not inherited), so it is the very
+ * pages every other process's anchor and host view of the section are */
+static char *vcpu_shm_anchor( int fd, size_t size )
+{
+    memory_object_size_t entry_size = size;
+    mach_port_t entry = MACH_PORT_NULL;
+    mach_vm_address_t anchor = 0;
+    kern_return_t kr;
+    void *tmp;
+
+    if ((tmp = mmap( NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED)
+    {
+        ERR( "vCPU mode: shared anchor: mmap of %#zx bytes failed: %s\n", size, strerror( errno ));
+        return NULL;
+    }
+    kr = mach_make_memory_entry_64( mach_task_self(), &entry_size, (mach_vm_address_t)(UINT_PTR)tmp,
+                                    VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL );
+    if (kr == KERN_SUCCESS && entry_size < size) kr = KERN_INVALID_ARGUMENT;
+    if (kr == KERN_SUCCESS)
+        kr = mach_vm_map( mach_task_self(), &anchor, size, 0, VM_FLAGS_ANYWHERE | vcpu_gmm_sect_anchor_tag(), entry,
+                          0, FALSE, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE );
+    if (entry != MACH_PORT_NULL) mach_port_deallocate( mach_task_self(), entry );
+    munmap( tmp, size );
+    if (kr != KERN_SUCCESS)
+    {
+        ERR( "vCPU mode: shared anchor of %#zx bytes failed: kern_return_t %d\n", size, kr );
+        return NULL;
+    }
+    return (char *)(UINT_PTR)anchor;
+}
+
+/* the section's anchor, created on its first view in this process (a shared section's, on each view) */
 static struct vcpu_section *vcpu_section_get( int fd, const struct stat *st, mem_size_t section_size )
 {
     struct vcpu_section *section;
+    BOOL shm = vcpu_stat_is_shm( st );
     int ret;
 
-    LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
-        if (section->dev == st->st_dev && section->ino == st->st_ino) return section;
+    if (!shm)
+        LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
+            if (!section->shared && section->dev == st->st_dev && section->ino == st->st_ino) return section;
 
     if (!(section = calloc( 1, sizeof(*section) ))) return NULL;
     section->dev  = st->st_dev;
     section->ino  = st->st_ino;
     section->size = ROUND_SIZE( 0, section_size, host_page_mask );
+    section->fd   = -1;
+    if (shm && vcpu_shared_sections)
+    {
+        section->shared = TRUE;
+        if (!(section->anchor = vcpu_shm_anchor( fd, section->size )))
+        {
+            free( section );
+            return NULL;
+        }
+        goto have_anchor;
+    }
     /* lazily populated: a 2 TiB anchor (CoreCLR's code heap section) costs address space only */
     section->anchor = mmap( NULL, section->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON,
                             vcpu_gmm_sect_anchor_tag(), 0 );
@@ -2245,6 +2318,7 @@ static struct vcpu_section *vcpu_section_get( int fd, const struct stat *st, mem
         free( section );
         return NULL;
     }
+have_anchor:
     {
         VCPU_GMM_BEGIN();
         ret = vcpu_gmm_sect_create( section->anchor, section->size, &section->gmm_sect );
@@ -2254,7 +2328,7 @@ static struct vcpu_section *vcpu_section_get( int fd, const struct stat *st, mem
     {
         ERR( "gmm_sect_create %p-%p failed %d\n", section->anchor, section->anchor + section->size, ret );
         if (!vcpu_gmm_out_of_resources( ret )) abort();
-        close( section->fd );
+        if (section->fd != -1) close( section->fd );
         munmap( section->anchor, section->size );
         free( section );
         return NULL;
@@ -2283,7 +2357,7 @@ static void vcpu_section_destroy( struct vcpu_section *section )
     }
     TRACE( "vCPU mode: section anchor %p-%p destroyed\n", section->anchor, section->anchor + section->size );
     munmap( section->anchor, section->size );
-    close( section->fd );
+    if (section->fd != -1) close( section->fd );
     vcpu_ranges_free( &section->filled );
     vcpu_ranges_free( &section->committed );
     list_remove( &section->entry );
@@ -2341,7 +2415,7 @@ static void vcpu_section_sync_file( int fd )
     if (list_empty( &vcpu_sections ) || fstat( fd, &st ) == -1) return;
     LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
     {
-        if (section->dev != st.st_dev || section->ino != st.st_ino) continue;
+        if (section->shared || section->dev != st.st_dev || section->ino != st.st_ino) continue;
         if (!section->written) return;
         LIST_FOR_EACH_ENTRY( sv, &vcpu_section_views, struct vcpu_section_view, entry )
             if (sv->section == section) vcpu_section_collect( sv );
@@ -2356,7 +2430,7 @@ static void vcpu_section_view_flush( const struct vcpu_section_view *sv )
 {
     const struct vcpu_section_view *other;
 
-    if (!sv->section->written) return;
+    if (!sv->section->written || sv->section->shared) return;  /* shared: the anchor is the section */
     LIST_FOR_EACH_ENTRY( other, &vcpu_section_views, struct vcpu_section_view, entry )
         if (other->section == sv->section) vcpu_section_collect( other );
     vcpu_section_write_back( sv->section, sv->offset, sv->offset + sv->view->size );
@@ -2385,11 +2459,15 @@ static NTSTATUS vcpu_section_view_map( struct file_view *view, int fd, mem_size_
     if (!(section = vcpu_section_get( fd, &st, section_size ))) goto failed;
     assert( end <= section->size );
 
-    /* read only what no earlier view has read: the anchor's copy may be newer than the file */
-    for (pos = offset; pos < end; pos = run_end)
-        if (!vcpu_ranges_find( &section->filled, pos, end, &run_end ))
-            pread( section->fd, section->anchor + pos, run_end - pos, pos );
-    if (vcpu_ranges_add( &section->filled, offset, end )) goto failed;
+    /* read only what no earlier view has read: the anchor's copy may be newer than the file (a shared section's
+     * anchor is the section itself) */
+    if (!section->shared)
+    {
+        for (pos = offset; pos < end; pos = run_end)
+            if (!vcpu_ranges_find( &section->filled, pos, end, &run_end ))
+                pread( section->fd, section->anchor + pos, run_end - pos, pos );
+        if (vcpu_ranges_add( &section->filled, offset, end )) goto failed;
+    }
 
     /* the view's host side, for host access (syscalls on its buffers, NtFlushInstructionCache, write-back); never
      * handed to hv_vm_map, which sees the anchor only. Not inherited either: it shares the anchor's object, so a
@@ -2441,7 +2519,7 @@ static void vcpu_section_view_unmap( struct file_view *view )
 
     if (!sv) return;  /* vcpu_section_view_map failed: nothing in gmm */
     section = sv->section;
-    vcpu_section_collect( sv );
+    if (!section->shared) vcpu_section_collect( sv );
     {
         VCPU_GMM_BEGIN();
         ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
@@ -2457,7 +2535,7 @@ static void vcpu_section_view_unmap( struct file_view *view )
     TRACE( "vCPU mode: aliased view %p-%p gone, %u left\n", view->base, (char *)view->base + view->size,
            section->views - 1 );
     if (--section->views) return;
-    if (section->written) vcpu_section_write_back( section, 0, section->size );
+    if (section->written && !section->shared) vcpu_section_write_back( section, 0, section->size );
     vcpu_section_destroy( section );
 }
 
@@ -2520,7 +2598,7 @@ static void vcpu_view_flush( const struct file_view *view, BOOL remove )
             run = page_size - ((size_t)(wb->addr + pos) & page_mask);
             if (run > wb->size - pos) run = wb->size - pos;
             if (!(get_page_vprot( wb->addr + pos ) & VPROT_COMMITTED)) continue;
-            if (pwrite( wb->fd, wb->addr + pos, run, wb->offset + pos ) != run)
+            if (section_fd_rw( wb->fd, wb->addr + pos, run, wb->offset + pos, TRUE ) != run)
                 ERR( "vCPU mode: write-back of %p-%p failed: %s\n", wb->addr + pos, wb->addr + pos + run,
                      strerror( errno ));
         }
@@ -3410,7 +3488,7 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     {
         /* vCPU mode: gmm can only map anonymous memory into the guest, so files are always read; a shared
          * writable view is a copy written back on flush and unmap (vcpu_view_flush) */
-        pread( fd, map_addr, size, offset );
+        section_fd_rw( fd, map_addr, size, offset, FALSE );
         /* the view may be executable from its creation on (vcpu_view_created): the pages this read wrote are not
          * re-invalidated by a later protection sync, which skips executable read-only pages (vcpu_icache_sync) */
         if (view->protect & VPROT_EXEC) vcpu_icache_invalidate( map_addr, size );

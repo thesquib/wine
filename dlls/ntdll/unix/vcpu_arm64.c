@@ -73,6 +73,7 @@ extern void trace_userret( void *ret_ptr, ULONG len, NTSTATUS status, UINT id );
 int vcpu_mode;
 int vcpu_check_s2;
 int vcpu_sect_alias;
+int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS=1: shm-backed sections alias one object across processes */
 
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
@@ -1763,6 +1764,9 @@ void vcpu_init_process(void)
         TRACE( "gmm: s2_run_chunks %u, flags %#x\n", cfg.s2_run_chunks, cfg.flags );
     }
     vcpu_sect_alias = VCPU_GMM_SECT && !((env = getenv( "PMW_VCPU_SECT_ALIAS" )) && !strcmp( env, "0" ));
+    /* wineserver backs anonymous sections with POSIX shm under the same variable (server/mapping.c); off until the
+     * FEX side's live HVF rung for cross-process anchors passes (relay fex-side-shared-sections-2026-09-25) */
+    vcpu_shared_sections = vcpu_sect_alias && (env = getenv( "PMW_VCPU_SHARED_SECTIONS" )) && atoi( env ) > 0;
 
     init_sys_page();
     init_kuser();
