@@ -408,6 +408,15 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     int stdin_fd = -1, stdout_fd = -1;
     pid_t pid;
     char **argv;
+    BOOL new_session;
+
+    /* everything the child needs from params and the PEB is read here: in the vCPU mode, guest memory is not
+     * inherited by fork() (virtual.c: anon_mmap_fixed_tag) */
+    if (!(argv = build_argv( &params->CommandLine, 2 ))) return STATUS_NO_MEMORY;
+    new_session = (peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                  params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                  params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                  params->ConsoleHandle == NULL;
 
     if (wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL ) &&
         isatty(0) && is_unix_console_handle( params->hStdInput ))
@@ -421,10 +430,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     {
         if (!(pid = fork()))  /* grandchild */
         {
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
-                params->ConsoleHandle == NULL)
+            if (new_session)
             {
                 setsid();
                 set_stdio_fd( -1, -1 );  /* close stdin and stdout */
@@ -440,7 +446,6 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
                 fchdir( unixdir );
                 close( unixdir );
             }
-            argv = build_argv( &params->CommandLine, 2 );
 
             exec_wineloader( argv, socketfd, pe_info );
             _exit(1);
@@ -459,6 +464,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     }
     else status = STATUS_NO_MEMORY;
 
+    free( argv );
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
     return status;
@@ -568,12 +574,25 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     int fd[2], stdin_fd = -1, stdout_fd = -1;
     char **argv;
     NTSTATUS status = STATUS_SUCCESS;
+    BOOL new_session;
+
+    /* everything the child needs from params and the PEB is read here: in the vCPU mode, guest memory is not
+     * inherited by fork() (virtual.c: anon_mmap_fixed_tag) */
+    if (!(argv = build_argv( &params->CommandLine, 0 ))) return STATUS_NO_MEMORY;
+    new_session = (peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
+                  params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
+                  params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
+                  params->ConsoleHandle == NULL;
 
 #ifdef HAVE_PIPE2
     if (pipe2( fd, O_CLOEXEC ) == -1)
 #endif
     {
-        if (pipe(fd) == -1) return STATUS_TOO_MANY_OPENED_FILES;
+        if (pipe(fd) == -1)
+        {
+            free( argv );
+            return STATUS_TOO_MANY_OPENED_FILES;
+        }
         fcntl( fd[0], F_SETFD, FD_CLOEXEC );
         fcntl( fd[1], F_SETFD, FD_CLOEXEC );
     }
@@ -592,10 +611,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
         {
             close( fd[0] );
 
-            if ((peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
-                params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
-                params->ConsoleHandle == NULL)
+            if (new_session)
             {
                 setsid();
                 set_stdio_fd( -1, -1 );  /* close stdin and stdout */
@@ -608,7 +624,6 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
             /* Reset signals that we previously set to SIG_IGN */
             signal( SIGPIPE, SIG_DFL );
 
-            argv = build_argv( &params->CommandLine, 0 );
             if (unixdir != -1)
             {
                 fchdir( unixdir );
@@ -648,6 +663,7 @@ static NTSTATUS fork_and_exec( OBJECT_ATTRIBUTES *attr, const char *unix_name, i
     }
     else status = STATUS_NO_MEMORY;
 
+    free( argv );
     close( fd[0] );
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );

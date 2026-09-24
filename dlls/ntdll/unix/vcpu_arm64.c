@@ -351,6 +351,8 @@ static void init_sys_page(void)
 
     sys_page = mmap( NULL, SYS_PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, VM_MAKE_TAG(250), 0 );
     if (sys_page == MAP_FAILED) vcpu_fatal( "system page mmap failed\n" );
+    /* guest memory is never shared with a fork() child (virtual.c: anon_mmap_fixed_tag) */
+    if (minherit( sys_page, SYS_PAGE_SIZE, VM_INHERIT_NONE )) vcpu_fatal( "system page minherit failed\n" );
     if ((ret = vel1_blob_install( sys_page + SYS_BLOB_OFF, 0x1000 ))) vcpu_fatal( "vel1_blob_install: %d\n", ret );
     memcpy( sys_page + SYS_TLBI_OFF, vcpu_tlbi_stub_start, stub_size );
     sys_icache_invalidate( sys_page + SYS_TLBI_OFF, stub_size );
@@ -1253,6 +1255,8 @@ void vcpu_init_process(void)
 
     pool = gmm_alloc_backing( VCPU_PT_POOL_SIZE );
     if (!pool) vcpu_fatal( "page-table pool allocation failed\n" );
+    /* a fork() child sharing the page tables would leave the vCPUs walking copies gmm no longer writes */
+    if (minherit( pool, VCPU_PT_POOL_SIZE, VM_INHERIT_NONE )) vcpu_fatal( "page-table pool minherit failed\n" );
     memset( &cfg, 0, sizeof(cfg) );
     cfg.alias_base = VCPU_ALIAS_BASE;
     cfg.ipa_lo = VCPU_DATA_IPA_LO;
