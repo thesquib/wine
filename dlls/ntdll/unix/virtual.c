@@ -2306,6 +2306,28 @@ static void vcpu_section_write_back( const struct vcpu_section *section, uint64_
     }
 }
 
+/* a view of fd's section that is a copy (map_file_into_view) is about to read the file: if the section has an anchor
+ * in this process, the file must first get what the aliased views wrote (a write-copy view of CoreCLR-style shared
+ * memory, a placeholder view) */
+static void vcpu_section_sync_file( int fd )
+{
+    const struct vcpu_section_view *sv;
+    struct vcpu_section *section;
+    struct stat st;
+
+    if (list_empty( &vcpu_sections ) || fstat( fd, &st ) == -1) return;
+    LIST_FOR_EACH_ENTRY( section, &vcpu_sections, struct vcpu_section, entry )
+    {
+        if (section->dev != st.st_dev || section->ino != st.st_ino) continue;
+        if (!section->written) return;
+        LIST_FOR_EACH_ENTRY( sv, &vcpu_section_views, struct vcpu_section_view, entry )
+            if (sv->section == section) vcpu_section_collect( sv );
+        TRACE( "vCPU mode: copy view of section anchor %p: writing the anchor back first\n", section->anchor );
+        vcpu_section_write_back( section, 0, section->size );
+        return;
+    }
+}
+
 /* NtFlushVirtualMemory of an aliased view: every view's commits so far, then the view's part of the section */
 static void vcpu_section_view_flush( const struct vcpu_section_view *sv )
 {
@@ -2536,6 +2558,7 @@ static inline NTSTATUS vcpu_section_view_map( struct file_view *view, int fd, me
 {
     return STATUS_NOT_SUPPORTED;
 }
+static inline void vcpu_section_sync_file( int fd ) {}
 #endif
 
 
@@ -4653,7 +4676,10 @@ static unsigned int virtual_map_section( HANDLE handle, PVOID *addr_ptr, ULONG_P
     if (view->protect & VPROT_ALIASED)
         res = vcpu_section_view_map( view, unix_handle, full_size, offset.QuadPart );
     else
+    {
+        if (is_guest_view( view )) vcpu_section_sync_file( unix_handle );
         res = map_file_into_view( view, unix_handle, 0, size, offset.QuadPart, vprot, needs_close );
+    }
     if (res == STATUS_SUCCESS)
     {
         /* file mappings must always be accessible. vCPU mode: gmm may be out of IPA or page tables (an aliased
