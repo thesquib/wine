@@ -150,6 +150,11 @@ static ULONG64 vcpu_shim_NtFsControlFile( ULONG64 a0, ULONG64 a1, ULONG64 a2, UL
     return (ULONG64)(ULONG)NtFsControlFile( (HANDLE)(ULONG_PTR)a0, (HANDLE)(ULONG_PTR)a1, (PIO_APC_ROUTINE)(ULONG_PTR)a2, (void *)(ULONG_PTR)a3, (IO_STATUS_BLOCK *)(ULONG_PTR)a4, (ULONG)(ULONG_PTR)a5, (void *)(ULONG_PTR)a6, (ULONG)(ULONG_PTR)a7, (void *)(ULONG_PTR)a8, (ULONG)(ULONG_PTR)a9 );
 }
 
+static ULONG64 vcpu_shim_NtInitiatePowerAction( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULONG64 a3 )
+{
+    return (ULONG64)(ULONG)NtInitiatePowerAction( (POWER_ACTION)(ULONG_PTR)a0, (SYSTEM_POWER_STATE)(ULONG_PTR)a1, (ULONG)(ULONG_PTR)a2, (BOOLEAN)(ULONG_PTR)a3 );
+}
+
 static ULONG64 vcpu_shim_NtLockFile( ULONG64 a0, ULONG64 a1, ULONG64 a2, ULONG64 a3, ULONG64 a4, ULONG64 a5, ULONG64 a6, ULONG64 a7, ULONG64 a8, ULONG64 a9 )
 {
     return (ULONG64)(ULONG)NtLockFile( (HANDLE)(ULONG_PTR)a0, (HANDLE)(ULONG_PTR)a1, (PIO_APC_ROUTINE)(ULONG_PTR)a2, (void*)(ULONG_PTR)a3, (IO_STATUS_BLOCK *)(ULONG_PTR)a4, (LARGE_INTEGER *)(ULONG_PTR)a5, (LARGE_INTEGER *)(ULONG_PTR)a6, (ULONG *)(ULONG_PTR)a7, (BOOLEAN)(ULONG_PTR)a8, (BOOLEAN)(ULONG_PTR)a9 );
@@ -331,6 +336,7 @@ const struct vcpu_syscall_shim vcpu_syscall_shims[] =
     { (const void *)NtDeviceIoControlFile, (const void *)vcpu_shim_NtDeviceIoControlFile },
     { (const void *)NtDuplicateToken, (const void *)vcpu_shim_NtDuplicateToken },
     { (const void *)NtFsControlFile, (const void *)vcpu_shim_NtFsControlFile },
+    { (const void *)NtInitiatePowerAction, (const void *)vcpu_shim_NtInitiatePowerAction },
     { (const void *)NtLockFile, (const void *)vcpu_shim_NtLockFile },
     { (const void *)NtMapViewOfSection, (const void *)vcpu_shim_NtMapViewOfSection },
     { (const void *)NtMapViewOfSectionEx, (const void *)vcpu_shim_NtMapViewOfSectionEx },
