@@ -1682,6 +1682,40 @@ static void publish_ksystem_time( volatile KSYSTEM_TIME *dst, const volatile KSY
     dst->High1Time = high1;
 }
 
+/* PMW_VCPU_FAST_QPC=1: the guest's RtlQueryPerformanceCounter reads CNTVCT_EL0 (== mach_absolute_time() on every
+ * vCPU, vcpu_el1 [D19]) plus QpcBias instead of making a syscall, while QpcFrequency is TICKSPERSEC. The bias is
+ * mach_continuous_time() - mach_absolute_time(): the time the Mac slept since boot. It is only moved forward, and
+ * only by more than 0.5 ms (so the reader's clock stays monotonic); after a wake the guest runs behind the host by
+ * the sleep for at most one republish (8 ms). Both fields are written only here, never copied from the server's
+ * page (copy_kuser_range skips them), so a reader never pairs the enabled frequency with a zero bias. */
+static BOOL fast_qpc;
+static ULONGLONG qpc_bias;
+
+static void publish_qpc_bias( char *dst )
+{
+    ULONGLONG bias = mach_continuous_time() - mach_absolute_time();
+
+    if (bias > qpc_bias + 12000) qpc_bias = bias;  /* 0.5 ms at 24 MHz */
+    __atomic_store_n( (volatile ULONGLONG *)(dst + FIELD_OFFSET( KUSER_SHARED_DATA, QpcBias )), qpc_bias,
+                      __ATOMIC_RELEASE );
+}
+
+/* plain bytes of [from, to), leaving the QPC fields alone while fast QPC owns them */
+static void copy_kuser_range( char *dst, const char *src, unsigned int from, unsigned int to )
+{
+    const unsigned int holes[2] = { FIELD_OFFSET( KUSER_SHARED_DATA, QpcFrequency ),
+                                    FIELD_OFFSET( KUSER_SHARED_DATA, QpcBias ) };
+    unsigned int i;
+
+    for (i = 0; fast_qpc && i < ARRAY_SIZE(holes); i++)
+    {
+        if (holes[i] < from || holes[i] >= to) continue;
+        memcpy( dst + from, src + from, holes[i] - from );
+        from = holes[i] + sizeof(ULONGLONG);
+    }
+    memcpy( dst + from, src + from, to - from );
+}
+
 static void publish_kuser( char *dst, const char *src )
 {
     unsigned int i, pos = 0;
@@ -1689,11 +1723,16 @@ static void publish_kuser( char *dst, const char *src )
     for (i = 0; i < ARRAY_SIZE(kuser_time_offsets); i++)
     {
         unsigned int off = kuser_time_offsets[i];
-        memcpy( dst + pos, src + pos, off - pos );
+        copy_kuser_range( dst, src, pos, off );
         publish_ksystem_time( (volatile KSYSTEM_TIME *)(dst + off), (const volatile KSYSTEM_TIME *)(src + off) );
         pos = off + sizeof(KSYSTEM_TIME);
     }
-    memcpy( dst + pos, src + pos, 0x1000 - pos );
+    copy_kuser_range( dst, src, pos, 0x1000 );
+    if (!fast_qpc) return;
+    /* the bias before the frequency that enables it (the first publish), and never a transient zero */
+    publish_qpc_bias( dst );
+    __atomic_store_n( (volatile LONGLONG *)(dst + FIELD_OFFSET( KUSER_SHARED_DATA, QpcFrequency )),
+                      (LONGLONG)10000000, __ATOMIC_RELEASE );
 }
 
 static void *kuser_thread( void *arg )
@@ -1708,9 +1747,13 @@ static void *kuser_thread( void *arg )
 
 void vcpu_start_kuser_publisher( const void *src )
 {
+    const char *env = getenv( "PMW_VCPU_FAST_QPC" );
     pthread_t thread;
     sigset_t old;
     int ret;
+
+    fast_qpc = env && !strcmp( env, "1" );
+    TRACE( "fast QPC %s\n", fast_qpc ? "on" : "off" );
 
     publish_kuser( kuser_host, src );
     block_all_signals( &old );
