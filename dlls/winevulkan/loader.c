@@ -768,11 +768,97 @@ VkResult WINAPI vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferA
     return params.result;
 }
 
+/***********************************************************************
+ * PMW_VK_BATCH=1: queue recording-only vkCmd* calls per command buffer (PROTON_DARWIN)
+ *
+ * Each call into the unix side is a PE-to-unix transition, and in the vCPU mode a VM exit: Slay the Spire 2 made
+ * ~175k vkCmd* calls a second (~2,900 a frame), each costing an exit for 0.2-0.6 us of host work. The generated
+ * thunks (make_vulkan: batch_plan) append a call whose pointers all lead to plain data of known size, copying that
+ * data; every other call taking the command buffer, vkEndCommandBuffer included, first replays the queue with one
+ * unix call, and vkResetCommandPool / vkFreeCommandBuffers replay what their buffers hold. A command buffer is
+ * externally synchronized, so its queue needs no lock. 64-bit only.
+ */
+#define VK_BATCH_MIN   (64 * 1024)
+#define VK_BATCH_MAX   (4 * 1024 * 1024)
+
+BOOL vk_batch_enabled;
+
+void vk_batch_flush_slow(VkCommandBuffer buffer)
+{
+#ifdef _WIN64
+    struct batch_execute_params params;
+
+    params.data = (UINT_PTR)buffer->batch;
+    params.size = buffer->batch_used;
+    buffer->batch_used = 0;
+    UNIX_CALL(batch_execute, &params);
+#endif
+}
+
+void vk_batch_flush_pool(VkCommandPool handle)
+{
+    struct vk_command_pool *pool = command_pool_from_handle(handle);
+    VkCommandBuffer buffer;
+
+    if (!pool) return;
+    LIST_FOR_EACH_ENTRY(buffer, &pool->command_buffers, struct VkCommandBuffer_T, pool_link)
+        vk_batch_flush(buffer);
+}
+
+/* reserves a record for a call with `extra` bytes of copied data; returns its params copy, or NULL after replaying
+ * whatever was queued (the caller then makes the call itself). Records hold absolute pointers into the buffer, so
+ * it never moves while anything is queued. */
+void *vk_batch_begin(VkCommandBuffer buffer, UINT32 code, const void *params, SIZE_T params_size, SIZE_T extra)
+{
+    SIZE_T need = sizeof(struct vk_batch_header) + VK_BATCH_ALIGN(params_size) + extra;
+    struct vk_batch_header *header;
+
+    if (buffer->batch_used + need > buffer->batch_size)
+    {
+        SIZE_T size;
+        BYTE *batch;
+
+        /* queued records point into the buffer (their copied data), so it may only move while empty: replay what
+         * is queued, then grow for the next run of records, doubling up to VK_BATCH_MAX */
+        vk_batch_flush(buffer);
+        size = buffer->batch_size ? min(buffer->batch_size * 2, VK_BATCH_MAX) : VK_BATCH_MIN;
+        while (size < need && size < VK_BATCH_MAX) size *= 2;
+        if (size > buffer->batch_size && (batch = realloc(buffer->batch, size)))
+        {
+            buffer->batch = batch;
+            buffer->batch_size = size;
+        }
+        if (need > buffer->batch_size) return NULL;
+    }
+    header = (struct vk_batch_header *)(buffer->batch + buffer->batch_used);
+    header->code = code;
+    header->size = need;
+    memcpy(header + 1, params, params_size);
+    buffer->batch_data = buffer->batch_used + sizeof(*header) + VK_BATCH_ALIGN(params_size);
+    buffer->batch_used += need;
+    return header + 1;
+}
+
+/* copies one pointer's data into the record vk_batch_begin reserved and returns where it now is */
+const void *vk_batch_data(VkCommandBuffer buffer, const void *src, SIZE_T size)
+{
+    BYTE *dst;
+
+    if (!src || !size) return src;  /* never read (a NULL optional pointer, or a zero count) */
+    dst = buffer->batch + buffer->batch_data;
+    memcpy(dst, src, size);
+    buffer->batch_data += VK_BATCH_ALIGN(size);
+    return dst;
+}
+
 void WINAPI vkFreeCommandBuffers(VkDevice device, VkCommandPool cmd_pool, uint32_t count,
                                  const VkCommandBuffer *buffers)
 {
     struct vkFreeCommandBuffers_params params;
     uint32_t i;
+
+    for (i = 0; i < count; i++)
+        if (buffers[i]) vk_batch_flush(buffers[i]);
 
     params.device = device;
     params.commandPool = cmd_pool;
@@ -784,6 +870,7 @@ void WINAPI vkFreeCommandBuffers(VkDevice device, VkCommandPool cmd_pool, uint32
         if (!buffers[i])
             continue;
         list_remove(&buffers[i]->pool_link);
+        free(buffers[i]->batch);
         free(buffers[i]);
     }
 }
@@ -795,9 +882,16 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
     switch (reason)
     {
         case DLL_PROCESS_ATTACH:
+        {
+#ifdef _WIN64
+            char env[8];
+            if (GetEnvironmentVariableA("PMW_VK_BATCH", env, sizeof(env)) && env[0] == '1')
+                vk_batch_enabled = TRUE;
+#endif
             hinstance = hinst;
             DisableThreadLibraryCalls(hinst);
             break;
+        }
     }
     return TRUE;
 }
