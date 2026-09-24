@@ -180,6 +180,16 @@ void ntdll_add_syscall_debug_info( UINT idx, const char **names, const char **us
     usercall_names = user_names;
 }
 
+/* the syscall's name when its table registered names (ntdll's always has them), else NULL */
+const char *ntdll_syscall_name( UINT id )
+{
+    UINT idx = (id >> 12) & 3, num = id & 0xfff;
+    const char **names = syscall_names[idx];
+
+    if (!names || num >= KeServiceDescriptorTable[idx].ServiceLimit) return NULL;
+    return names[num];
+}
+
 #ifdef __GNUC__
 static void fatal_error( const char *err, ... ) __attribute__((noreturn, format(printf,1,2)));
 #endif
