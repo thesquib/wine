@@ -35,6 +35,37 @@ static inline void vcpu_start_kuser_publisher( const void *src ) {}
 static inline void vcpu_thread_exit(void) {}
 #endif
 
+/* PMW_VCPU_PROF (vcpu_arm64.c): time spent inside host-side paths, reported as "in:" rows (nested inside the
+ * syscall or exit that ran them, so not additive with those) and faults by outcome */
+enum vcpu_prof_id
+{
+    VCPU_PROF_S1_SYNC,       /* in:s1 sync       vcpu_sync_pages: stage-1 update of a range */
+    VCPU_PROF_S1_REVOKE,     /* in:s1 revoke     vcpu_revoke_pages */
+    VCPU_PROF_ICACHE,        /* in:icache sync   before a range becomes executable */
+    VCPU_PROF_TLBI,          /* in:tlbi          the shootdown gmm asks for */
+    VCPU_PROF_VM_FAULT,      /* in:gmm_vm_fault  */
+    VCPU_PROF_VIRTUAL_LOCK,  /* lock:virtual_mutex, contended acquisitions only */
+    VCPU_PROF_FAULT_RETRY,   /* fault:retry      gmm says the live descriptor allows it: resumed */
+    VCPU_PROF_FAULT_HANDLED, /* fault:handled    virtual_handle_fault (guard, write watch, stack): resumed */
+    VCPU_PROF_FAULT_RAISED,  /* fault:raised     an exception delivered to the guest */
+    VCPU_PROF_IDS
+};
+
+#if defined(__APPLE__) && defined(__aarch64__)
+extern unsigned int vcpu_prof_interval;
+extern void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks );
+static inline uint64_t vcpu_prof_now(void)
+{
+    uint64_t v;
+    __asm__ volatile( "mrs %0, cntvct_el0" : "=r" (v) );
+    return v;
+}
+#else
+#define vcpu_prof_interval 0
+static inline void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks ) {}
+static inline uint64_t vcpu_prof_now(void) { return 0; }
+#endif
+
 #ifdef __aarch64__
 
 /* The per-thread user-mode register frame, at the top of the kernel stack. In the vCPU mode it stays the single
