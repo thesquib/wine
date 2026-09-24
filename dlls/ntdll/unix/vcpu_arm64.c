@@ -696,8 +696,12 @@ static void vcpu_store_full( struct vcpu_thread *vt, const struct syscall_frame 
     vcpu_unblock_signals();
     atomic_store( &vt->in_syscall, 0 );
     atomic_signal_fence( memory_order_seq_cst );
-    if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
+    /* as usr2_handler: the flag asks for the slow path, the frame's pc decides (vcpu_return) */
+    if ((frame->restore_flags & RESTORE_FLAGS_EMULATION) && is_emulated_code( frame->pc ))
     {
+        TRACE( "emulation entry via store_full: restore_flags %#x pc %#llx sp %#llx lr %#llx\n",
+               (UINT)frame->restore_flags, (unsigned long long)frame->pc, (unsigned long long)frame->sp,
+               (unsigned long long)frame->lr );
         vcpu_emulation_entry( frame, &entry );
         frame = &entry;
     }
@@ -724,13 +728,29 @@ static void vcpu_return( struct vcpu_thread *vt, struct vcpu_level *level, vel1_
 
     atomic_store( &vt->in_syscall, 0 );
     atomic_signal_fence( memory_order_seq_cst );
-    if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
+    /* RESTORE_FLAGS_EMULATION only sends the EL0 return to the slow path (SIGUSR2); usr2_handler then enters the
+     * emulator only if the frame's pc is still emulated code. It may not be: NtRaiseException's
+     * call_user_exception_dispatcher sets the flag through NtSetContextThread (an x86 context from the emulator's
+     * fault handler) and then points pc at the native KiUserExceptionDispatcher. Entering the emulator there ran
+     * the dispatcher as an x64 call on a shifted stack (exception code 0, then "invalid frame"): STS2's exit crash. */
+    if ((frame->restore_flags & RESTORE_FLAGS_EMULATION) && is_emulated_code( frame->pc ))
     {
         /* into x86 code: the emulator takes over with the frame as a CONTEXT, everything stored */
         struct syscall_frame entry;
 
+        TRACE( "emulation entry via %s return: syscall %#x ret %#llx restore_flags %#x pc %#llx sp %#llx lr %#llx\n",
+               kind == VEL1_EXIT_SYSCALL ? "syscall" : "unix call", (UINT)frame->syscall_id,
+               (unsigned long long)ret, (UINT)frame->restore_flags, (unsigned long long)frame->pc,
+               (unsigned long long)frame->sp, (unsigned long long)frame->lr );
         vcpu_emulation_entry( frame, &entry );
         vcpu_regs_from_frame( &regs, &entry );
+        core = VCPU_FULL_CORE_MASK;
+        simd = VEL1_R_ALL_SIMD;
+    }
+    else if (frame->restore_flags & RESTORE_FLAGS_EMULATION)
+    {
+        /* usr2_handler's native branch: the whole frame */
+        vcpu_regs_from_frame( &regs, frame );
         core = VCPU_FULL_CORE_MASK;
         simd = VEL1_R_ALL_SIMD;
     }
