@@ -594,6 +594,9 @@ static struct prof_bucket prof_guest;
 static struct prof_bucket prof_kind[PROF_KINDS];
 static struct prof_bucket prof_sys[2][4096];
 static struct prof_bucket prof_extra[VCPU_PROF_IDS];
+/* live Windows-thread vCPUs and their high-water mark: HVF allows 64 vCPUs per VM (one is the TLB executor's), so
+ * a process past 63 threads cannot run in this 1:1 mode; the peak is what an M:N pool has to absorb */
+static _Atomic int prof_vcpus_live, prof_vcpus_peak;
 
 static const char * const prof_extra_names[VCPU_PROF_IDS] =
 {
@@ -759,8 +762,9 @@ static void *prof_thread( void *arg )
         guest_t = atomic_load_explicit( &prof_guest.ticks, memory_order_relaxed );
         qsort( rows, n, sizeof(rows[0]), prof_row_cmp );
 
-        fprintf( stderr, "[VCPU-PROF] pid %d t=%.1f s: guest %.3f s (%llu entries) | host after exits %.3f s, of it waits "
-                 "%.3f s | process CPU %.3f s over %u s\n", (int)getpid(), (prof_now() - start) / hz,
+        fprintf( stderr, "[VCPU-PROF] pid %d t=%.1f s: vCPUs %d (peak %d) | guest %.3f s (%llu entries) | host after exits "
+                 "%.3f s, of it waits %.3f s | process CPU %.3f s over %u s\n", (int)getpid(), (prof_now() - start) / hz,
+                 atomic_load( &prof_vcpus_live ), atomic_load( &prof_vcpus_peak ),
                  (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
                  host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
         for (i = 0; i < n && i < 24; i++)
@@ -1379,8 +1383,13 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     cfg.x0 = frame->x[0];
     vcpu_block_signals( NULL );  /* no SIGQUIT between the create and the publish; vcpu_store_full unblocks */
     if ((ret = vcpu_create( &vt->vcpu, &cfg )))
-        vcpu_fatal( "vel1_vcpu_create for thread %04x failed %d (hv %#x; at most %u vCPUs per process)\n",
-                    (UINT)GetCurrentThreadId(), ret, vt->vcpu.last_hv_err, VEL1_MAX_VCPUS - 1 );
+        vcpu_fatal( "vel1_vcpu_create for thread %04x failed %d (hv %#x; at most %u vCPUs per process, %d live)\n",
+                    (UINT)GetCurrentThreadId(), ret, vt->vcpu.last_hv_err, VEL1_MAX_VCPUS - 1,
+                    atomic_load( &prof_vcpus_live ));
+    {
+        int live = atomic_fetch_add( &prof_vcpus_live, 1 ) + 1, peak = atomic_load( &prof_vcpus_peak );
+        while (live > peak && !atomic_compare_exchange_weak( &prof_vcpus_peak, &peak, live )) ;
+    }
     pthread_setspecific( vcpu_key, vt );
     atomic_store( &vt->in_syscall, 1 );
     vcpu_store_full( vt, frame );
@@ -1548,6 +1557,7 @@ void vcpu_thread_exit(void)
         pthread_sigmask( SIG_BLOCK, &all, NULL );
     }
     pthread_setspecific( vcpu_key, NULL );
+    atomic_fetch_sub( &prof_vcpus_live, 1 );
     if ((ret = vel1_vcpu_destroy( &vt->vcpu ))) ERR( "vel1_vcpu_destroy failed %d\n", ret );
     else free( vt );
 }
