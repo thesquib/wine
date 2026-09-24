@@ -54,7 +54,37 @@ struct VkCommandBuffer_T
 {
     struct vulkan_client_object obj;
     struct list pool_link;
+    /* PMW_VK_BATCH (loader.c): queued vkCmd* records, replayed in order by one unix call */
+    BYTE *batch;
+    SIZE_T batch_used, batch_size, batch_data;
 };
+
+/* PROTON_DARWIN PMW_VK_BATCH: a queued call is a header, the call's params struct and the data its pointers were
+ * redirected to, each 8-aligned; unix_batch_execute runs the records in order through the unix call table. */
+struct vk_batch_header
+{
+    UINT32 code;
+    UINT32 size;  /* the whole record */
+};
+
+struct batch_execute_params
+{
+    UINT64 data;
+    UINT64 size;
+};
+
+#define VK_BATCH_ALIGN(x) (((SIZE_T)(x) + 7) & ~(SIZE_T)7)
+
+extern BOOL vk_batch_enabled;
+void *vk_batch_begin(VkCommandBuffer buffer, UINT32 code, const void *params, SIZE_T params_size, SIZE_T extra);
+const void *vk_batch_data(VkCommandBuffer buffer, const void *src, SIZE_T size);
+void vk_batch_flush_slow(VkCommandBuffer buffer);
+void vk_batch_flush_pool(VkCommandPool pool);
+
+static inline void vk_batch_flush(VkCommandBuffer buffer)
+{
+    if (buffer && buffer->batch_used) vk_batch_flush_slow(buffer);
+}
 
 struct vulkan_func
 {

@@ -707,10 +707,98 @@ class VkFunction(object):
         proto += ")"
         return proto
 
+    # PROTON_DARWIN (PMW_VK_BATCH, loader.c): vkCmd* calls that only record can be queued on the PE side and replayed
+    # by one unix call (unix_batch_execute). A function qualifies when every pointer it takes is const data of a length
+    # known at the call: arrays of numbers, handles, enums, or structs with no pointer (so no pNext) anywhere inside.
+    # The queue copies that data, since the caller may reuse it as soon as the call returns. Returns the list of
+    # (param name, element type, C length expression) to copy, or None.
+    def batch_plan(self):
+        if not self.name.startswith("vkCmd") or self.type != "void":
+            return None
+        if not self.params or self.params[0].type != "VkCommandBuffer" or self.params[0].is_pointer():
+            return None
+        if self.name in MANUAL_LOADER_THUNKS | MANUAL_LOADER_FUNCTIONS:
+            return None
+
+        def pod(struct, depth=0):
+            if depth > 8:
+                return False
+            for m in struct.members:
+                if m.is_pointer() or m.type.startswith("PFN") or m.type in ("size_t", "HANDLE", "HWND", "HINSTANCE"):
+                    return False
+                if (m.is_struct() or m.is_union()) and not pod(m.struct, depth + 1):
+                    return False
+            return True
+
+        names = [p.name for p in self.params]
+        plan = []
+        for p in self.params[1:]:
+            if p.type.startswith("PFN") or p.type in ("size_t", "HANDLE", "HWND", "HINSTANCE"):
+                return None
+            if p.is_static_array():
+                length = " * ".join(str(l) for l in p.array_lens)
+                if (p.is_struct() or p.is_union()) and not pod(p.struct):
+                    return None
+                plan.append((p.name, p.type, length))
+                continue
+            if not p.is_pointer():
+                if (p.is_struct() or p.is_union()) and not pod(p.struct):
+                    return None
+                continue
+            if p.is_pointer_pointer() or not p.is_const():
+                return None
+            if p.type == "void":
+                elem = "BYTE"
+                if not isinstance(p.dyn_array_len, str) or p.dyn_array_len not in names:
+                    return None
+            elif p.is_struct() or p.is_union():
+                if not pod(p.struct):
+                    return None
+                elem = p.type
+            else:
+                elem = p.type
+            if p.dyn_array_len is None:
+                length = "1"
+            elif isinstance(p.dyn_array_len, int):
+                length = str(p.dyn_array_len)
+            elif p.dyn_array_len in names and not self.params[names.index(p.dyn_array_len)].is_pointer():
+                length = p.dyn_array_len
+            else:
+                return None
+            plan.append((p.name, elem, length))
+        return plan
+
     def loader_body(self):
         body = "    struct {0}_params params;\n".format(self.name)
         for p in self.params:
             body += "    params.{0} = {0};\n".format(p.name)
+
+        # PROTON_DARWIN (PMW_VK_BATCH): queue a recording-only vkCmd*; anything else that takes a command buffer
+        # replays its queue first, so every entry point keeps the buffer's order.
+        plan = self.batch_plan()
+        if plan is not None:
+            sizes = ["(SIZE_T)({0}) * sizeof({1})".format(length, elem) for (_, elem, length) in plan]
+            body += "#ifdef _WIN64\n"
+            body += "    if (vk_batch_enabled)\n"
+            body += "    {\n"
+            body += "        struct {0}_params *queued;\n".format(self.name)
+            extra = " + ".join("VK_BATCH_ALIGN({0})".format(sz) for sz in sizes) if sizes else "0"
+            body += "        if ((queued = vk_batch_begin(commandBuffer, unix_{0}, &params, sizeof(params), {1})))\n".format(self.name, extra)
+            body += "        {\n"
+            for (name, elem, length), sz in zip(plan, sizes):
+                body += "            queued->{0} = vk_batch_data(commandBuffer, {0}, {1});\n".format(name, sz)
+            body += "            return;\n"
+            body += "        }\n"
+            body += "    }\n"
+            body += "#endif\n"
+        elif self.params and self.params[0].type == "VkCommandBuffer" and not self.params[0].is_pointer():
+            body += "#ifdef _WIN64\n"
+            body += "    vk_batch_flush({0});\n".format(self.params[0].name)
+            body += "#endif\n"
+        elif self.name == "vkResetCommandPool":
+            body += "#ifdef _WIN64\n"
+            body += "    vk_batch_flush_pool(commandPool);\n"
+            body += "#endif\n"
 
         # Call the Unix function.
         if self.is_perf_critical():
@@ -2583,6 +2671,7 @@ class VkGenerator(object):
                 f.write("    (void *){1}{0},\n".format(vk_func.name, "thunk64_"))
             else:
                 f.write("    {1}{0},\n".format(vk_func.name, "thunk64_"))
+        f.write("    vk_batch_execute,\n")
         f.write("};\n")
         f.write("C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);\n\n")
 
@@ -2607,6 +2696,7 @@ class VkGenerator(object):
                 f.write("    (void *){1}{0},\n".format(vk_func.name, "thunk32_"))
             else:
                 f.write("    {1}{0},\n".format(vk_func.name, "thunk32_"))
+        f.write("    vk_batch_execute32,\n")
         f.write("};\n")
         f.write("C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_count);\n")
 
@@ -2728,6 +2818,7 @@ class VkGenerator(object):
                 continue
 
             f.write("    unix_{0},\n".format(vk_func.name))
+        f.write("    unix_batch_execute,\n")
         f.write("    unix_count,\n")
         f.write("};\n\n")
 

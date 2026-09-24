@@ -1037,6 +1037,33 @@ NTSTATUS vk_is_available_instance_function32(void *arg)
     return is_available_instance_function(UlongToPtr(params->instance), UlongToPtr(params->name));
 }
 
+/* PROTON_DARWIN PMW_VK_BATCH (loader.c): run queued vkCmd* records in order, each through the unix call table
+ * exactly as its own unix call would have (they are all void recording calls: nothing to return) */
+NTSTATUS vk_batch_execute(void *arg)
+{
+    const struct batch_execute_params *params = arg;
+    const BYTE *p = (const BYTE *)(ULONG_PTR)params->data, *end = p + params->size;
+
+    while (p + sizeof(struct vk_batch_header) <= end)
+    {
+        const struct vk_batch_header *header = (const struct vk_batch_header *)p;
+
+        if (header->size < sizeof(*header) || header->size > end - p || header->code >= unix_batch_execute)
+        {
+            ERR( "corrupt batch record at %p (code %u size %u)\n", p, header->code, header->size );
+            return STATUS_INVALID_PARAMETER;
+        }
+        __wine_unix_call_funcs[header->code]( (void *)(header + 1) );
+        p += header->size;
+    }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS vk_batch_execute32(void *arg)
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
 NTSTATUS vk_is_available_device_function32(void *arg)
 {
     struct

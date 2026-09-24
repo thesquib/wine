@@ -60,6 +60,8 @@ NTSTATUS vk_is_available_instance_function(void *arg);
 NTSTATUS vk_is_available_device_function(void *arg);
 NTSTATUS vk_is_available_instance_function32(void *arg);
 NTSTATUS vk_is_available_device_function32(void *arg);
+NTSTATUS vk_batch_execute(void *arg);
+NTSTATUS vk_batch_execute32(void *arg);
 
 struct conversion_context
 {
