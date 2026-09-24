@@ -598,6 +598,21 @@ static struct prof_bucket prof_extra[VCPU_PROF_IDS];
  * a process past 63 threads cannot run in this 1:1 mode; the peak is what an M:N pool has to absorb */
 static _Atomic int prof_vcpus_live, prof_vcpus_peak;
 
+/* M:N sizing (release-on-block): how long blocking waits last, from the wait syscall's exit to the guest entry that
+ * returns from it (user callbacks inside it are counted, not split out), how many threads sit in one at once, how
+ * many threads had a long one, and how many user callbacks each wait makes (each would re-acquire a released vCPU).
+ * Only the outermost wait of a thread is followed; a wait inside one of its callbacks is not. */
+#define PROF_LONG_WAIT_US 4000
+static const unsigned int prof_hist_us[] = { 16, 128, 1000, 4000, 16000, 100000, 1000000 };
+#define PROF_HIST_N (ARRAY_SIZE(prof_hist_us) + 1)
+enum { PROF_HIST_WAIT, PROF_HIST_UNIX, PROF_HISTS };
+static struct prof_bucket prof_hist[PROF_HISTS][PROF_HIST_N];
+static _Atomic int prof_parked, prof_parked_peak, prof_long_threads;
+static _Atomic unsigned int prof_epoch = 1;
+static _Atomic uint64_t prof_wait_cbs, prof_waits_with_cbs;
+static signed char prof_wait_class[2][4096];  /* 0 not looked up yet, 1 blocking wait, -1 not */
+static double prof_ticks_per_us = 1;
+
 static const char * const prof_extra_names[VCPU_PROF_IDS] =
 {
     "in:s1 sync", "in:s1 revoke", "in:icache sync", "in:tlbi", "in:gmm_vm_fault", "lock:virtual_mutex",
@@ -686,7 +701,60 @@ static BOOL prof_is_wait( const char *name )
 
     for (i = 0; name && i < ARRAY_SIZE(waits); i++)
         if (!strncmp( name, waits[i], strlen( waits[i] ))) return TRUE;
-    return FALSE;
+    return name && (!strcmp( name, "NtUserGetMessage" ) || !strcmp( name, "NtUserWaitMessage" ));
+}
+
+/* a syscall that can park its thread (NtYieldExecution cannot); looked up once per id */
+static BOOL prof_sys_blocks( UINT id )
+{
+    UINT idx = (id >> 12) & 3;
+    signed char *class;
+    const char *name;
+
+    if (idx >= 2) return FALSE;
+    class = &prof_wait_class[idx][id & 0xfff];
+    if (!*class)
+    {
+        name = ntdll_syscall_name( id );
+        *class = prof_is_wait( name ) && strcmp( name, "NtYieldExecution" ) ? 1 : -1;
+    }
+    return *class > 0;
+}
+
+static void prof_hist_add( unsigned int hist, uint64_t ticks, double ticks_per_us )
+{
+    unsigned int i, us = ticks / ticks_per_us;
+
+    for (i = 0; i < ARRAY_SIZE(prof_hist_us) && us >= prof_hist_us[i]; i++) ;
+    prof_add( &prof_hist[hist][i], ticks );
+}
+
+static void prof_hist_print( const char *what, unsigned int hist, double hz )
+{
+    static uint64_t last_count[PROF_HISTS][PROF_HIST_N], last_ticks[PROF_HISTS][PROF_HIST_N];
+    char line[512];
+    unsigned int i;
+    uint64_t total = 0;
+    int len = 0;
+
+    for (i = 0; i < PROF_HIST_N; i++)
+    {
+        uint64_t c = atomic_load_explicit( &prof_hist[hist][i].count, memory_order_relaxed );
+        uint64_t t = atomic_load_explicit( &prof_hist[hist][i].ticks, memory_order_relaxed );
+        uint64_t dc = c - last_count[hist][i], dt = t - last_ticks[hist][i];
+
+        last_count[hist][i] = c;
+        last_ticks[hist][i] = t;
+        total += dc;
+        if (len >= sizeof(line) - 48) continue;
+        if (i < ARRAY_SIZE(prof_hist_us))
+            len += snprintf( line + len, sizeof(line) - len, " <%u%s", prof_hist_us[i] >= 1000 ? prof_hist_us[i] / 1000
+                             : prof_hist_us[i], prof_hist_us[i] >= 1000 ? "ms" : "us" );
+        else
+            len += snprintf( line + len, sizeof(line) - len, " >=1s" );
+        len += snprintf( line + len, sizeof(line) - len, " %llu (%.2fs)", (unsigned long long)dc, dt / hz );
+    }
+    if (total) fprintf( stderr, "[VCPU-PROF] pid %d   %s by length:%s\n", (int)getpid(), what, line );
 }
 
 static void *prof_thread( void *arg )
@@ -773,6 +841,22 @@ static void *prof_thread( void *arg )
                      (unsigned long long)rows[i].count, rows[i].ticks / hz, rows[i].ticks / hz * 1e6 / rows[i].count,
                      prof_is_wait( rows[i].name ) ? "  (wait)" : "" );
         {
+            static uint64_t last_cbs, last_with;
+            uint64_t cbs = atomic_load( &prof_wait_cbs ), with = atomic_load( &prof_waits_with_cbs );
+            int parked = atomic_load( &prof_parked );
+
+            prof_hist_print( "blocking waits", PROF_HIST_WAIT, hz );
+            prof_hist_print( "unix calls", PROF_HIST_UNIX, hz );
+            fprintf( stderr, "[VCPU-PROF] pid %d   parked in a wait now %d (peak %d) | threads with a wait >= %u ms: %d "
+                     "| user callbacks inside waits %llu (from %llu waits)\n", (int)getpid(), parked,
+                     atomic_exchange( &prof_parked_peak, parked ), PROF_LONG_WAIT_US / 1000,
+                     atomic_exchange( &prof_long_threads, 0 ), (unsigned long long)(cbs - last_cbs),
+                     (unsigned long long)(with - last_with) );
+            atomic_fetch_add( &prof_epoch, 1 );
+            last_cbs = cbs;
+            last_with = with;
+        }
+        {
             /* gmm's thin mutator by phase (vcpu_gmm_arm64.c builds it with GMM_PROFILE); the view path is not split */
             static const char * const names[GMM_PROF_N] = { "args", "plan", "pt", "guard", "ipa", "urecs", "reserve",
                                                             "s2map", "insert", "desc", "tlbi", "unmap", "free", "trace" };
@@ -812,6 +896,11 @@ static void prof_start(void)
         prof_interval = 0;
         return;
     }
+    {
+        uint64_t freq;
+        __asm__ volatile( "mrs %0, cntfrq_el0" : "=r" (freq) );
+        prof_ticks_per_us = freq / 1e6;
+    }
     block_all_signals( &old );
     if (!pthread_create( &thread, NULL, prof_thread, NULL )) pthread_detach( thread );
     else prof_interval = 0;
@@ -828,9 +917,45 @@ struct vcpu_thread
     uint64_t            exits, syscalls, unix_calls, faults, kicks, kick_failures;
     uint64_t            prof_mark;     /* PMW_VCPU_PROF: when the last exit came back to the host */
     struct prof_bucket *prof_charge;   /* PMW_VCPU_PROF: what the host time since then is spent on */
+    BOOL                prof_unix;     /* PMW_VCPU_PROF: that is a unix call */
+    uint64_t            wait_t0;       /* PMW_VCPU_PROF: the outermost blocking wait's exit, 0 if none */
+    struct vcpu_level  *wait_level;    /* PMW_VCPU_PROF: the level it returns to */
+    unsigned int        wait_cbs;      /* PMW_VCPU_PROF: user callbacks made inside it */
+    unsigned int        long_epoch;    /* PMW_VCPU_PROF: the report interval this thread last counted a long wait in */
 };
 
 static pthread_key_t vcpu_key;
+
+
+static void prof_wait_start( struct vcpu_thread *vt )
+{
+    int parked = atomic_fetch_add( &prof_parked, 1 ) + 1, peak = atomic_load( &prof_parked_peak );
+
+    while (parked > peak && !atomic_compare_exchange_weak( &prof_parked_peak, &peak, parked )) ;
+    vt->wait_t0 = vt->prof_mark;
+    vt->wait_level = vt->level;
+    vt->wait_cbs = 0;
+}
+
+static void prof_wait_end( struct vcpu_thread *vt, uint64_t now )
+{
+    unsigned int epoch = atomic_load( &prof_epoch );
+    uint64_t ticks = now - vt->wait_t0;
+
+    prof_hist_add( PROF_HIST_WAIT, ticks, prof_ticks_per_us );
+    if (ticks >= PROF_LONG_WAIT_US * prof_ticks_per_us && vt->long_epoch != epoch)
+    {
+        vt->long_epoch = epoch;
+        atomic_fetch_add( &prof_long_threads, 1 );
+    }
+    if (vt->wait_cbs)
+    {
+        atomic_fetch_add( &prof_wait_cbs, vt->wait_cbs );
+        atomic_fetch_add( &prof_waits_with_cbs, 1 );
+    }
+    atomic_fetch_sub( &prof_parked, 1 );
+    vt->wait_t0 = 0;
+}
 
 extern void trace_syscall( UINT id, ULONG_PTR *args, ULONG len );
 extern void trace_sysret( UINT id, ULONG_PTR retval );
@@ -933,6 +1058,8 @@ static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
         {
             t0 = prof_now();
             if (vt->prof_charge) prof_add( vt->prof_charge, t0 - vt->prof_mark );
+            if (vt->prof_unix) prof_hist_add( PROF_HIST_UNIX, t0 - vt->prof_mark, prof_ticks_per_us );
+            if (vt->wait_t0 && vt->level == vt->wait_level) prof_wait_end( vt, t0 );
         }
         vt->hv_depth++;
         kind = vel1_run( &vt->vcpu, e );
@@ -943,6 +1070,7 @@ static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
             vt->prof_mark = prof_now();
             prof_add( &prof_guest, vt->prof_mark - t0 );
             vt->prof_charge = &prof_kind[(unsigned int)kind < PROF_KINDS ? kind : 0];
+            vt->prof_unix = FALSE;
         }
         if (kind != VEL1_EXIT_CANCELED) return kind;  /* past vel1's spurious bound: just go again */
     }
@@ -1285,11 +1413,19 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         {
         case VEL1_EXIT_SYSCALL:
             vcpu_frame_from_syscall_exit( frame, &e );
-            if (prof_interval) vt->prof_charge = prof_sys_bucket( frame->syscall_id );
+            if (prof_interval)
+            {
+                vt->prof_charge = prof_sys_bucket( frame->syscall_id );
+                if (!vt->wait_t0 && prof_sys_blocks( frame->syscall_id )) prof_wait_start( vt );
+            }
             break;
         case VEL1_EXIT_UNIX_CALL:
             vcpu_frame_from_unix_call_exit( frame, &e );
-            if (prof_interval) vt->prof_charge = prof_unix_bucket( (const void *)e.regs.x[0], e.regs.x[1] );
+            if (prof_interval)
+            {
+                vt->prof_charge = prof_unix_bucket( (const void *)e.regs.x[0], e.regs.x[1] );
+                vt->prof_unix = TRUE;
+            }
             break;
         case VEL1_EXIT_KICK:
         case VEL1_EXIT_FAULT_SYNC:
@@ -1463,6 +1599,7 @@ NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_le
     vt->hv_depth--;
     if (err) vcpu_fatal( "vel1_regs_set(callback) failed %d\n", err );
 
+    if (prof_interval && vt->wait_t0) vt->wait_cbs++;
     memset( &level, 0, sizeof(level) );
     vcpu_loop( vt, &level );
 
@@ -1558,6 +1695,7 @@ void vcpu_thread_exit(void)
     }
     pthread_setspecific( vcpu_key, NULL );
     atomic_fetch_sub( &prof_vcpus_live, 1 );
+    if (vt->wait_t0) atomic_fetch_sub( &prof_parked, 1 );  /* ended inside a wait (NtTerminateThread) */
     if ((ret = vel1_vcpu_destroy( &vt->vcpu ))) ERR( "vel1_vcpu_destroy failed %d\n", ret );
     else free( vt );
 }
