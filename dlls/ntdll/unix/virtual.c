@@ -2107,8 +2107,25 @@ static void vcpu_assert_s2_unmapped( const void *start, size_t size )
     }
 }
 
+/* PMW_VCPU_SKIP_NONE_SYNC=0 turns it off (A/B): a view whose every page is stage-1 NONE (a pure reservation) needs
+ * no sync after gmm_view_map, which just applied GMM_S1_NONE to every page. Chromium and V8 reserve many multi-GiB
+ * ranges at start-up (PartitionAlloc pools, pointer-compression cages), and a NONE->NONE gmm_vm_range_set over each
+ * was wasted work (full-bottle plan §9a) */
+static BOOL vcpu_skip_none_sync(void)
+{
+    static int skip = -1;
+
+    if (skip == -1)
+    {
+        const char *env = getenv( "PMW_VCPU_SKIP_NONE_SYNC" );
+        skip = !(env && !strcmp( env, "0" ));
+    }
+    return skip;
+}
+
 static NTSTATUS vcpu_view_created( struct file_view *view )
 {
+    BYTE vprot;
     int ret;
     VCPU_GMM_BEGIN();
 
@@ -2122,6 +2139,9 @@ static NTSTATUS vcpu_view_created( struct file_view *view )
         if (ret != GMM_ENOPT && ret != GMM_ENOIPA) abort();
         return STATUS_NO_MEMORY;
     }
+    if (vcpu_skip_none_sync() && get_vprot_range_size( view->base, view->size, ~0, &vprot ) == view->size &&
+        vcpu_vprot_to_s1( vprot ) == GMM_S1_NONE)
+        return STATUS_SUCCESS;
     if (vcpu_sync_pages( view, view->base, view->size, 0, 0 ))
     {
         vcpu_revoke_pages( view->base, view->size );
