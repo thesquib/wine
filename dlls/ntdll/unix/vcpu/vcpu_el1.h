@@ -70,7 +70,9 @@
  *      PLACEMENT (safety, the 2026-09-21 panic class): vel1_blob_install copies the image into caller memory that
  *      must be PLAIN ANONYMOUS memory; it refuses destination memory that is executable on the host (mach_vm_region).
  *      NEVER hv_vm_map the library's own __TEXT copy (vel1_blob_start): that is executable file-backed memory.
- *      Stage-2 for the blob page should be R|X (not W) and stage-1 read-only + executable at EL1 (PXN=0), outside
+ *      Stage-2 for the blob page should be R|X (not W) and stage-1 read-only + executable at EL1 (PXN=0) — the
+ *      stage-1 RX half is PROVEN LIVE (m1 `rx=1`, 2026-09-23: vector, both TLBI stubs, initiator, parked E and in-stub
+ *      CANCEL restarts, all from an AP=RO/PXN=0 page); stage-2 R|X has not run (gmm maps chunks RWX) — outside
  *      every Wine view, mapped once, never unmapped or remapped while a vCPU exists [D7].
  *      Syscalls: Wine's arm64 PE stubs do `mov x8,#id; mov x9,x30; ldr x16,<ptr>; blr x16` (wine
  *      include/wine/asm.h:247-255), NOT svc. The unix side points __wine_syscall_dispatcher at blob+0x800 and the

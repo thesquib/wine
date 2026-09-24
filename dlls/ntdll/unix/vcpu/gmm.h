@@ -130,21 +130,26 @@ enum {
                      // reused, never freed -- because a failed map may still be partly mapped (G5 review rule)
   GMM_EGUARD = -6,   // caller-provided backing failed the backing guard (identity/thin API only)
   GMM_EEXIST = -7,   // range overlaps something it may not (a legacy region, the alias window, a committed page)
+  GMM_EBUSY = -8,    // v3: gmm_sect_destroy while views of the section are registered (nothing changed)
 };
 
 // TEST/CALLER SUPPORT: allocates memory that will pass gmm's backing guard (§2: VM_MAKE_TAG'd, non-executable
 // anonymous memory; gmm_init() enforces this on cfg->pt_pool_host exactly as gmm.c enforces it on its own
-// private-chunk and section-chunk allocations, via the SAME check — so the caller-supplied PT pool gets the same
-// "never a MAP_JIT/driver page" safety property described in CLAUDE.md's Hard Safety Rules). This is the only
-// legitimate way to produce a pt_pool_host gmm_init() will accept; the tag value itself is private to gmm.c.
+// private-chunk and section-chunk allocations, via the SAME check). The guard refuses a currently-executable page,
+// which is all it can see: no query can distinguish a read/write MAP_JIT page from ordinary anonymous memory, so
+// never MAP_JIT the memory passed here (CLAUDE.md's Hard Safety Rules) -- that is a caller rule, not something
+// gmm_alloc_backing or gmm_init can check. This is the only legitimate way to produce a pt_pool_host gmm_init()
+// will accept; the tag value itself is private to gmm.c.
+// v3 (2026-09-24): the memory is VM_INHERIT_NONE (a fork() child never shares it), like every gmm allocation. NULL on
+// failure.
 void *gmm_alloc_backing(size_t sz);
 void gmm_free_backing(void *p, size_t sz);
 // TEST SUPPORT (N7 only): the mmap fd-argument (VM_MAKE_TAG(tag)) gmm_alloc_backing() uses. gmm_alloc_backing()
 // itself only ever requests PROT_READ|PROT_WRITE, so it cannot produce a mapping that is BOTH correctly tagged
 // AND executable — which N7 needs, to test the backing guard's executable check in isolation from its tag check.
-// (On this platform mprotect()-ing an already-VM_MAKE_TAG'd R|W mapping to add PROT_EXEC is refused by the
-// kernel with EACCES regardless of gmm — found while writing N7, see gmm/README.md — so the only way to get a
-// correctly-tagged executable mapping at all is PROT_EXEC at mmap() time, which needs this flag value.)
+// (mprotect() of a tagged R|W mapping to R|W|X is refused (EACCES) -- W^X, for any memory; to R|X it succeeds
+// (N22q K6). A mapping that is tagged AND executable from the start is simplest to make with PROT_EXEC at mmap()
+// time, which needs this flag value.)
 int gmm_debug_tag_flag(void);
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -310,15 +315,16 @@ gmm_fault_t gmm_fault(gmm_t *gmm, uint64_t far, uint64_t esr);
 // FAST MAPPING (2026-09-23): with cfg.s2_run_chunks > 1, contiguous newly-committed chunks share ONE stage-2 map
 // (a "run record", gmm_vm_s2_run below) and a revoke inside a run is a sub-range unmap, or -- if the backend
 // refuses it -- the chunk is retained (still mapped, gmm_vm_s2_mapped() keeps answering 1); see GMM_CFG_S2_REMAP.
-// The caller changes its host mapping (munmap, MAP_FIXED, madvise, mprotect) only AFTER the gmm call that
+// The caller changes its host mapping (munmap, MAP_FIXED, madvise, mprotect, minherit) only AFTER the gmm call that
 // revokes it has returned, and only for 16K host pages gmm_vm_s2_mapped() reports as unmapped (README "Wine M1
 // fixes", ordering rules).
 //
 // Backing requirements, checked by the guard before EVERY stage-2 map (abort-free: a failure returns GMM_EGUARD
 // with nothing mapped): the whole 16K host page is mapped, VM_MAKE_TAG(250) (gmm_debug_tag_flag() gives the mmap
 // fd-argument), current protection exactly READ|WRITE (no EXECUTE, not PROT_NONE, not read-only), not file-backed
-// (external_pager == 0). Allocate with mmap(va, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON|MAP_FIXED,
-// VM_MAKE_TAG(250), 0) and never mprotect it while stage-2 mapped.
+// (external_pager == 0), and VM_INHERIT_NONE (v3; mmap's default is VM_INHERIT_COPY). Allocate with mmap(va, sz,
+// PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON|MAP_FIXED, VM_MAKE_TAG(250), 0), then minherit(va, sz, VM_INHERIT_NONE)
+// before the first commit (again after every MAP_FIXED replacement), and never mprotect it while stage-2 mapped.
 //
 // Coexistence: the thin API and the legacy region API may share one gmm_t (one set of tables, one IPA allocator);
 // their ranges must not overlap (GMM_EEXIST), and neither may touch the low-4GiB alias window
@@ -411,6 +417,108 @@ void *gmm_vm_host_ptr(gmm_t *gmm, uint64_t va);
 // GMM_VF_FATAL by definition, and the caller must not pass it here).
 typedef enum { GMM_VF_RETRY = 0, GMM_VF_WINE = 1, GMM_VF_FATAL = 2 } gmm_vfault_t;
 gmm_vfault_t gmm_vm_fault(gmm_t *gmm, uint64_t far, uint64_t esr);
+
+// ---------------------------------------------------------------------------------------------------------------
+// v3 SECTIONS (B', vel1-gmm-v3, 2026-09-24): in-process aliasing of a section's views. Design: openrosetta
+// docs/superpowers/specs/2026-09-24-gmm-v3-section-alias-design.md. The legacy gmm_section_t/gmm_section_create/
+// gmm_map_view are a different, gmm-owned, eager API and are unchanged; nothing below uses them.
+//
+// A section has ONE host anchor the caller allocated. Each 16K anchor chunk is stage-2 mapped (one IPA, one 16K
+// s2_map) the first time any page of it is committed through ANY view, and stays mapped until gmm_sect_destroy.
+// Every view -- the first one included -- is stage-1 descriptors only, at the view's own VA, pointing at the anchor
+// chunk's IPA; each view has its own commit, protection, guard and NOACCESS state. The view's host side is the
+// caller's mach_vm_remap(copy=FALSE) of the anchor at the view VA: gmm validates it and never stage-2 maps it.
+// In a process that never creates a section every existing call behaves exactly as in v2.
+//
+// Existing calls, with sections present:
+//   gmm_vm_range_set[_pages] on a range wholly inside one registered view: the VIEW PATH (descriptors at the view's
+//     VAs -> anchor IPAs; a page's first commit through any view stage-2 maps its anchor chunk; nothing is ever
+//     stage-2 unmapped here). GMM_ENOIPA / GMM_ENOPT surface HERE, at the call that commits the first page of an
+//     anchor chunk -- map them to STATUS_NO_MEMORY like any commit. Touching an anchor, or straddling a view's owned
+//     range: GMM_EEXIST.
+//   gmm_view_unmap(va, size) of exactly a registered view's (va, size): every page RESERVED, one TLBI of the pages
+//     that were valid, the view unregistered; no stage-2 operation. Any other range touching a view: GMM_EINVAL.
+//   gmm_view_map (identity) touching a view or an anchor: GMM_EEXIST.
+//   gmm_vm_s2_mapped: 0 on a view VA, always; on an anchor page, 1 while its chunk is mapped (first commit through a
+//     view .. gmm_sect_destroy). gmm_vm_host_ptr/gmm_host_ptr: (void *)va on a view page whose descriptor is
+//     committed (valid, or NOACCESS), NULL on an anchor. gmm_vm_fault, gmm_walk, gmm_vm_s2_stats: unchanged.
+//
+// Caller rules (gmm README "Wine M1 fixes", R8-R12): the anchor is never mprotected, munmapped, madvised or
+// MAP_FIXED until gmm_sect_destroy returned 0 (R8); a view's host side is only ever the remap, made BEFORE
+// gmm_view_alias, never mprotected (it stays RW) and never executable, replaced only after gmm_view_unmap returned
+// (R9; the kernel does NOT refuse PROT_READ|PROT_EXEC on tagged memory); unmap order R10; exact views R11. With
+// GMM_CFG_PARANOID, identity (tag-250) memory aliased onto itself is refused too (GMM_EGUARD): its physical page, keyed
+// by the full 64-bit VM object id, already stage-2 mapped at another VA.
+typedef struct gmm_sect gmm_sect_t;
+
+// The mmap fd-argument for an anchor, VM_MAKE_TAG(252) (the value stays private to gmm.c, as the identity tag does).
+// Allocate an anchor as
+//   a = mmap(hint, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, gmm_sect_anchor_tag_flag(), 0);
+//   minherit(a, size, VM_INHERIT_NONE);
+// at a host address that is never a guest VA. VM_INHERIT_NONE is REQUIRED: a fork() with an inheritable anchor puts
+// its VM object into copy-on-write while the child lives (measured: share mode SM_COW, a shadow object after the
+// next write), and gmm refuses to stage-2 map such memory. NEVER MAP_JIT: that is a caller rule the kernel cannot be
+// asked about -- without the hardened runtime an RW MAP_JIT mapping with this tag reads exactly like an anchor (tag,
+// protection, max protection, share mode, pager: measured), so no gmm check can refuse it.
+int gmm_sect_anchor_tag_flag(void);
+
+// Register a section anchor the CALLER allocated (above). anchor and size are 16K multiples; nothing is stage-2
+// mapped and no IPA is consumed (an anchor costs host VA only, so a section may be larger than the IPA window).
+// Checks: alignment (GMM_EINVAL); [anchor, anchor+size) overlaps no other anchor, no view's owned range, no stage-2
+// mapped identity chunk, no legacy region and not the alias window (GMM_EEXIST); the host entries at the first and
+// the last chunk are tag 252, current protection exactly READ|WRITE, not file-backed, not a submap, VM_INHERIT_NONE
+// (GMM_EGUARD; with GMM_CFG_PARANOID every entry is walked). The per-chunk anchor guard before every stage-2 map is
+// the authoritative check. Returns 0, GMM_EINVAL, GMM_EEXIST, GMM_EGUARD or GMM_ENOMEM.
+int gmm_sect_create(gmm_t *gmm, void *anchor, size_t size, gmm_sect_t **out);
+
+// Unregister a section with no views: one exact 16K stage-2 unmap per mapped anchor chunk, then its IPA is freed.
+// No TLBI: every descriptor that referenced those IPAs was invalidated and shot down when its view was unmapped.
+// GMM_EBUSY (nothing changed) while any view is registered; GMM_EINVAL if sect is not a live section of gmm (a stale
+// pointer whose address a NEW section has since reused cannot be told apart: it names the new section). After
+// a 0 return gmm_vm_s2_mapped() is 0 on the whole anchor and the caller may munmap it. With GMM_CFG_PARANOID every
+// mapped chunk is re-checked first and gmm aborts on a changed anchor (a broken R8).
+int gmm_sect_destroy(gmm_t *gmm, gmm_sect_t *sect);
+
+// Map a view: [va, va+size) aliases section bytes [off, off+size), and the view owns [va, round16K(va+size)).
+//   va % 16K == 0, off % 16K == 0, size % 4K == 0, off + size <= the section's size; else GMM_EINVAL (the view is
+//   not host-congruent: keep the caller's copy path).
+//   The caller has ALREADY made [va, round16K(va+size)) a mach_vm_remap(copy=FALSE, ..., VM_INHERIT_NONE) of
+//   anchor+off. gmm checks it at every host entry: tag 252, protection exactly READ|WRITE, VM_INHERIT_NONE, not a
+//   submap, not file-backed, truly shared (SM_TRUESHARED, with the anchor's page_info depth) and the same VM object
+//   (its full 64-bit id) and object offset as the anchor at that offset; else GMM_EGUARD, nothing registered. A
+//   copy=TRUE (copy-on-write) remap is refused by the SM_TRUESHARED/depth check: it is never truly shared with the
+//   anchor.
+//   The owned range overlapping a registered view, an anchor, a stage-2 mapped identity chunk, a legacy region or
+//   the alias window: GMM_EEXIST.
+//   Then the view is registered and s1 is applied to every page as gmm_vm_range_set would (usually GMM_S1_NONE).
+// Returns 0, GMM_EINVAL, GMM_EEXIST, GMM_EGUARD, GMM_ENOMEM, and -- only when s1 != GMM_S1_NONE -- the commit
+// errors GMM_ENOIPA, GMM_ENOPT, GMM_ES2 (then nothing is registered either).
+int gmm_view_alias(gmm_t *gmm, gmm_sect_t *sect, uint64_t off, uint64_t va, size_t size, unsigned s1);
+
+// TEST/CALLER SUPPORT: 1 and the view whose [va, va+size) holds va (its section, base, size, and the section offset
+// of va's 4K page), else 0. Any output pointer may be NULL.
+int gmm_sect_view_at(gmm_t *gmm, uint64_t va, gmm_sect_t **sect, uint64_t *view_va, uint64_t *view_size,
+                     uint64_t *off);
+
+// TEST SUPPORT. All zero if sect is not a live section of gmm (a stale pointer reused by a new section reads that one).
+typedef struct {
+  void *anchor;
+  uint64_t size;
+  uint64_t views;          // registered views
+  uint64_t mapped_chunks;  // anchor chunks stage-2 mapped (each 16K, each its own s2_map)
+  uint64_t s2_maps, s2_unmaps;
+} gmm_sect_info_t;
+void gmm_sect_info(gmm_t *gmm, gmm_sect_t *sect, gmm_sect_info_t *out);
+
+// TEST SUPPORT: stage-2 map every not-yet-mapped anchor chunk overlapping section bytes [off, off+size), exactly as
+// a first commit through a view would (anchor guard, one IPA and one 16K s2_map each, all or nothing); no descriptor
+// is written. Returns 0, GMM_EINVAL, GMM_ENOIPA, GMM_EGUARD, GMM_ENOMEM or GMM_ES2.
+int gmm_debug_sect_map(gmm_t *gmm, gmm_sect_t *sect, uint64_t off, size_t size);
+// TEST SUPPORT: the same, but keyed and mapped at host base + offset for a CALLER-CHOSEN base, and with no check that
+// [off, off+size) lies inside the section. Every real caller passes the registered anchor; this door exists so a test
+// can show that the section map path refuses anything else -- a view's remap, a VA inside the anchor that is not its
+// base, a chunk at or past the section's end -- with GMM_EGUARD before anything is mapped. Never call it otherwise.
+int gmm_debug_sect_map_at(gmm_t *gmm, gmm_sect_t *sect, uint64_t base, uint64_t off, size_t size);
 
 // ---------------------------------------------------------------------------------------------------------------
 // gmm_walk: the oracle. Declared fully in gmm_walk.h (a standalone, gmm_t-independent AArch64 stage-1 walker used

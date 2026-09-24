@@ -84,9 +84,9 @@ extern gmm_t *vcpu_gmm(void);
  * guest memory: always with multi-chunk stage-2 runs (their retained chunks make a violation reachable), else with
  * PMW_VCPU_PARANOID=1 */
 extern int vcpu_check_s2;
-/* section aliasing (virtual.c: vcpu_section): needs gmm's section API (vel1-gmm-v3, not vendored yet: 0 until it
- * is); PMW_VCPU_SECT_ALIAS=0 turns it off, and every section view is then a copy */
-#define VCPU_GMM_SECT 0
+/* section aliasing (virtual.c: vcpu_section): gmm's section API (vel1-gmm-v3); PMW_VCPU_SECT_ALIAS=0 turns it
+ * off, and every section view is then a copy */
+#define VCPU_GMM_SECT 1
 extern int vcpu_sect_alias;
 extern uint64_t vcpu_blob_va(void);
 extern void *vcpu_kuser_host(void);

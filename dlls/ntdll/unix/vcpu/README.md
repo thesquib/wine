@@ -4,8 +4,10 @@ Used only by the arm64 macOS vCPU mode (`PMW_VCPU`), where every Windows thread'
 Hypervisor.framework vCPU. Nothing here is built on any other platform: the `*_arm64.c` wrappers one level up compile to
 nothing unless `__APPLE__ && __aarch64__`.
 
-Source: fex_macos branch `openrosetta-macos`, tag `vel1-gmm-v2` (annotated tag object `77f4266e4`, libraries at commit
-`c224d7cad`), `openrosetta/hvf_proto/{vcpu_el1,gmm}/`; gmm is unchanged from `vel1-gmm-v1` (`e2876b528`). Releases are tags, each with an entry in openrosetta's
+Source: fex_macos, tag `vel1-gmm-v3` (annotated tag object `60881fedf`, libraries at commit `3ffb44e74`, branch
+`upstream-sync-20260921`), `openrosetta/hvf_proto/{vcpu_el1,gmm}/`. v3 changed `gmm.[ch]` (section aliasing:
+`gmm_sect_create` / `gmm_view_alias` / `gmm_sect_destroy`, rules R8-R12) and only a comment in `vcpu_el1.h`; the other
+files are unchanged from `vel1-gmm-v2` (`c224d7cad`). Releases are tags, each with an entry in openrosetta's
 `hvf_proto/LIBS-CHANGES.md`; re-vendor only by moving to a tag. Files are byte-identical copies. Do not edit them here:
 changes go to openrosetta and are copied back.
 

@@ -53,9 +53,47 @@ void gmm_debug_prof_reset(void) { memset(g_prof_ns, 0, sizeof g_prof_ns); }
 // mmap fd-argument ABI expects here).
 static int gmm_tag_flag(void) { return VM_MAKE_TAG((unsigned)GMM_VM_TAG); }
 
+// v3 (vel1-gmm-v3): the SECTION ANCHOR tag. Distinct from GMM_VM_TAG on purpose: a mach_vm_remap of an anchor always
+// carries the anchor's tag (measured: the caller cannot choose another), so no view remap can ever pass the identity
+// guard (tag 250 only), registered or not. VM_MEMORY_APPLICATION_SPECIFIC_13; nothing in Wine, FEX or these libraries
+// uses it.
+#define GMM_ANCHOR_TAG 252
+static int gmm_anchor_tag_flag(void) { return VM_MAKE_TAG((unsigned)GMM_ANCHOR_TAG); }
+
+// TEST ONLY (gmm_test_mut, built by build.sh with -DGMM_MUTATION_TESTS): one deliberate bug at a time, so N22 can show
+// that each guard layer and each ordering rule is load-bearing (its oracle must catch the bug). Every other build --
+// gmm_test_asan/o2, gmm_vm, m1, and Wine's copy -- compiles MUT(x) to 0 and has no gmm_debug_mutant symbol.
+#ifdef GMM_MUTATION_TESTS
+enum {
+  GMM_MUT_NO_LAYER1 = 0x01,          // the identity guard also accepts tag 252
+  GMM_MUT_NO_LAYER2 = 0x02,          // no registry check on the identity path, no view routing
+  GMM_MUT_NO_LAYER3 = 0x04,          // gmm_view_alias skips the remap identity check
+  GMM_MUT_NO_LAYER4 = 0x08,          // no anchor guard before an anchor chunk's s2_map
+  GMM_MUT_CHUNK_BY_VIEW = 0x10,      // the view path keys and maps anchor chunks by the VIEW's VA (option A)
+  GMM_MUT_NO_VIEW_TLBI = 0x20,       // the view path skips its (D) shootdown
+  GMM_MUT_DESTROY_SKIP_UNMAP = 0x40, // gmm_sect_destroy frees the IPAs without unmapping them
+  GMM_MUT_DESTROY_LEAK_IPA = 0x80,   // gmm_sect_destroy unmaps but never frees the IPAs
+  GMM_MUT_NO_SELF_ALIAS = 0x100,     // no PARANOID identity self-alias check
+};
+int gmm_debug_mutant;
+#define MUT(m) ((gmm_debug_mutant & (m)) != 0)
+#else
+#define MUT(m) 0
+#endif
+
+// gmm's own backing -- legacy chunks (Wine's KUSER page is one), legacy section chunks, and the PT pool via
+// gmm_alloc_backing -- is VM_INHERIT_NONE, like Wine's identity memory (wine a8108564ef8): a fork() child (Wine's
+// spawn_process fork -> exec window) never makes a page stage 2 maps copy-on-write under the host's next write.
+// Side effect (measured 2026-09-24): an entry with VM_INHERIT_NONE is never coalesced with the next adjacent mmap, so
+// every 16K chunk is its own map entry, with no VM object until it is first touched (or hv_vm_map'd live).
 static void *gmm_host_alloc(size_t sz) {
   void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, gmm_tag_flag(), 0);
-  return (p == MAP_FAILED) ? NULL : p;
+  if (p == MAP_FAILED) return NULL;
+  if (minherit(p, sz, VM_INHERIT_NONE) != 0) {
+    munmap(p, sz);
+    return NULL;
+  }
+  return p;
 }
 static void gmm_host_free(void *p, size_t sz) {
   if (p) munmap(p, sz);
@@ -73,6 +111,11 @@ static void gmm_host_free(void *p, size_t sz) {
 typedef struct {
   uint64_t start, end;
   unsigned tag, prot, external_pager, is_submap;
+  // v3 (vel1-gmm-v3): the entry's VM object and how it is shared, for the section guards (anchor and view checks)
+  // and the PARANOID identity self-alias check. object_id is 0 while the entry has no VM object (never touched).
+  unsigned share_mode, inherit, ref_count;
+  uint32_t object_id;
+  uint64_t offset;  // object offset of `start`
 } host_region_t;
 static int host_region_at(uint64_t va, host_region_t *out) {
   mach_vm_address_t addr = (mach_vm_address_t)va;
@@ -84,7 +127,9 @@ static int host_region_at(uint64_t va, host_region_t *out) {
       mach_vm_region_recurse(mach_task_self(), &addr, &regsz, &depth, (vm_region_recurse_info_t)&info, &count);
   if (kr != KERN_SUCCESS) return -1;
   *out = (host_region_t){.start = addr, .end = addr + regsz, .tag = info.user_tag, .prot = (unsigned)info.protection,
-                         .external_pager = info.external_pager, .is_submap = info.is_submap};
+                         .external_pager = info.external_pager, .is_submap = info.is_submap,
+                         .share_mode = info.share_mode, .inherit = (unsigned)info.inheritance,
+                         .ref_count = info.ref_count, .object_id = info.object_id, .offset = info.offset};
   return 0;
 }
 // Returns 0 if [host, host+sz) is entirely our own VM_MAKE_TAG'd, non-executable anonymous memory; -1 otherwise.
@@ -108,13 +153,21 @@ static int gmm_backing_check(void *host, size_t sz) {
 // READ|WRITE (a PROT_NONE or read-only page handed to hv_vm_map is an unexplored class; EXECUTE is the MAP_JIT
 // panic class), and it is not file-backed (external_pager == 0; a file mapping cannot carry the tag anyway, since
 // the tag rides mmap's fd argument, but this does not rely on that). The region may be larger than the chunk (a
-// Wine view is one mmap). max_protection is NOT checked: mmap gives VM_PROT_ALL there, and the kernel already
-// refuses to add EXECUTE to a tag-250 mapping later (gmm/README.md "Design issues" 4).
+// Wine view is one mmap). max_protection is NOT checked (mmap gives VM_PROT_ALL there), and the kernel does NOT stop
+// EXECUTE being added later: mprotect(PROT_READ|PROT_EXEC) succeeds on tag-250 memory -- only R|W|X is refused, which
+// is W^X for any memory (measured 2026-09-24, N22q K6). So the CURRENT protection is checked before every map, and
+// the caller must never mprotect a page while it is stage-2 mapped (README rule R2).
+// v3 (2026-09-24, controller ruling): the region is also VM_INHERIT_NONE. Wine's identity memory is (wine a8108564ef8;
+// an interleaved A/B measured no cost), so an inheritable region is refused like any other clause: GMM_EGUARD with
+// nothing mapped before a map, an abort at a PARANOID unmap (the region changed while mapped). An inheritable identity
+// page would be copy-on-write in a forked child while stage 2 still maps the parent's page (N22r's anchor finding).
 // These are the region tests; the coverage test (the page lies wholly inside hr) is done by caller_region_end()
 // and caller_range_ok() below, the only two users.
 static int caller_region_shape_ok(const host_region_t *hr) {
-  return !hr->is_submap && hr->tag == GMM_VM_TAG && hr->external_pager == 0 &&
-         (hr->prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_READ | VM_PROT_WRITE);
+  return !hr->is_submap && (hr->tag == GMM_VM_TAG || (MUT(GMM_MUT_NO_LAYER1) && hr->tag == GMM_ANCHOR_TAG)) &&
+         hr->external_pager == 0 &&
+         (hr->prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
+         hr->inherit == VM_INHERIT_NONE;
 }
 
 // ================================================================================================================
@@ -299,11 +352,21 @@ typedef struct {
   uint64_t key;       // chunk VA | 1 (never 0, so 0 marks an empty slot)
   uint64_t ipa;
   uint8_t committed;  // bit i = 4K page i of the chunk is committed
+  uint64_t pobj;      // v3 PARANOID (thin chunks only): the physical identity recorded in g->palias, 0 = none
+  uint64_t poff;
 } tchunk_t;
 typedef struct {
   tchunk_t *slots;
   size_t cap, n;  // cap: power of two (or 0); load kept <= 1/2
 } tchunk_tab_t;
+// v3: one section. Its anchor chunks live in their OWN chunk table (never in g->thin, never run records), keyed by
+// the anchor chunk's host VA; present <=> stage-2 mapped (at .ipa). Nothing else about a section is per chunk.
+struct gmm_sect {
+  uint64_t anchor, size;  // the caller's anchor (host VA) and its size, both 16K multiples
+  uint64_t nviews;        // registered views of this section
+  tchunk_tab_t chunks;
+  uint64_t s2_maps, s2_unmaps;
+};
 
 // Dynamic vector of freed IPAs (§2 IPA allocator: "bump + free list").
 typedef struct {
@@ -332,6 +395,19 @@ typedef struct {
               // of the whole record is then an "exact" unmap, the shape proven live since G5a); 0: a piece left by
               // a sub-range unmap (split), so unmapping it is itself a sub-range unmap of the original call
 } s2rec_t;
+// v3 (vel1-gmm-v3) sections (gmm.h "v3 SECTIONS"). A registered anchor and a registered view: the payloads of the
+// ordered sets g->anchors (key: anchor base) and g->views (key: view VA). Both keys are 16K-aligned, so
+// tset_remove's "key + 1 never wraps" holds, and both payloads fit the node union without growing it.
+typedef struct {
+  uint64_t base, size;
+  gmm_sect_t *sect;
+} anchor_rec_t;
+typedef struct {
+  uint64_t va, size, off;  // [va, va+size) aliases section bytes [off, off+size); the view owns [va, round16K(va+size))
+  gmm_sect_t *sect;
+} view_rec_t;
+_Static_assert(sizeof(anchor_rec_t) <= sizeof(s2rec_t) && sizeof(view_rec_t) <= sizeof(s2rec_t),
+               "a v3 registry payload must not grow tnode_t");
 
 // ================================================================================================================
 // Ordered sets (PER-CHUNK OVERHEAD FIX, 2026-09-23): a treap over an index-linked node pool, used for the run
@@ -351,6 +427,8 @@ typedef struct {
   union {
     s2rec_t rec;
     ipa_ext_t ext;
+    anchor_rec_t anc;  // v3: g->anchors
+    view_rec_t view;   // v3: g->views
   } u;
 } tnode_t;
 typedef struct {
@@ -489,6 +567,24 @@ static int tn_check(const tnode_t *n, uint32_t x) {
   return bad + (m != n[x].maxlen);
 }
 
+// ================================================================================================================
+// v3 PARANOID identity self-alias check (the user's decision 2026-09-24, design §10 q7). One entry per stage-2 mapped
+// identity chunk: its physical identity (VM object, object offset) -> its VA. A new identity chunk whose physical
+// page is already mapped at ANOTHER VA is the one aliasing layers 1-4 cannot see (a tag-250 remap of identity memory,
+// K1): GMM_EGUARD. The identity is page_ident()'s: the FULL 64-bit id of the object the page lives in. Never the region
+// query's 32-bit object_id: that is a truncated hash, and distinct live objects share it (7 pairs among 250k,
+// measured 2026-09-24) -- keying by it made two unrelated chunks "aliases", an R7 abort in Wine (Wine runs PARANOID).
+// Maintained only with GMM_CFG_PARANOID. Open addressing, backward-shift deletion (tchunk's scheme). Memory: 24 B per
+// entry at <= 1/2 load, plus tchunk_t's 16 B (pobj/poff) in every chunk table.
+typedef struct {
+  uint64_t off, va;  // va == 0: empty slot (a thin chunk's VA is never 0)
+  uint64_t obj;
+} palias_t;
+typedef struct {
+  palias_t *slots;
+  size_t cap, n;  // cap: power of two (or 0); load kept <= 1/2
+} palias_tab_t;
+
 struct gmm {
   gmm_config_t cfg;
   gmm_backend_t backend;
@@ -518,6 +614,10 @@ struct gmm {
   // thin chunk lies in exactly one record and its IPA is rec.ipa + (chunk va - rec.va).
   tset_t recs;  // PER-CHUNK OVERHEAD FIX: an ordered set keyed by va (was a sorted array)
   gmm_s2_stats_t st;  // counters (records/mapped/retained are computed on demand by gmm_vm_s2_stats)
+  // v3 sections: registered anchors (key: base) and views (key: va). Both stay empty in a process that never creates
+  // a section, and then every thin and legacy call behaves exactly as in v2.
+  tset_t anchors, views;
+  palias_tab_t palias;  // v3 PARANOID identity self-alias check: physical identity -> thin chunk VA
 
   gmm_ev_t *trace;
   size_t ntrace, cap_trace;
@@ -560,7 +660,7 @@ static tchunk_t *tchunk_insert(tchunk_tab_t *t, uint64_t chunk_va, uint64_t ipa)
   const uint64_t key = chunk_va | 1;
   size_t i = tchunk_hash(t, key);
   while (t->slots[i].key) i = (i + 1) & (t->cap - 1);
-  t->slots[i] = (tchunk_t){.key = key, .ipa = ipa, .committed = 0};
+  t->slots[i] = (tchunk_t){.key = key, .ipa = ipa, .committed = 0, .pobj = 0, .poff = 0};
   t->n++;
   return &t->slots[i];
 }
@@ -595,6 +695,111 @@ static int tchunk_any_in(tchunk_tab_t *t, uint64_t va, uint64_t sz) {
   }
   return 0;
 }
+static size_t palias_hash(const palias_tab_t *t, uint64_t obj, uint64_t off) {
+  return (size_t)(((obj * 0x9E3779B97F4A7C15ull) ^ ((off >> 14) * 0xC2B2AE3D27D4EB4Full)) >> 20) & (t->cap - 1);
+}
+static palias_t *palias_find(palias_tab_t *t, uint64_t obj, uint64_t off) {
+  if (!t->cap) return NULL;
+  for (size_t i = palias_hash(t, obj, off);; i = (i + 1) & (t->cap - 1)) {
+    if (!t->slots[i].va) return NULL;
+    if (t->slots[i].obj == obj && t->slots[i].off == off) return &t->slots[i];
+  }
+}
+static int palias_reserve(palias_tab_t *t, size_t extra) {  // 0, or -1 with the table unchanged
+  if ((t->n + extra) * 2 <= t->cap) return 0;
+  size_t ncap = t->cap ? t->cap : 64;
+  while ((t->n + extra) * 2 > ncap) ncap *= 2;
+  palias_t *ns = calloc(ncap, sizeof *ns);
+  if (!ns) return -1;
+  palias_tab_t nt = {ns, ncap, 0};
+  for (size_t i = 0; i < t->cap; i++) {
+    if (!t->slots[i].va) continue;
+    size_t j = palias_hash(&nt, t->slots[i].obj, t->slots[i].off);
+    while (nt.slots[j].va) j = (j + 1) & (ncap - 1);
+    nt.slots[j] = t->slots[i];
+    nt.n++;
+  }
+  free(t->slots);
+  *t = nt;
+  return 0;
+}
+static void palias_insert(palias_tab_t *t, uint64_t obj, uint64_t off, uint64_t va) {  // reserved by the caller
+  size_t i = palias_hash(t, obj, off);
+  while (t->slots[i].va) i = (i + 1) & (t->cap - 1);
+  t->slots[i] = (palias_t){.off = off, .va = va, .obj = obj};
+  t->n++;
+}
+static void palias_remove(palias_tab_t *t, uint64_t obj, uint64_t off) {
+  palias_t *e = palias_find(t, obj, off);
+  if (!e) return;
+  size_t i = (size_t)(e - t->slots);
+  t->slots[i].va = 0;
+  t->n--;
+  for (size_t j = (i + 1) & (t->cap - 1); t->slots[j].va; j = (j + 1) & (t->cap - 1)) {
+    const size_t h = palias_hash(t, t->slots[j].obj, t->slots[j].off);
+    const int between = (i <= j) ? (i < h && h <= j) : (i < h || h <= j);
+    if (between) continue;
+    t->slots[i] = t->slots[j];
+    t->slots[j].va = 0;
+    i = j;
+  }
+}
+// Forget a thin chunk: its self-alias entry (PARANOID), then the chunk. Every tchunk_remove of g->thin goes here.
+static void thin_chunk_forget(gmm_t *g, tchunk_t *e) {
+  if (e->pobj) palias_remove(&g->palias, e->pobj, e->poff);
+  tchunk_remove(&g->thin, e);
+}
+typedef struct {
+  uint64_t obj;
+  uint64_t off;
+} pkey_t;
+static int cmp_pkey(const void *a, const void *b) {
+  const pkey_t *x = a, *y = b;
+  if (x->obj != y->obj) return x->obj < y->obj ? -1 : 1;
+  return x->off < y->off ? -1 : x->off > y->off;
+}
+
+// ================================================================================================================
+// v3 (vel1-gmm-v3): the section REGISTRY lookups (design §4.2, layer 2). Both sets hold disjoint ranges, so the
+// entry with the largest key <= hi-1 is the only one that can intersect [lo, hi). O(log n), under g->mtx.
+static inline uint64_t round16k(uint64_t x) { return (x + 16383) & ~16383ull; }
+static anchor_rec_t *anchor_at(gmm_t *g, uint64_t va) {  // the anchor holding va, or NULL
+  const uint32_t x = tset_floor(&g->anchors, va);
+  if (!x) return NULL;
+  anchor_rec_t *a = &g->anchors.n[x].u.anc;
+  return va < a->base + a->size ? a : NULL;
+}
+static int anchors_touch(gmm_t *g, uint64_t lo, uint64_t hi) {
+  if (hi <= lo || !g->anchors.count) return 0;
+  const uint32_t x = tset_floor(&g->anchors, hi - 1);
+  return x && g->anchors.n[x].u.anc.base + g->anchors.n[x].u.anc.size > lo;
+}
+static view_rec_t *view_owning(gmm_t *g, uint64_t va) {  // the view whose OWNED range [va, round16K(va+size)) holds va
+  const uint32_t x = tset_floor(&g->views, va);
+  if (!x) return NULL;
+  view_rec_t *v = &g->views.n[x].u.view;
+  return va < v->va + round16k(v->size) ? v : NULL;
+}
+static int views_touch(gmm_t *g, uint64_t lo, uint64_t hi) {  // any view's OWNED range intersects [lo, hi)
+  if (hi <= lo || !g->views.count) return 0;
+  const uint32_t x = tset_floor(&g->views, hi - 1);
+  return x && g->views.n[x].u.view.va + round16k(g->views.n[x].u.view.size) > lo;
+}
+// Layer 2 for the identity and legacy paths: an anchor or a view's owned range is never identity/legacy memory.
+static int sect_overlap_forbidden(gmm_t *g, uint64_t lo, uint64_t hi) {
+  return anchors_touch(g, lo, hi) || views_touch(g, lo, hi);
+}
+// The g->anchors node of section s, or 0 if s is not a live section of g. Never dereferences s (a stale or foreign
+// pointer is GMM_EINVAL, not a use-after-free); O(number of sections), which stays small. It cannot tell a stale
+// pointer whose address malloc has since reused for a NEW section: that one resolves to the new section.
+static uint32_t anchor_node_of(const tset_t *t, uint32_t x, const gmm_sect_t *s) {
+  if (!x) return 0;
+  if (t->n[x].u.anc.sect == s) return x;
+  const uint32_t l = anchor_node_of(t, t->n[x].l, s);
+  return l ? l : anchor_node_of(t, t->n[x].r, s);
+}
+// gmm_host_ptr/gmm_vm_host_ptr for view and anchor VAs (defined with the view path, below).
+static void *v3_host_ptr_locked(gmm_t *g, uint64_t va, int *handled);
 
 // ================================================================================================================
 // G7/N11: gmm_foreign_s2_map, deferred to here from beside gmm_foreign_map/gmm_foreign_backing_check above
@@ -946,7 +1151,7 @@ static void apply_page(gmm_t *g, gmm_region_t *r, uint64_t page_va, unsigned idx
   // else (legacy policy only): pure raise, no TLBI up front (see the DESIGN NOTE above).
 }
 
-void *gmm_alloc_backing(size_t sz) { return gmm_host_alloc(sz); }
+void *gmm_alloc_backing(size_t sz) { return gmm_host_alloc(sz); }  // VM_INHERIT_NONE (gmm_host_alloc)
 void gmm_free_backing(void *p, size_t sz) { gmm_host_free(p, sz); }
 int gmm_debug_tag_flag(void) { return gmm_tag_flag(); }
 
@@ -1003,6 +1208,21 @@ void gmm_destroy(gmm_t *g) {
   free(g->thin.slots);  // thin chunks' host memory is the caller's: nothing to unmap here
   free(g->ifree.n);
   free(g->recs.n);
+  if (g->anchors.count) {  // v3: live sections (their anchors are the caller's memory: nothing to unmap here)
+    uint32_t *idx = malloc(g->anchors.count * sizeof *idx);
+    if (idx) {  // on allocation failure at teardown the sections leak; TEST SUPPORT only
+      tn_inorder(g->anchors.n, g->anchors.root, idx, 0, g->anchors.count);
+      for (uint32_t i = 0; i < g->anchors.count; i++) {
+        gmm_sect_t *s = g->anchors.n[idx[i]].u.anc.sect;
+        free(s->chunks.slots);
+        free(s);
+      }
+      free(idx);
+    }
+  }
+  free(g->anchors.n);
+  free(g->views.n);
+  free(g->palias.slots);
   free(g->trace);
   pthread_mutex_destroy(&g->mtx);
   free(g);
@@ -1025,6 +1245,7 @@ int gmm_reserve(gmm_t *g, uint64_t va, size_t sz, unsigned flags) {
   }
   if (regions_overlap(g, va, sz)) goto out;
   if (tchunk_any_in(&g->thin, va, sz)) goto out;  // Wine M1: never over committed thin/identity memory
+  if (sect_overlap_forbidden(g, va, va + sz)) goto out;  // v3: never over an anchor or a view
 
   gmm_region_t rec = {0};
   rec.base = va;
@@ -1366,6 +1587,7 @@ int gmm_map_view(gmm_t *g, gmm_section_t *section, uint64_t off, uint64_t va, si
   }
   if (regions_overlap(g, va, sz)) goto out;
   if (tchunk_any_in(&g->thin, va, sz)) goto out;  // Wine M1: never over committed thin/identity memory
+  if (sect_overlap_forbidden(g, va & ~16383ull, round16k(va + sz))) goto out;  // v3: never over an anchor/view
 
   gmm_region_t rec = {0};
   rec.base = va;
@@ -1483,8 +1705,10 @@ void *gmm_host_ptr(gmm_t *g, uint64_t va) {
       p = (uint8_t *)r->section->host[sidx] + (soff - sidx * 16384);
     }
   } else {
+    int handled;  // v3: a view page (committed descriptor) or an anchor (NULL)
+    p = v3_host_ptr_locked(g, va, &handled);
     // Wine M1 thin/identity memory: the host pointer IS the VA, while the 4K page is committed.
-    const tchunk_t *c = tchunk_find(&g->thin, va & ~16383ull);
+    const tchunk_t *c = handled ? NULL : tchunk_find(&g->thin, va & ~16383ull);
     if (c && (c->committed & (1u << ((va >> 12) & 3)))) p = (void *)(uintptr_t)va;
   }
   pthread_mutex_unlock(&g->mtx);
@@ -1711,6 +1935,8 @@ typedef struct {
   uint8_t old_mask, new_mask;
   uint8_t need_map, mapped_now, need_unmap;
   uint64_t ipa;     // IPA the chunk will have (existing or newly mapped)
+  uint64_t pobj;    // v3 PARANOID: a new chunk's physical identity (0 = not recorded)
+  uint64_t poff;
 } tplan_t;
 
 static int thin_overlap_forbidden(gmm_t *g, uint64_t va, uint64_t sz) {
@@ -1719,7 +1945,414 @@ static int thin_overlap_forbidden(gmm_t *g, uint64_t va, uint64_t sz) {
     const uint64_t lo = g->cfg.alias_base, hi = g->cfg.alias_base + 0x100000000ull;
     if (va < hi && lo < va + sz) return 1;
   }
+  // v3 layer 2: anchors and views are never identity memory
+  return !MUT(GMM_MUT_NO_LAYER2) && sect_overlap_forbidden(g, va, va + sz);
+}
+
+// ================================================================================================================
+// v3 (vel1-gmm-v3) SECTIONS: anchors, the section path's stage-2 maps, create/destroy (gmm.h "v3 SECTIONS").
+// Layer 4, the anchor guard (design §4.4), before EVERY stage-2 map of an anchor chunk: the 16K chunk lies in ONE
+// host entry that is tag 252, current protection exactly READ|WRITE, not file-backed, not a submap, VM_INHERIT_NONE,
+// and shared in no way but private, empty or truly shared (SM_PRIVATE/SM_EMPTY/SM_TRUESHARED: this refuses
+// copy-on-write, SM_SHARED and the aliased modes). The share-mode test is new for anchors only; the identity guard
+// (caller_region_shape_ok) is unchanged.
+static int anchor_shape_ok(const host_region_t *hr) {
+  return !hr->is_submap && hr->tag == GMM_ANCHOR_TAG && hr->external_pager == 0 &&
+         (hr->prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) == (VM_PROT_READ | VM_PROT_WRITE) &&
+         hr->inherit == VM_INHERIT_NONE;
+}
+static int anchor_chunk_ok(uint64_t p) {
+  host_region_t hr;
+  if (host_region_at(p, &hr) != 0 || hr.start > p || hr.end < p + 16384) return 0;
+  return anchor_shape_ok(&hr) &&
+         (hr.share_mode == SM_PRIVATE || hr.share_mode == SM_EMPTY || hr.share_mode == SM_TRUESHARED);
+}
+static int anchor_range_ok(uint64_t a, uint64_t size) {  // every host entry of [a, a+size): PARANOID create
+  for (uint64_t p = a; p < a + size;) {
+    host_region_t hr;
+    if (host_region_at(p, &hr) != 0 || hr.start > p || !anchor_shape_ok(&hr)) return 0;
+    p = hr.end;
+  }
+  return 1;
+}
+// The section path's stage-2 maps: anchor chunks at section offsets ck[0..n) (16K aligned, none mapped yet, no
+// repeats), keyed and mapped at base + ck[k]. (A) IPA count, the anchor guard per chunk, table capacity -- any failure
+// returns with nothing changed; (B) one 16K s2_map each, all or nothing: on a failure every map of this call is undone
+// with its own exact unmap and the failed IPA is quarantined (thin_apply_locked's rule, gmm.c "(B) stage-2 map every
+// run"). The section path never takes a host pointer from the caller: every caller passes base = s->anchor (the
+// registered anchor; only gmm_debug_sect_map_at and Task 5's mutation build can pass anything else). Caller holds
+// g->mtx.
+// "Inside the registered anchor" is an explicit clause of (A), not left to layer 4: a view's remap reads exactly like
+// the anchor to anchor_chunk_ok (tag 252, RW, VM_INHERIT_NONE, truly shared), and so does anchor-shaped memory right
+// past the section's end. Either would stage-2 map a second IPA for one physical page, or memory no section owns.
+static int sect_map_chunks_locked(gmm_t *g, gmm_sect_t *s, uint64_t base, const uint64_t *ck, size_t n) {
+  if (!n) return 0;
+  if (ipa_available(g) < n) return GMM_ENOIPA;
+  for (size_t k = 0; k < n; k++) {
+    // The mutation build turns this clause off for GMM_MUT_CHUNK_BY_VIEW, so N22's oracle still sees that mutant.
+    if (!MUT(GMM_MUT_CHUNK_BY_VIEW) && (ck[k] >= s->size || base != s->anchor)) return GMM_EGUARD;
+    if (!MUT(GMM_MUT_NO_LAYER4) && !anchor_chunk_ok(base + ck[k])) return GMM_EGUARD;
+  }
+  uint64_t *ipa = malloc(n * sizeof *ipa);
+  if (!ipa || tchunk_reserve(&s->chunks, n) != 0) {
+    free(ipa);
+    return GMM_ENOMEM;
+  }
+  for (size_t k = 0; k < n; k++) ipa[k] = alloc_ipa(g);  // pre-checked: cannot fail
+  for (size_t k = 0; k < n; k++) {
+    const uint64_t host = base + ck[k];
+    const uint32_t sr = g->backend.s2_map((void *)(uintptr_t)host, ipa[k], 16384, GMM_S2_RWX);
+    if (sr != 0) {
+      fprintf(stderr, "gmm: anchor s2_map(0x%llx, ipa=0x%llx) failed 0x%x -- rolling back, IPA quarantined\n",
+              (unsigned long long)host, (unsigned long long)ipa[k], sr);
+      for (size_t j = 0; j < k; j++) {
+        if (g->backend.s2_unmap(ipa[j], 16384) != 0) {
+          fprintf(stderr, "gmm: rollback s2_unmap(ipa=0x%llx) FAILED -- aborting with it mapped\n",
+                  (unsigned long long)ipa[j]);
+          abort();
+        }
+        trace_push(g, GMM_EV_S2_UNMAP, base + ck[j], ipa[j]);
+        free_ipa(g, ipa[j]);
+      }
+      for (size_t j = k + 1; j < n; j++) free_ipa(g, ipa[j]);  // never mapped
+      free(ipa);
+      return GMM_ES2;
+    }
+    trace_push(g, GMM_EV_S2_MAP, host, ipa[k]);
+  }
+  for (size_t k = 0; k < n; k++) tchunk_insert(&s->chunks, base + ck[k], ipa[k]);  // reserved: cannot rehash
+  s->s2_maps += n;
+  free(ipa);
   return 0;
+}
+
+int gmm_sect_create(gmm_t *g, void *anchor, size_t size, gmm_sect_t **out) {
+  const uint64_t a = (uint64_t)(uintptr_t)anchor;
+  if (!g || !anchor || !out || !size || (a % 16384) || (size % 16384) || a + size < a) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  int rc = GMM_EEXIST;
+  if (thin_overlap_forbidden(g, a, size) || tchunk_any_in(&g->thin, a, size)) goto out;
+  host_region_t lo, hi;
+  rc = GMM_EGUARD;
+  if (host_region_at(a, &lo) != 0 || lo.start > a || lo.end < a + 16384 || !anchor_shape_ok(&lo)) goto out;
+  if (host_region_at(a + size - 16384, &hi) != 0 || hi.start > a + size - 16384 || hi.end < a + size ||
+      !anchor_shape_ok(&hi))
+    goto out;
+  if ((g->cfg.flags & GMM_CFG_PARANOID) && !anchor_range_ok(a, size)) goto out;
+  rc = GMM_ENOMEM;
+  gmm_sect_t *s = calloc(1, sizeof *s);
+  if (!s || tset_reserve(&g->anchors, 1) != 0) {
+    free(s);
+    goto out;
+  }
+  s->anchor = a;
+  s->size = size;
+  const uint32_t x = tset_insert(&g->anchors, a, 0);
+  g->anchors.n[x].u.anc = (anchor_rec_t){.base = a, .size = size, .sect = s};
+  *out = s;
+  rc = 0;
+out:
+  pthread_mutex_unlock(&g->mtx);
+  return rc;
+}
+
+int gmm_sect_destroy(gmm_t *g, gmm_sect_t *s) {
+  if (!g || !s) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  int rc = GMM_EINVAL;
+  if (!anchor_node_of(&g->anchors, g->anchors.root, s)) goto out;
+  rc = GMM_EBUSY;
+  if (s->nviews) goto out;
+  if (g->cfg.flags & GMM_CFG_PARANOID) {  // R8: the anchor must be exactly what was mapped, until destroy returns
+    for (size_t i = 0; i < s->chunks.cap; i++) {
+      const uint64_t ck = s->chunks.slots[i].key & ~1ull;
+      if (s->chunks.slots[i].key && !anchor_chunk_ok(ck)) {
+        fprintf(stderr, "gmm: R8 VIOLATION: anchor chunk 0x%llx changed while stage-2 mapped (ipa=0x%llx) -- "
+                        "aborting with it mapped\n", (unsigned long long)ck,
+                (unsigned long long)s->chunks.slots[i].ipa);
+        abort();
+      }
+    }
+  }
+  // No view exists, so no descriptor references any of these IPAs (each view's unmap invalidated and shot down its
+  // own): unmap each chunk exactly as it was mapped, then free its IPA -- the free_ipa_range rule. Chunk-table order.
+  for (size_t i = 0; i < s->chunks.cap; i++) {
+    if (!s->chunks.slots[i].key) continue;
+    const uint64_t ck = s->chunks.slots[i].key & ~1ull, ipa = s->chunks.slots[i].ipa;
+    const uint32_t ur = MUT(GMM_MUT_DESTROY_SKIP_UNMAP) ? 0 : g->backend.s2_unmap(ipa, 16384);
+    if (ur != 0) {
+      fprintf(stderr, "gmm: anchor s2_unmap(ipa=0x%llx) FAILED 0x%x -- aborting with it left mapped\n",
+              (unsigned long long)ipa, ur);
+      abort();
+    }
+    trace_push(g, GMM_EV_S2_UNMAP, ck, ipa);
+    if (!MUT(GMM_MUT_DESTROY_LEAK_IPA)) free_ipa(g, ipa);
+    s->s2_unmaps++;
+  }
+  tset_remove(&g->anchors, s->anchor);
+  free(s->chunks.slots);
+  free(s);
+  rc = 0;
+out:
+  pthread_mutex_unlock(&g->mtx);
+  return rc;
+}
+
+void gmm_sect_info(gmm_t *g, gmm_sect_t *s, gmm_sect_info_t *out) {
+  memset(out, 0, sizeof *out);
+  pthread_mutex_lock(&g->mtx);
+  if (s && anchor_node_of(&g->anchors, g->anchors.root, s))
+    *out = (gmm_sect_info_t){.anchor = (void *)(uintptr_t)s->anchor, .size = s->size, .views = s->nviews,
+                             .mapped_chunks = s->chunks.n, .s2_maps = s->s2_maps, .s2_unmaps = s->s2_unmaps};
+  pthread_mutex_unlock(&g->mtx);
+}
+
+// gmm_debug_sect_map[_at]: every not-yet-mapped chunk of section bytes [off, off+size), keyed at base + offset.
+// anchor_base: base is the registered anchor and [off, off+size) must lie inside the section (gmm_debug_sect_map);
+// otherwise base is taken as given and the range is not checked -- the _at door, on purpose (gmm.h).
+static int debug_sect_map(gmm_t *g, gmm_sect_t *s, int anchor_base, uint64_t base, uint64_t off, size_t size) {
+  if (!g || !s || !size || off + size < off || off + size > UINT64_MAX - 16383) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  int rc = GMM_EINVAL;
+  uint64_t *ck = NULL;
+  if (!anchor_node_of(&g->anchors, g->anchors.root, s)) goto out;
+  if (anchor_base) {
+    if (off >= s->size || size > s->size - off) goto out;
+    base = s->anchor;
+  }
+  const uint64_t c0 = off & ~16383ull, c1 = round16k(off + size);
+  rc = GMM_ENOMEM;
+  if (!(ck = malloc((size_t)((c1 - c0) / 16384) * sizeof *ck))) goto out;
+  size_t n = 0;
+  for (uint64_t c = c0; c < c1; c += 16384)
+    if (!tchunk_find(&s->chunks, base + c)) ck[n++] = c;
+  rc = sect_map_chunks_locked(g, s, base, ck, n);
+out:
+  free(ck);
+  pthread_mutex_unlock(&g->mtx);
+  return rc;
+}
+int gmm_debug_sect_map(gmm_t *g, gmm_sect_t *s, uint64_t off, size_t size) {
+  return debug_sect_map(g, s, 1, 0, off, size);
+}
+int gmm_debug_sect_map_at(gmm_t *g, gmm_sect_t *s, uint64_t base, uint64_t off, size_t size) {
+  return debug_sect_map(g, s, 0, base, off, size);
+}
+
+// ================================================================================================================
+// v3 (vel1-gmm-v3) VIEWS (gmm.h "v3 SECTIONS"; design §4.3, §6.2).
+// The physical identity of the host page at va: the FULL 64-bit id of the VM object the page lives in, and its
+// offset there (mach_vm_page_info, VM_PAGE_INFO_BASIC: ~0.7 us). The region query's object_id is only 32 bits of a
+// hash and collides between live objects (7 pairs among 250k, measured 2026-09-24), so it never decides identity on
+// its own. page_info reports the object the page is FOUND in (it walks the shadow chain), so the identity survives a
+// copy-on-write shadow pushed on top and changes only if the page itself is copied. 0 or -1; *obj = 0 if the entry
+// has no VM object yet. page_ident_depth also gives how far down the entry's shadow chain the page was found (0: in
+// the entry's own top object).
+static int page_ident_depth(uint64_t va, uint64_t *obj, uint64_t *off, int *depth) {
+  vm_page_info_basic_data_t b;
+  mach_msg_type_number_t n = VM_PAGE_INFO_BASIC_COUNT;
+  if (mach_vm_page_info(mach_task_self(), (mach_vm_address_t)va, VM_PAGE_INFO_BASIC, (vm_page_info_t)&b, &n) !=
+      KERN_SUCCESS)
+    return -1;
+  *obj = b.object_id;
+  *off = (uint64_t)b.offset;
+  *depth = b.depth;
+  return 0;
+}
+static int page_ident(uint64_t va, uint64_t *obj, uint64_t *off) {  // the PARANOID self-alias key (palias_t)
+  int depth;
+  return page_ident_depth(va, obj, off, &depth);
+}
+
+// Layer 3, the remap identity check: every host entry over [va, va+len) is tag 252, protection exactly READ|WRITE,
+// VM_INHERIT_NONE, not a submap, not file-backed, and maps the SAME VM object at the SAME object offset as the anchor
+// at off + (p - va): the 32-bit region object_id and the offset arithmetic, and the 64-bit page_ident of the first
+// page of every stretch (K5: a missing remap, a wrong offset or another anchor's remap all fail, and a 32-bit hash
+// collision can no longer pass). A view spanning two anchor entries is two host entries with two objects: the loop
+// steps to the nearer end of the two entries. gmm never stage-2 maps these pages; this protects coherence (the host
+// must see the bytes the guest sees), not HVF. VM_INHERIT_NONE: Wine's remaps are made so (wine 90b3e66dbf1), and
+// requiring it keeps the tested shape the production shape.
+// copy=FALSE (review fix 1): the view entry must be truly shared (SM_TRUESHARED). A copy=TRUE remap made as the FIRST
+// view of an anchor entry shares the anchor's object copy-on-write: both entries read SM_COW with the same 32-bit
+// id, 64-bit id and offset, so nothing else here tells it apart -- and the next host write splits host from guest.
+// Every copy=FALSE remap measured reads SM_TRUESHARED (touched or untouched anchor, first or later view, after host
+// writes; 2026-09-24), and it stays so while the view exists, so the PARANOID re-check at unmap still passes. The
+// page_ident depths must match too: a page found one level down a shadow chain on one side only is not the same
+// mapping even if a 32-bit id collides.
+static int view_remap_ok(const gmm_sect_t *s, uint64_t off, uint64_t va, uint64_t len) {
+  for (uint64_t p = va; p < va + len;) {
+    const uint64_t ap = s->anchor + off + (p - va);
+    host_region_t v, a;
+    if (host_region_at(p, &v) != 0 || v.start > p || host_region_at(ap, &a) != 0 || a.start > ap) return 0;
+    if (v.is_submap || a.is_submap || v.tag != GMM_ANCHOR_TAG || a.tag != GMM_ANCHOR_TAG || v.external_pager ||
+        (v.prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_WRITE) ||
+        v.inherit != VM_INHERIT_NONE || v.share_mode != SM_TRUESHARED)
+      return 0;
+    if (!v.object_id || v.object_id != a.object_id || v.offset + (p - v.start) != a.offset + (ap - a.start)) return 0;
+    uint64_t vo = 0, vf = 0, ao = 0, af = 0;
+    int vd = 0, ad = 0;
+    if (page_ident_depth(p, &vo, &vf, &vd) != 0 || page_ident_depth(ap, &ao, &af, &ad) != 0 || !vo || vo != ao ||
+        vf != af || vd != ad)
+      return 0;
+    uint64_t step = v.end - p;
+    if (a.end - ap < step) step = a.end - ap;
+    p += step;  // both ends are 16K aligned
+  }
+  return 1;
+}
+
+// The view path: gmm_vm_range_set[_pages] on a range wholly inside view v (and gmm_view_alias with s1 != NONE).
+// Same phases as thin_apply_locked, without (E): (A) validate; the anchor chunks this call brings their first
+// committed page; IPA count; tables for every descriptor that will be valid; then (inside sect_map_chunks_locked)
+// the anchor guard and table capacity -- nothing observable changes before (B); (B) one 16K s2_map per new chunk, all
+// or nothing; (C) descriptors at the view's own VAs -> anchor chunk IPA + (section offset mod 16K), through the one
+// encoder s1_encode, each valid->changed VA listed; (D) one batched TLBI of that list, at this view's VAs only.
+// Nothing is ever stage-2 unmapped here: decommit through a view invalidates this view's descriptors only, and the
+// section's bytes outlive every view. Caller holds g->mtx.
+static int view_apply_locked(gmm_t *g, const view_rec_t *v, uint64_t va, size_t npages, const uint8_t *s1arr,
+                             unsigned s1uni) {
+  if (!npages || (va % 4096) != 0 || va < v->va || va + (uint64_t)npages * 4096 > v->va + v->size) return GMM_EINVAL;
+  for (size_t i = 0; i < npages; i++)
+    if (!s1_valid_arg(s1arr ? s1arr[i] : s1uni)) return GMM_EINVAL;
+  gmm_sect_t *s = v->sect;
+  const uint64_t so0 = v->off + (va - v->va);  // section offset of the first page
+  const uint64_t base = MUT(GMM_MUT_CHUNK_BY_VIEW) ? v->va - v->off : s->anchor;  // chunk key/host base
+  const size_t nch = (size_t)((round16k(so0 + (uint64_t)npages * 4096) - (so0 & ~16383ull)) / 16384);
+  uint64_t *ck = malloc(nch * sizeof *ck), *tl = malloc(npages * sizeof *tl);
+  int rc = GMM_ENOMEM;
+  if (!ck || !tl) goto out;
+  size_t n = 0;
+  for (size_t i = 0; i < npages; i++) {  // ascending pages -> ascending chunks: a repeat can only be the last one
+    if (!((s1arr ? s1arr[i] : s1uni) & GMM_S1_COMMIT)) continue;
+    const uint64_t c = (so0 + (uint64_t)i * 4096) & ~16383ull;
+    if ((n && ck[n - 1] == c) || tchunk_find(&s->chunks, base + c)) continue;
+    ck[n++] = c;
+  }
+  rc = GMM_ENOIPA;
+  if (ipa_available(g) < n) goto out;
+  for (size_t i = 0; i < npages; i++) {
+    const uint64_t pva = va + (uint64_t)i * 4096;
+    if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni) || pt_lookup_slot(g, pva)) continue;
+    if ((rc = pt_ensure(g, pva)) != 0) goto out;
+  }
+  if ((rc = sect_map_chunks_locked(g, s, base, ck, n)) != 0) goto out;  // (A) guard + reserve, (B) the maps
+  size_t nt = 0;
+  for (size_t i = 0; i < npages; i++) {  // (C) nothing below can fail
+    const uint64_t pva = va + (uint64_t)i * 4096, so = so0 + (uint64_t)i * 4096;
+    const unsigned s1 = s1arr ? s1arr[i] : s1uni;
+    const tchunk_t *e = tchunk_find(&s->chunks, base + (so & ~16383ull));
+    if ((s1 & GMM_S1_COMMIT) && !e) {  // (B) mapped every chunk a committed page needs: never an IPA-0 descriptor
+      fprintf(stderr, "gmm: BUG: view page 0x%llx committed with no anchor chunk -- aborting\n", (unsigned long long)pva);
+      abort();
+    }
+    const uint64_t new_desc = s1_encode(s1, (e ? e->ipa : 0) + (so & 16383));
+    uint64_t *slot = pt_lookup_slot(g, pva);
+    const uint64_t old_desc = slot ? *slot : 0;
+    if (old_desc == new_desc) continue;
+    if (!slot) {
+      if (!(new_desc & 1ull)) continue;  // already a translation fault at a higher level
+      fprintf(stderr, "gmm: BUG: no table for view va=0x%llx after pt_ensure -- aborting\n", (unsigned long long)pva);
+      abort();
+    }
+    __atomic_store_n(slot, new_desc, __ATOMIC_RELEASE);
+    trace_push(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva, leaf_trace_ipa(new_desc));
+    if (valid_change_needs_tlbi(g, old_desc, new_desc)) tl[nt++] = pva;
+  }
+  if (nt && !MUT(GMM_MUT_NO_VIEW_TLBI)) do_tlbi(g, tl, nt);  // (D)
+  rc = 0;
+out:
+  free(ck);
+  free(tl);
+  return rc;
+}
+
+// gmm_view_unmap of exactly a registered view: (C)+(D) with every page RESERVED, then unregister. No stage-2
+// operation. PARANOID first re-runs layer 3 over the owned range and aborts if the host side is no longer the
+// anchor's remap at that offset (a broken R9: made executable, mprotected, replaced before this call).
+static int view_unmap_locked(gmm_t *g, view_rec_t *v) {
+  gmm_sect_t *s = v->sect;
+  if ((g->cfg.flags & GMM_CFG_PARANOID) && !view_remap_ok(s, v->off, v->va, round16k(v->size))) {
+    fprintf(stderr, "gmm: R9 VIOLATION: the host side of view [0x%llx,+0x%llx) is no longer the anchor's remap "
+                    "(changed, made executable or replaced before gmm_view_unmap) -- aborting\n",
+            (unsigned long long)v->va, (unsigned long long)v->size);
+    abort();
+  }
+  const size_t np = (size_t)(v->size / 4096);
+  uint64_t *tl = malloc(np * sizeof *tl);
+  if (!tl) return GMM_ENOMEM;
+  size_t nt = 0;
+  const uint64_t inv = (uint64_t)GMM_TAG_RESERVED << GMM_TAG_SHIFT;
+  for (size_t i = 0; i < np; i++) {
+    const uint64_t pva = v->va + (uint64_t)i * 4096;
+    uint64_t *slot = pt_lookup_slot(g, pva);
+    if (!slot || *slot == inv) continue;
+    const uint64_t old_desc = *slot;
+    __atomic_store_n(slot, inv, __ATOMIC_RELEASE);
+    trace_push(g, GMM_EV_PTE_INVALID, pva, GMM_TAG_RESERVED);
+    if (old_desc & 1ull) tl[nt++] = pva;
+  }
+  if (nt) do_tlbi(g, tl, nt);
+  free(tl);
+  tset_remove(&g->views, v->va);  // v is dead from here on
+  s->nviews--;
+  return 0;
+}
+
+int gmm_view_alias(gmm_t *g, gmm_sect_t *s, uint64_t off, uint64_t va, size_t size, unsigned s1) {
+  if (!g || !s || !size || (va % 16384) || (off % 16384) || (size % 4096) || !s1_valid_arg(s1)) return GMM_EINVAL;
+  const uint64_t len = round16k(size);
+  if (va + len < va || va + len > (1ull << (64 - g->cfg.t0sz))) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  int rc = GMM_EINVAL;
+  if (!anchor_node_of(&g->anchors, g->anchors.root, s) || off >= s->size || size > s->size - off) goto out;
+  rc = GMM_EEXIST;
+  if (thin_overlap_forbidden(g, va, len) || tchunk_any_in(&g->thin, va, len)) goto out;
+  rc = GMM_EGUARD;
+  if (!MUT(GMM_MUT_NO_LAYER3) && !view_remap_ok(s, off, va, len)) goto out;
+  rc = GMM_ENOMEM;
+  if (tset_reserve(&g->views, 1) != 0) goto out;
+  const uint32_t x = tset_insert(&g->views, va, 0);
+  g->views.n[x].u.view = (view_rec_t){.va = va, .size = size, .off = off, .sect = s};
+  s->nviews++;
+  rc = 0;
+  if (s1 != GMM_S1_NONE && (rc = view_apply_locked(g, &g->views.n[x].u.view, va, size / 4096, NULL, s1)) != 0) {
+    tset_remove(&g->views, va);  // nothing else changed (view_apply_locked's all-or-nothing rule)
+    s->nviews--;
+  }
+out:
+  pthread_mutex_unlock(&g->mtx);
+  return rc;
+}
+
+int gmm_sect_view_at(gmm_t *g, uint64_t va, gmm_sect_t **sect, uint64_t *view_va, uint64_t *view_size, uint64_t *off) {
+  pthread_mutex_lock(&g->mtx);
+  const view_rec_t *v = view_owning(g, va);
+  const int r = v && va < v->va + v->size;
+  if (r) {
+    if (sect) *sect = v->sect;
+    if (view_va) *view_va = v->va;
+    if (view_size) *view_size = v->size;
+    if (off) *off = v->off + ((va & ~4095ull) - v->va);
+  }
+  pthread_mutex_unlock(&g->mtx);
+  return r;
+}
+
+// gmm_vm_host_ptr/gmm_host_ptr for v3 memory. *handled = 1 if va is a view's or an anchor's: then the result is
+// (void *)va for a view page whose descriptor is committed (valid, or the NOACCESS tag), else NULL.
+static void *v3_host_ptr_locked(gmm_t *g, uint64_t va, int *handled) {
+  *handled = 1;
+  const view_rec_t *v = view_owning(g, va);
+  if (v) {
+    if (va >= v->va + v->size) return NULL;
+    const uint64_t *slot = pt_lookup_slot(g, va & ~4095ull);
+    const uint64_t d = slot ? *slot : 0;
+    const int committed = (d & 1ull) || ((d >> GMM_TAG_SHIFT) & GMM_TAG_MASK) == GMM_TAG_NOACCESS;
+    return committed ? (void *)(uintptr_t)va : NULL;
+  }
+  if (anchor_at(g, va)) return NULL;
+  *handled = 0;
+  return NULL;
 }
 
 // ================================================================================================================
@@ -1740,8 +2373,8 @@ static void rec_insert(gmm_t *g, s2rec_t r) {  // capacity reserved by the calle
 static void rec_remove(gmm_t *g, s2rec_t *r) { tset_remove(&g->recs, r->va); }
 
 // The caller-backing guard for a run: the host region containing va passes caller_region_shape_ok's tests (tag
-// 250, not file-backed, exactly READ|WRITE) and covers at least va's whole 16K page. Returns that region's end in
-// *end (a run never extends past it: one backend->s2_map call never spans two VM map entries). 0 or -1.
+// 250, not file-backed, exactly READ|WRITE, VM_INHERIT_NONE) and covers at least va's whole 16K page. Returns that
+// region's end in *end (a run never extends past it: one backend->s2_map call never spans two VM map entries). 0 or -1.
 static int caller_region_end(uint64_t va, uint64_t *end) {
   host_region_t hr;
   if (host_region_at(va, &hr) != 0 || hr.start > va || hr.end < va + 16384 || !caller_region_shape_ok(&hr)) return -1;
@@ -1871,6 +2504,56 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     grp[ngrp++] = (tgroup_t){.ci = ci, .n = n, .ipa = GMM_IPA_NONE};
     ci += n - 1;
   }
+  // v3 PARANOID identity self-alias check (see palias_t): each new chunk's page_ident (read once first if its entry has
+  // no VM object yet) must not be mapped at another VA already, nor repeat within this call. One page query per chunk.
+  // (Identity memory is VM_INHERIT_NONE, enforced by the run guard above: caller_region_shape_ok.)
+  if ((g->cfg.flags & GMM_CFG_PARANOID) && need_map && !MUT(GMM_MUT_NO_SELF_ALIAS)) {
+    pkey_t *pk = malloc(need_map * sizeof *pk);
+    if (!pk || palias_reserve(&g->palias, need_map) != 0) {
+      free(pk);
+      rc = GMM_ENOMEM;
+      goto out;
+    }
+    size_t npk = 0;
+    rc = 0;
+    int query_failed = 0;  // M1 (Task 4 review): distinguishes "page_ident itself failed (or the page still has no
+                            // VM object after being touched)" from "the query succeeded and found a real alias", so
+                            // the refusal message doesn't claim an alias when the query never got that far
+    for (size_t ci = 0; ci < nchunks && !rc; ci++) {
+      tplan_t *pl = &plan[ci];
+      if (!pl->need_map) continue;
+      int r = page_ident(pl->va, &pl->pobj, &pl->poff);
+      if (r == 0 && !pl->pobj) {  // never touched: give the entry its VM object, then ask again
+        (void)*(volatile const uint8_t *)(uintptr_t)pl->va;
+        r = page_ident(pl->va, &pl->pobj, &pl->poff);
+      }
+      if (r != 0 || !pl->pobj) {
+        rc = GMM_EGUARD;
+        query_failed = 1;
+        break;
+      }
+      const palias_t *e = palias_find(&g->palias, pl->pobj, pl->poff);
+      if (e && e->va != pl->va) rc = GMM_EGUARD;
+      pk[npk++] = (pkey_t){pl->pobj, pl->poff};
+    }
+    if (!rc && npk > 1) {
+      qsort(pk, npk, sizeof *pk, cmp_pkey);
+      for (size_t k = 1; k < npk && !rc; k++)
+        if (!cmp_pkey(&pk[k - 1], &pk[k])) rc = GMM_EGUARD;
+    }
+    free(pk);
+    if (rc) {
+      if (rc == GMM_EGUARD) {
+        if (query_failed)
+          fprintf(stderr, "gmm: PARANOID: could not read an identity chunk's physical page identity (page_ident "
+                          "failed, or the page still had no VM object after being touched) -- refused\n");
+        else
+          fprintf(stderr, "gmm: PARANOID: an identity chunk is the same physical page as another identity VA (a remap "
+                          "of identity memory, rule R9) -- refused\n");
+      }
+      goto out;
+    }
+  }
   PROF_LAP(GUARD);
   // A contiguous IPA range per run. If the free space is fragmented, a run is split in halves until each piece
   // finds one (so only a genuine shortage -- already excluded above -- could fail; the loop keeps that honest).
@@ -1974,6 +2657,10 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       pl->ipa = gr->ipa + k * 16384;
       pl->mapped_now = 1;
       pl->e = tchunk_insert(&g->thin, pl->va, pl->ipa);
+      if (pl->pobj) {  // v3 PARANOID: record the physical identity (reserved in (A))
+        pl->e->pobj = pl->pobj, pl->e->poff = pl->poff;
+        palias_insert(&g->palias, pl->pobj, pl->poff, pl->va);
+      }
     }
     rec_insert(g, (s2rec_t){.va = plan[gr->ci].va, .ipa = gr->ipa, .nchunks = gr->n, .whole = 1});
     g->st.map_calls++;
@@ -2067,7 +2754,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       if (r->whole) g->st.unmap_exact++;
       else g->st.unmap_sub++;
       rec_remove(g, r);
-      for (uint64_t c = 0; c < rn; c++) tchunk_remove(&g->thin, tchunk_find(&g->thin, rva + c * 16384));
+      for (uint64_t c = 0; c < rn; c++) thin_chunk_forget(g, tchunk_find(&g->thin, rva + c * 16384));
       free_ipa_range(g, ripa, rn);
       continue;
     }
@@ -2090,7 +2777,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       for (uint64_t c = 0; c < old.nchunks;) {
         const uint64_t cva = old.va + c * 16384;
         if (!tchunk_find(&g->thin, cva)->committed) {  // emptied: forget it, free its IPA (the unmap returned)
-          tchunk_remove(&g->thin, tchunk_find(&g->thin, cva));
+          thin_chunk_forget(g, tchunk_find(&g->thin, cva));
           free_ipa(g, old.ipa + c * 16384);
           c++;
           continue;
@@ -2148,7 +2835,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       if (b < old.nchunks)
         rec_insert(g, (s2rec_t){.va = old.va + b * 16384, .ipa = old.ipa + b * 16384, .nchunks = old.nchunks - b,
                                 .whole = 0});
-      for (uint64_t c = a; c < b; c++) tchunk_remove(&g->thin, tchunk_find(&g->thin, old.va + c * 16384));
+      for (uint64_t c = a; c < b; c++) thin_chunk_forget(g, tchunk_find(&g->thin, old.va + c * 16384));
       free_ipa_range(g, hipa, hn);
       if (b >= old.nchunks) break;
       rva = old.va + b * 16384;
@@ -2167,16 +2854,23 @@ out:
 }
 
 int gmm_vm_range_set(gmm_t *g, uint64_t va, size_t size, unsigned s1) {
-  if (!size || (size % 4096) != 0) return GMM_EINVAL;
+  if (!size || (size % 4096) != 0 || va + size < va) return GMM_EINVAL;
   pthread_mutex_lock(&g->mtx);
-  const int rc = thin_apply_locked(g, va, size / 4096, NULL, s1, 0);
+  // v3: a range wholly inside one view takes the view path
+  const view_rec_t *v = MUT(GMM_MUT_NO_LAYER2) ? NULL : view_owning(g, va);
+  const int rc = (v && va + size <= v->va + v->size) ? view_apply_locked(g, v, va, size / 4096, NULL, s1)
+                                                      : thin_apply_locked(g, va, size / 4096, NULL, s1, 0);
   pthread_mutex_unlock(&g->mtx);
   return rc;
 }
 int gmm_vm_range_set_pages(gmm_t *g, uint64_t va, size_t npages, const uint8_t *s1) {
-  if (!s1) return GMM_EINVAL;
+  if (!s1 || !npages || npages > (UINT64_MAX - va) / 4096) return GMM_EINVAL;
   pthread_mutex_lock(&g->mtx);
-  const int rc = thin_apply_locked(g, va, npages, s1, 0, 0);
+  // v3: a range wholly inside one view takes the view path
+  const view_rec_t *v = MUT(GMM_MUT_NO_LAYER2) ? NULL : view_owning(g, va);
+  const int rc = (v && va + (uint64_t)npages * 4096 <= v->va + v->size)
+                     ? view_apply_locked(g, v, va, npages, s1, 0)
+                     : thin_apply_locked(g, va, npages, s1, 0, 0);
   pthread_mutex_unlock(&g->mtx);
   return rc;
 }
@@ -2188,22 +2882,35 @@ int gmm_view_map(gmm_t *g, uint64_t va, size_t size, const void *host_backing, u
   return rc;
 }
 int gmm_view_unmap(gmm_t *g, uint64_t va, size_t size) {
-  if (!size || (size % 4096) != 0) return GMM_EINVAL;
+  if (!size || (size % 4096) != 0 || va + size < va) return GMM_EINVAL;
   pthread_mutex_lock(&g->mtx);
-  const int rc = thin_apply_locked(g, va, size / 4096, NULL, GMM_S1_NONE, 0);
+  view_rec_t *v = view_owning(g, va);
+  int rc;
+  if (v && v->va == va && v->size == size) rc = view_unmap_locked(g, v);  // v3: exactly a registered view
+  else if (v || views_touch(g, va & ~16383ull, round16k(va + size))) rc = GMM_EINVAL;  // any other range touching one
+  else rc = thin_apply_locked(g, va, size / 4096, NULL, GMM_S1_NONE, 0);  // anchors: GMM_EEXIST there
   pthread_mutex_unlock(&g->mtx);
   return rc;
 }
 int gmm_vm_s2_mapped(gmm_t *g, uint64_t va) {
   pthread_mutex_lock(&g->mtx);
-  const int r = tchunk_find(&g->thin, va & ~16383ull) != NULL;
+  // v3: an anchor page is mapped from its chunk's first commit through a view until gmm_sect_destroy; a view VA
+  // never is (Wine may replace the view's host remap once gmm_view_unmap returned).
+  const anchor_rec_t *a = anchor_at(g, va);
+  const int r = a                    ? tchunk_find(&a->sect->chunks, va & ~16383ull) != NULL
+                : view_owning(g, va) ? 0
+                                     : tchunk_find(&g->thin, va & ~16383ull) != NULL;
   pthread_mutex_unlock(&g->mtx);
   return r;
 }
 void *gmm_vm_host_ptr(gmm_t *g, uint64_t va) {
   pthread_mutex_lock(&g->mtx);
-  const tchunk_t *c = tchunk_find(&g->thin, va & ~16383ull);
-  void *p = (c && (c->committed & (1u << ((va >> 12) & 3)))) ? (void *)(uintptr_t)va : NULL;
+  int handled;
+  void *p = v3_host_ptr_locked(g, va, &handled);
+  if (!handled) {
+    const tchunk_t *c = tchunk_find(&g->thin, va & ~16383ull);
+    p = (c && (c->committed & (1u << ((va >> 12) & 3)))) ? (void *)(uintptr_t)va : NULL;
+  }
   pthread_mutex_unlock(&g->mtx);
   return p;
 }
@@ -2253,7 +2960,8 @@ void gmm_vm_s2_stats(gmm_t *g, gmm_s2_stats_t *out) {
 }
 uint64_t gmm_vm_chunk_ipa(gmm_t *g, uint64_t va) {
   pthread_mutex_lock(&g->mtx);
-  const tchunk_t *c = tchunk_find(&g->thin, va & ~16383ull);
+  const anchor_rec_t *a = anchor_at(g, va);  // v3: an anchor chunk's IPA; a view VA owns no chunk
+  const tchunk_t *c = view_owning(g, va) ? NULL : tchunk_find(a ? &a->sect->chunks : &g->thin, va & ~16383ull);
   const uint64_t ipa = c ? c->ipa : UINT64_MAX;
   pthread_mutex_unlock(&g->mtx);
   return ipa;
@@ -2272,6 +2980,17 @@ static int ipa_in_free(const gmm_t *g, uint64_t ipa) {
 static int cmp_rec_ipa(const void *a, const void *b) {
   const s2rec_t *x = a, *y = b;
   return x->ipa < y->ipa ? -1 : x->ipa > y->ipa;
+}
+static int cmp_ext_lo(const void *a, const void *b) {
+  const ipa_ext_t *x = a, *y = b;
+  return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+static int is_legacy_section_ipa(const gmm_t *g, uint64_t ipa) {  // a legacy section chunk (listed once per view)
+  for (size_t i = 0; i < g->nregions; i++)
+    if (g->regions[i].section)
+      for (size_t c = 0; c < g->regions[i].section->nchunks; c++)
+        if (g->regions[i].section->ipa[c] == ipa) return 1;
+  return 0;
 }
 int gmm_debug_check(gmm_t *g) {
   int bad = 0;
@@ -2352,6 +3071,104 @@ int gmm_debug_check(gmm_t *g) {
       if (recs[i].ipa + recs[i].nchunks * 16384 > recs[i + 1].ipa)
         DBAD("records overlap in IPA at 0x%llx", (unsigned long long)recs[i + 1].ipa);
   }
+  // ---- v3 (vel1-gmm-v3, design §6.4): anchors, views, anchor chunks, the PARANOID self-alias table ----
+  {
+    const size_t na = g->anchors.count, nv = g->views.count;
+    size_t cap_used = nrecs + 1;
+    for (size_t i = 0; i < g->nregions; i++) {
+      if (g->regions[i].chunks) cap_used += g->regions[i].size / 16384;
+      if (g->regions[i].section) cap_used += g->regions[i].section->nchunks;
+    }
+    uint32_t *ai = malloc((na + 1) * sizeof *ai), *vi = malloc((nv + 1) * sizeof *vi);
+    if (ai && na) tn_inorder(g->anchors.n, g->anchors.root, ai, 0, na);
+    for (size_t k = 0; ai && k < na; k++) cap_used += g->anchors.n[ai[k]].u.anc.sect->chunks.n;
+    ipa_ext_t *used = malloc(cap_used * sizeof *used);  // every stage-2 IPA range in use, to check disjointness
+    size_t nused = 0;
+    if (!ai || !vi || !used) {
+      DBAD("out of memory (v3 checks)");
+    } else {
+      if (nv) tn_inorder(g->views.n, g->views.root, vi, 0, nv);
+      if (na && tn_check(g->anchors.n, g->anchors.root)) DBAD("anchor treap invariants broken");
+      if (nv && tn_check(g->views.n, g->views.root)) DBAD("view treap invariants broken");
+      for (size_t k = 0; k < na; k++) {
+        const anchor_rec_t *a = &g->anchors.n[ai[k]].u.anc;
+        const gmm_sect_t *s = a->sect;
+        if (g->anchors.n[ai[k]].key != a->base || a->base != s->anchor || a->size != s->size || (a->base | a->size) % 16384)
+          DBAD("anchor %zu (0x%llx): record and section disagree", k, (unsigned long long)a->base);
+        if (k + 1 < na && a->base + a->size > g->anchors.n[ai[k + 1]].u.anc.base) DBAD("anchors %zu/%zu overlap", k, k + 1);
+        if (tchunk_any_in(&g->thin, a->base, a->size)) DBAD("an identity chunk lies inside anchor 0x%llx", (unsigned long long)a->base);
+        if (views_touch(g, a->base, a->base + a->size)) DBAD("a view overlaps anchor 0x%llx", (unsigned long long)a->base);
+        if (regions_overlap(g, a->base, a->size)) DBAD("a legacy region overlaps anchor 0x%llx", (unsigned long long)a->base);
+        uint64_t cnt = 0;
+        for (size_t j = 0; j < nv; j++) cnt += g->views.n[vi[j]].u.view.sect == s;
+        if (cnt != s->nviews)
+          DBAD("section 0x%llx: nviews %llu != %llu registered views", (unsigned long long)a->base,
+               (unsigned long long)s->nviews, (unsigned long long)cnt);
+        for (size_t i = 0; i < s->chunks.cap; i++) {
+          const tchunk_t *e = &s->chunks.slots[i];
+          if (!e->key) continue;
+          const uint64_t ck = e->key & ~1ull;
+          if (ck < a->base || ck >= a->base + a->size || ck % 16384 || e->ipa % 16384)
+            DBAD("anchor chunk 0x%llx (ipa 0x%llx) malformed or outside its anchor", (unsigned long long)ck,
+                 (unsigned long long)e->ipa);
+          if (ipa_in_free(g, e->ipa)) DBAD("anchor chunk IPA 0x%llx is also FREE", (unsigned long long)e->ipa);
+          used[nused++] = (ipa_ext_t){e->ipa, e->ipa + 16384};
+        }
+      }
+      for (size_t j = 0; j < nv; j++) {
+        const view_rec_t *v = &g->views.n[vi[j]].u.view;
+        gmm_sect_t *s = v->sect;
+        if (g->views.n[vi[j]].key != v->va || v->va % 16384 || v->off % 16384 || !v->size || v->size % 4096 ||
+            !anchor_node_of(&g->anchors, g->anchors.root, s) || v->off + v->size > s->size)
+          DBAD("view 0x%llx malformed or outside its section", (unsigned long long)v->va);
+        if (j + 1 < nv && v->va + round16k(v->size) > g->views.n[vi[j + 1]].u.view.va) DBAD("views %zu/%zu overlap", j, j + 1);
+        if (tchunk_any_in(&g->thin, v->va, round16k(v->size)))
+          DBAD("an identity chunk lies inside view 0x%llx", (unsigned long long)v->va);
+        for (uint64_t p = 0; p < v->size; p += 4096) {
+          const uint64_t *slot = pt_lookup_slot(g, v->va + p);
+          const uint64_t d = slot ? *slot : 0, so = v->off + p;
+          if (d & 1ull) {
+            const tchunk_t *e = tchunk_find(&s->chunks, s->anchor + (so & ~16383ull));
+            if (!e) DBAD("view page 0x%llx is valid but its anchor chunk is not mapped", (unsigned long long)(v->va + p));
+            else if ((d & 0x0000fffffffff000ull) != e->ipa + (so & 16383))
+              DBAD("view page 0x%llx descriptor ipa 0x%llx != anchor chunk ipa 0x%llx + 0x%llx",
+                   (unsigned long long)(v->va + p), (unsigned long long)(d & 0x0000fffffffff000ull),
+                   (unsigned long long)e->ipa, (unsigned long long)(so & 16383));
+          } else {
+            const unsigned tag = (unsigned)((d >> GMM_TAG_SHIFT) & GMM_TAG_MASK);
+            if (tag != GMM_TAG_RESERVED && tag != GMM_TAG_NOACCESS)
+              DBAD("view page 0x%llx is invalid with tag %u (want RESERVED or NOACCESS)", (unsigned long long)(v->va + p), tag);
+          }
+        }
+      }
+      for (size_t i = 0; i < nrecs; i++) used[nused++] = (ipa_ext_t){recs[i].ipa, recs[i].ipa + recs[i].nchunks * 16384};
+      for (size_t i = 0; i < g->nregions; i++) {
+        const gmm_region_t *r = &g->regions[i];
+        if (r->chunks)
+          for (size_t c = 0; c < r->size / 16384; c++)
+            if (r->chunks[c].s2_mapped) used[nused++] = (ipa_ext_t){r->chunks[c].ipa, r->chunks[c].ipa + 16384};
+        if (r->section)  // a legacy section is listed once per view region: keep its chunks once (dedupe below)
+          for (size_t c = 0; c < r->section->nchunks; c++)
+            used[nused++] = (ipa_ext_t){r->section->ipa[c], r->section->ipa[c] + 16384};
+      }
+      qsort(used, nused, sizeof *used, cmp_ext_lo);
+      for (size_t i = 0; i + 1 < nused; i++)
+        if (used[i].hi > used[i + 1].lo && !(used[i].lo == used[i + 1].lo && used[i].hi == used[i + 1].hi && is_legacy_section_ipa(g, used[i].lo)))
+          DBAD("stage-2 IPA ranges overlap at 0x%llx", (unsigned long long)used[i + 1].lo);
+      if (g->cfg.flags & GMM_CFG_PARANOID) {  // the self-alias table mirrors exactly the thin chunks that recorded one
+        size_t with = 0;
+        for (size_t i = 0; i < g->thin.cap; i++) {
+          const tchunk_t *e = &g->thin.slots[i];
+          if (!e->key || !e->pobj) continue;
+          with++;
+          const palias_t *p = palias_find(&g->palias, e->pobj, e->poff);
+          if (!p || p->va != (e->key & ~1ull)) DBAD("thin chunk 0x%llx: its self-alias entry is missing", (unsigned long long)(e->key & ~1ull));
+        }
+        if (with != g->palias.n) DBAD("self-alias table has %zu entries, %zu thin chunks recorded one", g->palias.n, with);
+      }
+    }
+    free(ai), free(vi), free(used);
+  }
   free(ifree), free(recs), free(idx);
   // legacy chunks and section chunks: never in the free list
   for (size_t i = 0; i < g->nregions; i++) {
@@ -2369,3 +3186,7 @@ int gmm_debug_check(gmm_t *g) {
 #undef DBAD
   return bad;
 }
+
+// ================================================================================================================
+// v3 SECTIONS: the anchor tag for callers (gmm.h). Every other v3 entry point is with the section and view blocks.
+int gmm_sect_anchor_tag_flag(void) { return gmm_anchor_tag_flag(); }
