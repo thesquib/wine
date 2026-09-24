@@ -2197,6 +2197,15 @@ static struct vcpu_section *vcpu_section_get( int fd, const struct stat *st, mem
         free( section );
         return NULL;
     }
+    /* a fork() child (Wine starts processes with one) sharing the anchor would make it copy-on-write, and gmm's
+     * guard refuses an anchor that is not private to this process (relay fex-side-gmm-v3-anchor-inherit) */
+    if (minherit( section->anchor, section->size, VM_INHERIT_NONE ))
+    {
+        ERR( "vCPU mode: minherit of anchor %p failed: %s\n", section->anchor, strerror( errno ));
+        munmap( section->anchor, section->size );
+        free( section );
+        return NULL;
+    }
     if ((section->fd = dup( fd )) == -1)
     {
         munmap( section->anchor, section->size );
@@ -2328,10 +2337,11 @@ static NTSTATUS vcpu_section_view_map( struct file_view *view, int fd, mem_size_
     if (vcpu_ranges_add( &section->filled, offset, end )) goto failed;
 
     /* the view's host side, for host access (syscalls on its buffers, NtFlushInstructionCache, write-back); never
-     * handed to hv_vm_map, which sees the anchor only */
+     * handed to hv_vm_map, which sees the anchor only. Not inherited either: it shares the anchor's object, so a
+     * fork() child holding it would make the anchor copy-on-write as surely as one holding the anchor */
     kr = mach_vm_remap( mach_task_self(), &addr, ROUND_SIZE( 0, view->size, host_page_mask ), 0,
                         VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), (mach_vm_address_t)(section->anchor + offset),
-                        FALSE, &cur_prot, &max_prot, VM_INHERIT_DEFAULT );
+                        FALSE, &cur_prot, &max_prot, VM_INHERIT_NONE );
     if (kr != KERN_SUCCESS)
     {
         ERR( "vCPU mode: remap of section offset %#llx at %p failed: kern_return_t %d\n", (unsigned long long)offset,
