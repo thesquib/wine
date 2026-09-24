@@ -35,6 +35,7 @@
 
 #if defined(__APPLE__) && defined(__aarch64__)
 
+#include <dlfcn.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -204,11 +205,25 @@ static uint32_t s2_map( void *host, uint64_t ipa, size_t size, int perm )
     if (perm & GMM_S2_R) flags |= HV_MEMORY_READ;
     if (perm & GMM_S2_W) flags |= HV_MEMORY_WRITE;
     if (perm & GMM_S2_X) flags |= HV_MEMORY_EXEC;
+    if (vcpu_prof_interval)
+    {
+        uint64_t t0 = vcpu_prof_now();
+        uint32_t ret = hv_vm_map( host, ipa, size, flags );
+        vcpu_prof_add( VCPU_PROF_S2_MAP, vcpu_prof_now() - t0 );
+        return ret;
+    }
     return hv_vm_map( host, ipa, size, flags );
 }
 
 static uint32_t s2_unmap( uint64_t ipa, size_t size )
 {
+    if (vcpu_prof_interval)
+    {
+        uint64_t t0 = vcpu_prof_now();
+        uint32_t ret = hv_vm_unmap( ipa, size );
+        vcpu_prof_add( VCPU_PROF_S2_UNMAP, vcpu_prof_now() - t0 );
+        return ret;
+    }
     return hv_vm_unmap( ipa, size );
 }
 
@@ -583,8 +598,20 @@ static struct prof_bucket prof_extra[VCPU_PROF_IDS];
 static const char * const prof_extra_names[VCPU_PROF_IDS] =
 {
     "in:s1 sync", "in:s1 revoke", "in:icache sync", "in:tlbi", "in:gmm_vm_fault", "lock:virtual_mutex",
-    "fault:retry", "fault:handled", "fault:raised",
+    "fault:retry", "fault:handled", "fault:raised", "in:hv_vm_map", "in:hv_vm_unmap",
 };
+
+/* unix calls by (function table, index): a slot is filled once under prof_unix_mutex, then published by ready */
+#define PROF_UNIX_SLOTS 2048
+static struct
+{
+    const void *table;
+    uint64_t    code;
+    atomic_int  ready;
+} prof_unix_key[PROF_UNIX_SLOTS];
+static struct prof_bucket prof_unix[PROF_UNIX_SLOTS];
+static pthread_mutex_t prof_unix_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 extern const char *ntdll_syscall_name( UINT id );
 
@@ -599,6 +626,33 @@ static inline void prof_add( struct prof_bucket *b, uint64_t ticks )
 void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks )
 {
     prof_add( &prof_extra[id], ticks );
+}
+
+static struct prof_bucket *prof_unix_bucket( const void *table, uint64_t code )
+{
+    unsigned int i, h0 = (unsigned int)((((uintptr_t)table >> 4) * 0x9e3779b1u) ^ (code * 0x85ebca6bu)) % PROF_UNIX_SLOTS;
+    unsigned int h = h0;
+
+    for (i = 0; i < PROF_UNIX_SLOTS; i++, h = (h + 1) % PROF_UNIX_SLOTS)
+    {
+        if (!atomic_load_explicit( &prof_unix_key[h].ready, memory_order_acquire )) break;
+        if (prof_unix_key[h].table == table && prof_unix_key[h].code == code) return &prof_unix[h];
+    }
+    /* first sighting: insert under the mutex (a racing insert of the same key is found by the rescan) */
+    pthread_mutex_lock( &prof_unix_mutex );
+    for (i = 0, h = h0; i < PROF_UNIX_SLOTS; i++, h = (h + 1) % PROF_UNIX_SLOTS)
+    {
+        if (!atomic_load_explicit( &prof_unix_key[h].ready, memory_order_acquire ))
+        {
+            prof_unix_key[h].table = table;
+            prof_unix_key[h].code = code;
+            atomic_store_explicit( &prof_unix_key[h].ready, 1, memory_order_release );
+            break;
+        }
+        if (prof_unix_key[h].table == table && prof_unix_key[h].code == code) break;
+    }
+    pthread_mutex_unlock( &prof_unix_mutex );
+    return i < PROF_UNIX_SLOTS ? &prof_unix[h] : &prof_kind[VEL1_EXIT_UNIX_CALL];
 }
 
 static struct prof_bucket *prof_sys_bucket( UINT id )
@@ -634,7 +688,7 @@ static BOOL prof_is_wait( const char *name )
 
 static void *prof_thread( void *arg )
 {
-    enum { NSYS = 2 * 4096, NROWS = NSYS + PROF_KINDS + VCPU_PROF_IDS };
+    enum { NSYS = 2 * 4096, NUNIX0 = NSYS + PROF_KINDS + VCPU_PROF_IDS, NROWS = NUNIX0 + PROF_UNIX_SLOTS };
     static uint64_t last_count[NROWS + 1], last_ticks[NROWS + 1];
     static struct prof_row rows[NROWS];
     uint64_t freq, start = prof_now(), last_cpu = 0;
@@ -655,7 +709,8 @@ static void *prof_thread( void *arg )
         for (i = 0; i < NROWS; i++)
         {
             struct prof_bucket *b = i < NSYS ? &prof_sys[i / 4096][i % 4096]
-                                    : i < NSYS + PROF_KINDS ? &prof_kind[i - NSYS] : &prof_extra[i - NSYS - PROF_KINDS];
+                                    : i < NSYS + PROF_KINDS ? &prof_kind[i - NSYS]
+                                    : i < NUNIX0 ? &prof_extra[i - NSYS - PROF_KINDS] : &prof_unix[i - NUNIX0];
             uint64_t c = atomic_load_explicit( &b->count, memory_order_relaxed );
             uint64_t t = atomic_load_explicit( &b->ticks, memory_order_relaxed );
             struct prof_row *r = &rows[n];
@@ -674,6 +729,17 @@ static void *prof_thread( void *arg )
                     snprintf( r->buf, sizeof(r->buf), "syscall %04x", id );
                 }
                 if (prof_is_wait( r->name )) wait += r->ticks;
+            }
+            else if (i >= NUNIX0)
+            {
+                Dl_info info;
+                const char *mod = "?", *slash;
+
+                if (dladdr( prof_unix_key[i - NUNIX0].table, &info ) && info.dli_fname)
+                    mod = (slash = strrchr( info.dli_fname, '/' )) ? slash + 1 : info.dli_fname;
+                snprintf( r->buf, sizeof(r->buf), "unix:%.14s#%llu", mod,
+                          (unsigned long long)prof_unix_key[i - NUNIX0].code );
+                r->name = NULL;
             }
             else if (i >= NSYS + PROF_KINDS)
             {
@@ -697,7 +763,7 @@ static void *prof_thread( void *arg )
                  "%.3f s | process CPU %.3f s over %u s\n", (int)getpid(), (prof_now() - start) / hz,
                  (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
                  host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
-        for (i = 0; i < n && i < 20; i++)
+        for (i = 0; i < n && i < 24; i++)
             fprintf( stderr, "[VCPU-PROF] pid %d   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n",
                      (int)getpid(), rows[i].name ? rows[i].name : rows[i].buf,
                      (unsigned long long)rows[i].count, rows[i].ticks / hz, rows[i].ticks / hz * 1e6 / rows[i].count,
@@ -1197,6 +1263,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             break;
         case VEL1_EXIT_UNIX_CALL:
             vcpu_frame_from_unix_call_exit( frame, &e );
+            if (prof_interval) vt->prof_charge = prof_unix_bucket( (const void *)e.regs.x[0], e.regs.x[1] );
             break;
         case VEL1_EXIT_KICK:
         case VEL1_EXIT_FAULT_SYNC:
