@@ -10,6 +10,7 @@
 // write, even though gmm's own mutators are already serialized against each other by the mutex.
 #include "gmm.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -19,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 // GMM_PROFILE (gmm.h TEST SUPPORT): per-phase wall time of thin_apply_locked, for gmm_bench only. Without the
 // macro every PROF_* below compiles to nothing.
@@ -74,11 +76,27 @@ enum {
   GMM_MUT_DESTROY_SKIP_UNMAP = 0x40, // gmm_sect_destroy frees the IPAs without unmapping them
   GMM_MUT_DESTROY_LEAK_IPA = 0x80,   // gmm_sect_destroy unmaps but never frees the IPAs
   GMM_MUT_NO_SELF_ALIAS = 0x100,     // no PARANOID identity self-alias check
+  // v6 (N24m): bugs in the uniform-NONE early-out that N24f's differential fuzz must catch
+  GMM_MUT_NONE_FIRST_RECORD = 0x200,  // the clip ends where the FIRST record it touches ends (later records untouched)
+  GMM_MUT_NONE_PROBE_C0 = 0x400,      // the early-out asks only whether a record covers the range's first chunk
+  GMM_MUT_NONE_CLIP_WIDE = 0x800,     // the clip keeps the whole first/last 16K chunk, past the caller's va/va+sz
+  GMM_MUT_DESC_SKIP_1G = 0x1000,      // the descriptor loop skips to the next 1 GiB line past ANY missing leaf table
 };
 int gmm_debug_mutant;
 #define MUT(m) ((gmm_debug_mutant & (m)) != 0)
 #else
 #define MUT(m) 0
+#endif
+
+// TEST ONLY (gmm_fuzz_ref, built by build.sh with -DGMM_REFERENCE): the thin mutator's pre-v6 algorithms -- no
+// uniform-NONE early-out or clip, a table walk and an encode per page -- so N24f (gmm_fuzz.c) can compare v6 against
+// them step by step. Every other build
+// (the test binaries, gmm_vm, m1, Wine's copy) has V6 == 1, and no gmm_debug_reference symbol (build.sh checks).
+#ifdef GMM_REFERENCE
+#define V6 0
+int gmm_debug_reference = 1;
+#else
+#define V6 1
 #endif
 
 // gmm's own backing -- legacy chunks (Wine's KUSER page is one), legacy section chunks, and the PT pool via
@@ -110,7 +128,7 @@ static void gmm_host_free(void *p, size_t sz) {
 // (which it reports as a submap, refused below). nesting depth 0: a submap is never descended into, only refused.
 typedef struct {
   uint64_t start, end;
-  unsigned tag, prot, external_pager, is_submap;
+  unsigned tag, prot, max_prot, external_pager, is_submap;
   // v3 (vel1-gmm-v3): the entry's VM object and how it is shared, for the section guards (anchor and view checks)
   // and the PARANOID identity self-alias check. object_id is 0 while the entry has no VM object (never touched).
   unsigned share_mode, inherit, ref_count;
@@ -127,6 +145,7 @@ static int host_region_at(uint64_t va, host_region_t *out) {
       mach_vm_region_recurse(mach_task_self(), &addr, &regsz, &depth, (vm_region_recurse_info_t)&info, &count);
   if (kr != KERN_SUCCESS) return -1;
   *out = (host_region_t){.start = addr, .end = addr + regsz, .tag = info.user_tag, .prot = (unsigned)info.protection,
+                         .max_prot = (unsigned)info.max_protection,
                          .external_pager = info.external_pager, .is_submap = info.is_submap,
                          .share_mode = info.share_mode, .inherit = (unsigned)info.inheritance,
                          .ref_count = info.ref_count, .object_id = info.object_id, .offset = info.offset};
@@ -534,6 +553,18 @@ static uint32_t tset_floor(const tset_t *t, uint64_t key) {  // the node with th
   }
   return best;
 }
+static uint32_t tset_ceil(const tset_t *t, uint64_t key) {  // v6: the node with the smallest key >= key, or 0
+  uint32_t best = 0;
+  for (uint32_t x = t->root; x;) {
+    if (t->n[x].key >= key) {
+      best = x;
+      x = t->n[x].l;
+    } else {
+      x = t->n[x].r;
+    }
+  }
+  return best;
+}
 static uint32_t tset_first_fit(const tset_t *t, uint64_t len) {  // the lowest-keyed node with len >= len, or 0
   for (uint32_t x = t->root; x;) {
     const tnode_t *n = t->n;
@@ -621,6 +652,12 @@ struct gmm {
 
   gmm_ev_t *trace;
   size_t ntrace, cap_trace;
+
+  // v6 (vel1-gmm-v6): the uniform-NONE early-out (thin_apply_locked). legacy_released: sticky, set by gmm_release --
+  // the one call that leaves non-RESERVED descriptors (GMM_TAG_DECOMMITTED) where no chunk is mapped, which breaks the
+  // invariant the early-out relies on; from then on uniform NONE takes v5's full walk. thin: gmm_debug_thin_counts.
+  int legacy_released;
+  gmm_debug_thin_t thin_counts;
 };
 
 // ================================================================================================================
@@ -819,8 +856,9 @@ int gmm_foreign_s2_map(gmm_t *gmm, void *host, uint64_t ipa, size_t sz, int perm
 }
 
 // ================================================================================================================
-// Trace (TEST SUPPORT, gmm.h).
-static void trace_push_sz(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa, uint64_t sz) {
+// Trace (TEST SUPPORT, gmm.h). v6: only with GMM_CFG_TRACE. The flag test is inline in every caller, so a production
+// gmm_t (Wine: flag clear) pays one predictable branch per event -- no call, no append, no GMM_PROFILE clock read.
+static void trace_append(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa, uint64_t sz) {
 #ifdef GMM_PROFILE
   const uint64_t pt0 = prof_now();
 #endif
@@ -833,8 +871,11 @@ static void trace_push_sz(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ip
   g_prof_ns[GMM_PROF_TRACE] += prof_now() - pt0;
 #endif
 }
+static inline void trace_push_sz(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa, uint64_t sz) {
+  if (g->cfg.flags & GMM_CFG_TRACE) trace_append(g, kind, va, ipa, sz);
+}
 // Every pre-FAST-MAPPING stage-2 event is one 16K chunk.
-static void trace_push(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa) {
+static inline void trace_push(gmm_t *g, gmm_ev_kind_t kind, uint64_t va, uint64_t ipa) {
   trace_push_sz(g, kind, va, ipa, (kind == GMM_EV_S2_MAP || kind == GMM_EV_S2_UNMAP) ? 16384 : 0);
 }
 size_t gmm_trace_count(gmm_t *g) { return g->ntrace; }
@@ -945,6 +986,22 @@ static uint64_t *pt_lookup_slot(gmm_t *g, uint64_t va) {
     t = e & 0x0000fffffffff000ull;
   }
   return &pt_table_ptr(g, t)[(va >> 12) & 0x1FFull];
+}
+// v6: the leaf table (512 slots) covering va's 2 MiB if every intermediate table exists. Else NULL, and *span = the size
+// of the missing subtree containing va (2 MiB, 1 GiB or 512 GiB at t0sz 16): a caller writing only invalid
+// descriptors can skip all of it, since a missing subtree already walks invalid (a translation fault above level 3).
+static uint64_t *pt_lookup_leaf(gmm_t *g, uint64_t va, uint64_t *span) {
+  uint64_t t = g->root_ipa;
+  for (int level = gmm_start_level_for_t0sz(g->cfg.t0sz); level < 3; level++) {
+    const int shift = 12 + 9 * (3 - level);
+    const uint64_t e = pt_table_ptr(g, t)[(va >> shift) & 0x1FFull];
+    if (!(e & 1ull)) {
+      *span = MUT(GMM_MUT_DESC_SKIP_1G) ? 1ull << 30 : 1ull << shift;
+      return NULL;
+    }
+    t = e & 0x0000fffffffff000ull;
+  }
+  return pt_table_ptr(g, t);
 }
 // Wine M1 fix 1b: allocate every intermediate table `va`'s leaf needs, without writing the leaf. Returns 0, or
 // GMM_ENOPT if the pool ran out (tables allocated before that stay linked in: still-invalid leaves, reusable,
@@ -1446,6 +1503,7 @@ int gmm_release(gmm_t *g, uint64_t alloc_base) {
     if (bad) goto out;
   }
   region_remove(g, r);
+  g->legacy_released = 1;  // v6: its DECOMMITTED leaves stay behind; the thin NONE early-out is off from now on
   rc = 0;
 out:
   pthread_mutex_unlock(&g->mtx);
@@ -2371,6 +2429,20 @@ static void rec_insert(gmm_t *g, s2rec_t r) {  // capacity reserved by the calle
   g->recs.n[x].u.rec = r;
 }
 static void rec_remove(gmm_t *g, s2rec_t *r) { tset_remove(&g->recs, r->va); }
+// v6: the part of [lo, hi) that run records cover the ends of -- [the start of the first record ending after lo, the
+// end of the last record starting before hi), intersected with [lo, hi) -- in *clo/*chi. 0 if no record intersects
+// [lo, hi) (records are disjoint and sorted by va: O(log records)). lo and hi are 16K-aligned here.
+static int recs_span(gmm_t *g, uint64_t lo, uint64_t hi, uint64_t *clo, uint64_t *chi) {
+  if (!g->recs.count) return 0;
+  uint32_t f = tset_floor(&g->recs, lo);  // the record containing lo, else the first one above it
+  if (!f || g->recs.n[f].u.rec.va + g->recs.n[f].u.rec.nchunks * 16384 <= lo) f = tset_ceil(&g->recs, lo);
+  if (!f || g->recs.n[f].u.rec.va >= hi || (MUT(GMM_MUT_NONE_PROBE_C0) && !rec_find(g, lo))) return 0;
+  const uint32_t l = MUT(GMM_MUT_NONE_FIRST_RECORD) ? f : tset_floor(&g->recs, hi - 1);  // exists: f qualifies
+  const uint64_t rlo = g->recs.n[f].u.rec.va, rhi = g->recs.n[l].u.rec.va + g->recs.n[l].u.rec.nchunks * 16384;
+  *clo = rlo > lo ? rlo : lo;
+  *chi = rhi < hi ? rhi : hi;
+  return 1;
+}
 
 // The caller-backing guard for a run: the host region containing va passes caller_region_shape_ok's tests (tag
 // 250, not file-backed, exactly READ|WRITE, VM_INHERIT_NONE) and covers at least va's whole 16K page. Returns that
@@ -2427,16 +2499,55 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
                              int refuse_committed) {
   PROF_MARK();
   if (!npages || (va % 4096) != 0) return GMM_EINVAL;
-  const uint64_t sz = (uint64_t)npages * 4096;
+  uint64_t sz = (uint64_t)npages * 4096;
   const uint64_t va_limit = 1ull << (64 - g->cfg.t0sz);
   if (va + sz < va || va + sz > va_limit) return GMM_EINVAL;
-  for (size_t i = 0; i < npages; i++)
-    if (!s1_valid_arg(s1arr ? s1arr[i] : s1uni)) return GMM_EINVAL;
-  const uint64_t c0 = va & ~16383ull;
-  const size_t nchunks = (size_t)(((va + sz - 1) & ~16383ull) - c0) / 16384 + 1;
+  if (!s1arr) {
+    if (!s1_valid_arg(s1uni)) return GMM_EINVAL;  // v6: one value, one check (was a loop over every page)
+  } else {
+    for (size_t i = 0; i < npages; i++)
+      if (!s1_valid_arg(s1arr[i])) return GMM_EINVAL;
+  }
+  uint64_t c0 = va & ~16383ull;
+  size_t nchunks = (size_t)(((va + sz - 1) & ~16383ull) - c0) / 16384 + 1;
   // Checked on the 16K-rounded range: a stage-2 map covers the whole host page, so a thin range may not even share
   // a 16K chunk with a legacy region or the alias window.
   if (thin_overlap_forbidden(g, c0, (uint64_t)nchunks * 16384)) return GMM_EEXIST;
+  // v6 (vel1-gmm-v6), the uniform-NONE early-out and clip (gmm/README.md "v6 memop"; relay openrosetta
+  // docs/relays/fex-side-memop-cost-2026-09-25.md): Wine's reserve and release of a multi-GiB view is a NONE call over
+  // the whole range, and every loop below is O(pages) -- ~5.5 ns per 4K page with nothing to do (16 GiB: 23.8 ms).
+  // INVARIANT relied on: every page of a 16K chunk that is not stage-2 mapped has descriptor 0 (GMM_TAG_RESERVED, or
+  // no leaf table at all) -- outside legacy regions, the alias window and views, which thin_overlap_forbidden has just
+  // refused. It holds because a thin chunk is stage-2 mapped while any page of it is committed (NOACCESS, a committed
+  // page without access bits, keeps its chunk mapped), a chunk loses its mapping only when every page of it is NONE
+  // (RESERVED), and every stage-2 mapped thin chunk lies in a run record (retained chunks included). The view path
+  // and gmm_view_unmap of a view leave RESERVED; the one call that leaves anything else behind is gmm_release of a
+  // legacy region (GMM_TAG_DECOMMITTED), so after one of those this is off for good (g->legacy_released; Wine never
+  // calls it). gmm_debug_check verifies the invariant.
+  // So a uniform NONE writes nothing in a chunk no run record covers: if no record touches the 16K-rounded range the
+  // call is a no-op, and otherwise only [first record touched, end of the last) intersected with the range can change
+  // -- the pages outside it, including a partial first or last chunk, are already RESERVED. refuse_committed's
+  // EEXIST is unaffected (a page outside every record is never committed). Clipped on record boundaries (16K), so the
+  // clipped range still starts/ends at va/va+sz whenever a record covers the first/last chunk.
+  if (V6 && !s1arr && s1uni == GMM_S1_NONE && !g->legacy_released) {
+    uint64_t clo, chi;
+    if (!recs_span(g, c0, c0 + (uint64_t)nchunks * 16384, &clo, &chi)) {
+      g->thin_counts.none_early_outs++;
+      PROF_LAP(ARGS);
+      return 0;
+    }
+    if (!MUT(GMM_MUT_NONE_CLIP_WIDE)) {
+      if (clo < va) clo = va;
+      if (chi > va + sz) chi = va + sz;
+    }
+    if (clo != va || chi != va + sz) {
+      g->thin_counts.none_clips++;
+      va = clo, sz = chi - clo, npages = (size_t)(sz / 4096);
+      c0 = va & ~16383ull;
+      nchunks = (size_t)(((va + sz - 1) & ~16383ull) - c0) / 16384 + 1;
+    }
+  }
+  g->thin_counts.pages_applied += npages;
   const int remap_policy = (g->cfg.flags & GMM_CFG_S2_REMAP) != 0;
   const uint64_t cap = g->cfg.s2_run_chunks > 1 ? g->cfg.s2_run_chunks : 1;
   tplan_t *plan = calloc(nchunks, sizeof(tplan_t));
@@ -2483,11 +2594,23 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     goto out;
   }
   PROF_LAP(PLAN);
-  for (size_t i = 0; i < npages; i++) {  // tables for every descriptor that will be valid (one lookup per 2 MiB)
-    const uint64_t pva = va + i * 4096;
-    if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
-    if (pt_lookup_slot(g, pva)) continue;
-    if ((rc = pt_ensure(g, pva)) != 0) goto out;
+  // Tables for every descriptor that will be valid. v6: one pt_ensure per 2 MiB span (the leaf table covers all of it),
+  // and none at all for a uniform invalid target; v5 walked the tables once per page.
+  if (!V6) {
+    for (size_t i = 0; i < npages; i++) {
+      const uint64_t pva = va + i * 4096;
+      if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
+      if (pt_lookup_slot(g, pva)) continue;
+      if ((rc = pt_ensure(g, pva)) != 0) goto out;
+    }
+  } else if (s1arr || s1_is_valid_desc(s1uni)) {
+    uint64_t done2m = ~0ull;  // the 2 MiB span whose leaf table is known to exist
+    for (size_t i = 0; i < npages; i++) {
+      const uint64_t pva = va + i * 4096;
+      if ((pva & ~0x1FFFFFull) == done2m || !s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
+      if ((rc = pt_ensure(g, pva)) != 0) goto out;
+      done2m = pva & ~0x1FFFFFull;
+    }
   }
   PROF_LAP(PT);
   // Runs: maximal stretches of chunks gaining their first committed page, cut at the cap and at the end of the host
@@ -2670,13 +2793,45 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
   PROF_LAP(INSERT);
 
   // ---- (C) descriptors. Nothing below can fail. ----
+  // v6: one leaf-table lookup per 2 MiB (v5 walked from the root for every page), and each descriptor is its s1 value's
+  // template -- s1_encode(s1, 0), made once per call and value -- with the page's IPA OR'd in when it is valid (every
+  // valid encoding is gmm_pte_encode's attribute bits | (ipa & OA)). A uniform invalid target (NONE, NOACCESS) skips a
+  // whole missing subtree at once: nothing there can differ from it (the old loop's `!slot` + invalid case). V6 == 0
+  // (gmm_fuzz_ref only) keeps v5's per-page walk and encode.
   size_t ntlbi = 0;
+  // The template of a uniform s1 is made up front; an array's are made on first use. The trace flag is read once:
+  // the compiler cannot keep g->cfg.flags in a register across the descriptor stores (measured: ~1 ns/page).
+  uint64_t tmpl[16];
+  unsigned have_tmpl = 0;
+  if (!s1arr) tmpl[s1uni] = s1_encode(s1uni, 0), have_tmpl = 1u << s1uni;
+  const int tracing = (g->cfg.flags & GMM_CFG_TRACE) != 0;
+  uint64_t *leaf = NULL, leaf2m = ~0ull;  // the leaf table of the 2 MiB span leaf2m (NULL: missing)
   for (size_t i = 0; i < npages; i++) {
     const uint64_t pva = va + i * 4096;
     const unsigned s1 = s1arr ? s1arr[i] : s1uni;
     const tplan_t *pl = &plan[(pva - c0) / 16384];
-    const uint64_t new_desc = s1_encode(s1, (pl->ipa == GMM_IPA_NONE ? 0 : pl->ipa) + (pva - pl->va));
-    uint64_t *slot = pt_lookup_slot(g, pva);
+    const uint64_t ipa = (pl->ipa == GMM_IPA_NONE ? 0 : pl->ipa) + (pva - pl->va);
+    uint64_t new_desc, *slot;
+    if (!V6) {
+      new_desc = s1_encode(s1, ipa);
+      slot = pt_lookup_slot(g, pva);
+    } else {
+      if (!(have_tmpl & (1u << s1))) tmpl[s1] = s1_encode(s1, 0), have_tmpl |= 1u << s1;  // s1 < 16 (s1_valid_arg)
+      new_desc = (tmpl[s1] & 1ull) ? tmpl[s1] | (ipa & 0x0000fffffffff000ull) : tmpl[s1];
+      if ((pva & ~0x1FFFFFull) != leaf2m) {
+        uint64_t span = 0;
+        leaf = pt_lookup_leaf(g, pva, &span);
+        leaf2m = pva & ~0x1FFFFFull;
+        if (!leaf && !s1arr && !(new_desc & 1ull)) {  // uniform invalid over a missing subtree: skip all of it
+          const uint64_t next = (pva & ~(span - 1)) + span;
+          if (next >= va + sz || next < pva) break;
+          i = (size_t)((next - va) / 4096) - 1;
+          leaf2m = ~0ull;
+          continue;
+        }
+      }
+      slot = leaf ? &leaf[(pva >> 12) & 0x1FFull] : NULL;
+    }
     const uint64_t old_desc = slot ? *slot : 0;
     if (old_desc == new_desc) continue;
     if (!slot) {
@@ -2685,7 +2840,8 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       abort();
     }
     __atomic_store_n(slot, new_desc, __ATOMIC_RELEASE);
-    trace_push(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva, leaf_trace_ipa(new_desc));
+    if (tracing)
+      trace_append(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva, leaf_trace_ipa(new_desc), 0);
     if (valid_change_needs_tlbi(g, old_desc, new_desc)) tlbi_va[ntlbi++] = pva;
   }
   for (size_t ci = 0; ci < nchunks; ci++)
@@ -2966,6 +3122,11 @@ uint64_t gmm_vm_chunk_ipa(gmm_t *g, uint64_t va) {
   pthread_mutex_unlock(&g->mtx);
   return ipa;
 }
+void gmm_debug_thin_counts(gmm_t *g, gmm_debug_thin_t *out) {
+  pthread_mutex_lock(&g->mtx);
+  *out = g->thin_counts;
+  pthread_mutex_unlock(&g->mtx);
+}
 uint64_t gmm_debug_ipa_available(gmm_t *g) {
   pthread_mutex_lock(&g->mtx);
   const uint64_t n = ipa_available(g);
@@ -2991,6 +3152,27 @@ static int is_legacy_section_ipa(const gmm_t *g, uint64_t ipa) {  // a legacy se
       for (size_t c = 0; c < g->regions[i].section->nchunks; c++)
         if (g->regions[i].section->ipa[c] == ipa) return 1;
   return 0;
+}
+// v6: the invariant the uniform-NONE early-out relies on (thin_apply_locked): every non-zero level-3 descriptor lies in
+// a legacy region, the alias window, a view's owned range, or a 16K chunk some run record covers. Walks every table
+// reachable from the root (gmm's tables are only ever table or page descriptors). Prints at most 8 violations.
+static int dcheck_leaves(gmm_t *g, uint64_t table_ipa, int level, uint64_t va_base, int bad) {
+  const uint64_t *t = pt_table_ptr(g, table_ipa);
+  const int shift = 12 + 9 * (3 - level);
+  for (uint64_t i = 0; i < 512; i++) {
+    const uint64_t d = t[i], va = va_base | (i << shift);
+    if (!d) continue;
+    if (level < 3) {
+      if ((d & 3ull) == 3ull) bad = dcheck_leaves(g, d & 0x0000fffffffff000ull, level + 1, va, bad);
+      continue;
+    }
+    if (find_region(g, va) || view_owning(g, va) || rec_find(g, va & ~16383ull)) continue;
+    if (g->cfg.alias_base && va >= g->cfg.alias_base && va - g->cfg.alias_base < 0x100000000ull) continue;
+    if (++bad <= 8)
+      fprintf(stderr, "gmm_debug_check: va 0x%llx has descriptor 0x%llx but no run record covers its chunk (the "
+                      "NONE early-out's invariant)\n", (unsigned long long)va, (unsigned long long)d);
+  }
+  return bad;
 }
 int gmm_debug_check(gmm_t *g) {
   int bad = 0;
@@ -3170,6 +3352,10 @@ int gmm_debug_check(gmm_t *g) {
     free(ai), free(vi), free(used);
   }
   free(ifree), free(recs), free(idx);
+  // v6: the uniform-NONE early-out's invariant (dcheck_leaves), unless a released legacy region may have left
+  // DECOMMITTED leaves behind (g->legacy_released: the early-out is off then too)
+  if (!g->legacy_released)
+    bad = dcheck_leaves(g, g->root_ipa, gmm_start_level_for_t0sz(g->cfg.t0sz), 0, bad);
   // legacy chunks and section chunks: never in the free list
   for (size_t i = 0; i < g->nregions; i++) {
     const gmm_region_t *r = &g->regions[i];
@@ -3190,3 +3376,49 @@ int gmm_debug_check(gmm_t *g) {
 // ================================================================================================================
 // v3 SECTIONS: the anchor tag for callers (gmm.h). Every other v3 entry point is with the section and view blocks.
 int gmm_sect_anchor_tag_flag(void) { return gmm_anchor_tag_flag(); }
+
+// G14 (2026-09-25): an anchor that shares its bytes across processes (gmm.h). The temporary MAP_SHARED mapping is
+// checked BEFORE anything is tagged -- a file-backed object (Wine's unlinked temp file: external_pager 1, share mode
+// SM_SHARED, measured) is refused with nothing but that mapping to undo -- and the finished anchor is checked again
+// with the anchor guard's own shape test on every entry, so this door can hand out nothing gmm_sect_create would not
+// accept. The alias is the relay's case C: one VM object with the shm mapping (SM_TRUESHARED, external_pager 0,
+// max protection READ|WRITE, measured), so every process that maps the object sees the same pages.
+int gmm_sect_anchor_from_fd(int fd, size_t size, void **anchor) {
+  struct stat st;
+  if (!anchor || fd < 0 || !size || (size % 16384) || fstat(fd, &st) != 0 || st.st_size < 0 ||
+      (uint64_t)st.st_size < (uint64_t)size)
+    return GMM_EINVAL;
+  void *tmp = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (tmp == MAP_FAILED) return (errno == EPERM || errno == EACCES) ? GMM_EGUARD : GMM_ENOMEM;  // O_RDONLY: EPERM
+  const uint64_t t = (uint64_t)(uintptr_t)tmp;
+  host_region_t hr;
+  if (host_region_at(t, &hr) != 0 || hr.start > t || hr.end < t + size || hr.is_submap || hr.external_pager != 0 ||
+      (hr.max_prot & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) {
+    munmap(tmp, size);
+    return GMM_EGUARD;
+  }
+  memory_object_size_t esz = size;
+  mach_port_t entry = MACH_PORT_NULL;
+  kern_return_t kr = mach_make_memory_entry_64(mach_task_self(), &esz, (memory_object_offset_t)t,
+                                               VM_PROT_READ | VM_PROT_WRITE, &entry, MACH_PORT_NULL);
+  mach_vm_address_t a = 0;
+  if (kr == KERN_SUCCESS && esz >= size)
+    kr = mach_vm_map(mach_task_self(), &a, size, 16383, VM_FLAGS_ANYWHERE | gmm_anchor_tag_flag(), entry, 0, FALSE,
+                     VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE);
+  else if (kr == KERN_SUCCESS)
+    kr = KERN_INVALID_ARGUMENT;  // a short entry (never seen): refuse rather than map part of the object
+  if (entry != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), entry);
+  munmap(tmp, size);
+  if (kr != KERN_SUCCESS) return GMM_ENOMEM;
+  // Every entry of the new anchor, as gmm_sect_create's PARANOID walk sees it, plus the max protection asked for.
+  for (uint64_t p = a; p < a + size;) {
+    if (host_region_at(p, &hr) != 0 || hr.start > p || !anchor_shape_ok(&hr) ||
+        (hr.max_prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_WRITE)) {
+      mach_vm_deallocate(mach_task_self(), a, size);
+      return GMM_EGUARD;
+    }
+    p = hr.end;
+  }
+  *anchor = (void *)(uintptr_t)a;
+  return 0;
+}

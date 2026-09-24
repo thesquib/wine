@@ -113,6 +113,12 @@ enum {
   // per contiguous piece, and their descriptors are restored (invalid->valid: no TLBI). A vCPU touching a survivor
   // in that window takes an ordinary stage-1 fault; gmm_vm_fault() blocks on the gmm mutex and answers RETRY.
   GMM_CFG_S2_REMAP = 0x4,
+  // TEST SUPPORT (vel1-gmm-v6, 2026-09-25): record the event trace (gmm_trace_* at the end of this header). Off by
+  // default: with the flag clear every trace call returns at once (no append, no GMM_PROFILE clock read). Before v6
+  // the trace was always on and nothing cleared it -- 32 bytes per descriptor change for the life of the process
+  // (40 MiB after five 256 MiB commit/decommit cycles) and about half of the `desc` phase (relay openrosetta
+  // docs/relays/fex-side-memop-cost-2026-09-25.md). gmm_test.c and gmm_vm.c set it; WINE MUST NOT SET IT.
+  GMM_CFG_TRACE = 0x8,
 };
 
 // Error returns (every int-returning mutator; 0 = success). GMM_EINVAL (-1) is the historical "anything wrong"
@@ -397,7 +403,17 @@ uint64_t gmm_debug_ipa_available(gmm_t *gmm);
 // chunk-table entry inside exactly one record; the IPA free list sorted, coalesced, inside [ipa_lo, bump) and
 // disjoint from every record and every legacy chunk/section IPA; every valid thin descriptor points at its chunk's
 // IPA + offset with that page's committed bit set. Returns 0, or the number of violations (each printed).
+// v6: also the invariant the uniform-NONE early-out relies on (gmm.c, thin_apply_locked): outside legacy regions, the
+// alias window and registered views, every non-zero stage-1 leaf lies in a 16K chunk some run record covers (skipped
+// once a legacy region has been released: gmm_release leaves GMM_TAG_DECOMMITTED leaves behind).
 int gmm_debug_check(gmm_t *gmm);
+// TEST SUPPORT (v6): what the thin mutator did since gmm_init. none_early_outs: uniform GMM_S1_NONE calls that returned
+// at once because no run record touches their (16K-rounded) range; none_clips: uniform NONE calls whose range was cut
+// down to the run records it touches; pages_applied: 4K pages the thin mutator's per-page loops covered, after any clip.
+typedef struct {
+  uint64_t none_early_outs, none_clips, pages_applied;
+} gmm_debug_thin_t;
+void gmm_debug_thin_counts(gmm_t *gmm, gmm_debug_thin_t *out);
 // Identity backing: returns (void *)va if the 4K page at va is committed through the thin API, else NULL.
 // (gmm_host_ptr() answers the same for thin pages, so existing callers work on either kind of memory.)
 void *gmm_vm_host_ptr(gmm_t *gmm, uint64_t va);
@@ -461,6 +477,22 @@ typedef struct gmm_sect gmm_sect_t;
 // asked about -- without the hardened runtime an RW MAP_JIT mapping with this tag reads exactly like an anchor (tag,
 // protection, max protection, share mode, pager: measured), so no gmm check can refuse it.
 int gmm_sect_anchor_tag_flag(void);
+
+// A section anchor that SHARES its bytes with every other process mapping the same object (G14, 2026-09-25; relay
+// openrosetta docs/relays/fex-side-shared-sections-2026-09-25.md). `fd` is a POSIX shm object (shm_open, sized once
+// with ftruncate: macOS refuses a second ftruncate) of at least `size` bytes; size is a 16K multiple. The anchor is
+// mmap(MAP_SHARED, fd) -> mach_make_memory_entry_64 -> mach_vm_map(tag 252, cur=max=READ|WRITE, VM_INHERIT_NONE) at a
+// kernel-chosen 16K-aligned address; the temporary mapping is munmapped before return. On 0, *anchor is ready for
+// gmm_sect_create exactly like a private anchor (rules R8-R12 apply unchanged: never mprotect/munmap/madvise it until
+// gmm_sect_destroy returned 0), and the caller munmap(*anchor, size)s it after gmm_sect_destroy. Returns
+//   GMM_EINVAL: anchor NULL, fd < 0, size 0 or not a 16K multiple, fstat fails, or the object is smaller than size;
+//   GMM_EGUARD: the object is file-backed (external_pager != 0: Wine's unlinked temp file), is a submap, or cannot be
+//     mapped READ|WRITE (an O_RDONLY fd: mmap EPERM/EACCES, or max protection without READ|WRITE) -- a new kind of
+//     memory in a VM is how this Mac was panicked, so only anonymous objects pass;
+//   GMM_ENOMEM: any other mmap/Mach call failed.
+// On every non-zero return nothing is left mapped and *anchor is untouched. The object stays alive while any process
+// maps it or holds its fd; each process's gmm_sect_destroy unmaps only its own VM's stage 2.
+int gmm_sect_anchor_from_fd(int fd, size_t size, void **anchor);
 
 // Register a section anchor the CALLER allocated (above). anchor and size are 16K multiples; nothing is stage-2
 // mapped and no IPA is consumed (an anchor costs host VA only, so a section may be larger than the IPA window).
@@ -534,10 +566,10 @@ int gmm_debug_sect_map_at(gmm_t *gmm, gmm_sect_t *sect, uint64_t base, uint64_t 
 int gmm_walk(const gmm_t *gmm, uint64_t va, gmm_xlat_t *out);
 
 // ---------------------------------------------------------------------------------------------------------------
-// TEST SUPPORT (not in the design's §1 API list): an always-on internal event trace, used by N4's revocation-order
-// checker and available to any other test. Recording the trace costs one dynamic-array append per event; there is
-// no live-path equivalent need (gmm_vm.c's maintenance-vCPU discipline is already logged the rung_vm.c way) so
-// this is harmless prototype-only surface, not a change to the live ABI.
+// TEST SUPPORT (not in the design's §1 API list): an internal event trace, used by N4's revocation-order checker, by
+// gmm_vm.c's stage-2 checks and available to any other test. v6: recorded only with cfg.flags & GMM_CFG_TRACE (off by
+// default; gmm_trace_count() then stays 0). Recording costs one dynamic-array append per event and the array is never
+// shrunk -- test support only, never for a production caller (Wine must not set GMM_CFG_TRACE).
 typedef enum {
   GMM_EV_PTE_VALID,     // a.va now has a valid stage-1 descriptor (ipa = its output address)
   GMM_EV_PTE_INVALID,   // a.va now has an invalid stage-1 descriptor (ipa = the descriptor's tag, GMM_TAG_*)
@@ -576,7 +608,7 @@ typedef enum {
   GMM_PROF_TLBI,       // the batched shootdown
   GMM_PROF_UNMAP,      // stage-2 unmaps, record removal/split, IPA free
   GMM_PROF_FREE,       // scratch frees
-  GMM_PROF_TRACE,      // trace_push (nested: see above)
+  GMM_PROF_TRACE,      // trace_push (nested: see above); always 0 without GMM_CFG_TRACE (v6)
   GMM_PROF_N
 } gmm_prof_phase_t;
 void gmm_debug_prof_get(uint64_t ns[GMM_PROF_N]);  // copies the sums
