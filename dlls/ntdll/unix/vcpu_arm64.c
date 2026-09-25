@@ -845,6 +845,12 @@ static void *prof_thread( void *arg )
                  atomic_load( &prof_vcpus_live ), atomic_load( &prof_vcpus_peak ),
                  (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
                  host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
+        if (vcpu_mn)
+        {
+            char line[256];
+            vcpu_pool_line( line, sizeof(line) );
+            fprintf( stderr, "[VCPU-PROF] pid %d %s\n", (int)getpid(), line );
+        }
         for (i = 0; i < n && i < 24; i++)
             fprintf( stderr, "[VCPU-PROF] pid %d   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n",
                      (int)getpid(), rows[i].name ? rows[i].name : rows[i].buf,
@@ -1007,7 +1013,7 @@ static int tlbi_initiator( const uint64_t *va, size_t count, int all )
     struct vcpu_thread *vt = vcpu_current();
     int ret;
 
-    if (!vt || vt->hv_depth || !(all || (count && count <= VEL1_TLBI_MAX_VA))) return 1;
+    if (!vt || !vt->has_vcpu || vt->hv_depth || !(all || (count && count <= VEL1_TLBI_MAX_VA))) return 1;
     vt->hv_depth++;
     ret = all ? vel1_run_tlbi_all( &vt->vcpu ) : vel1_run_tlbi( &vt->vcpu, va, count );
     vt->hv_depth--;
@@ -1174,9 +1180,20 @@ static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
             if (vt->prof_unix) prof_hist_add( PROF_HIST_UNIX, t0 - vt->prof_mark, prof_ticks_per_us );
             if (vt->wait_t0 && vt->level == vt->wait_level) prof_wait_end( vt, t0 );
         }
+        if (vcpu_mn)
+        {
+            if (!vt->has_vcpu) vcpu_fatal( "thread %04x entered vcpu_run without a vCPU\n", (UINT)GetCurrentThreadId() );
+            vel1_pool_note_run_begin( &vt->pool_member, vel1_pool_now_ns() );
+        }
         vt->hv_depth++;
         kind = vel1_run( &vt->vcpu, e );
         vt->hv_depth--;
+        if (vcpu_mn)
+        {
+            vel1_pool_note_run_end( &vt->pool_member );
+            /* R9: record after every return, whatever the exit; acted on at the next preempt point */
+            if (vel1_pool_take_preempt( &vt->pool_member )) vt->preempt = TRUE;
+        }
         vt->exits++;
         if (prof_interval)
         {
@@ -1217,6 +1234,20 @@ static void vcpu_emulation_entry( const struct syscall_frame *frame, struct sysc
     TRACE( "emulation entry: x86 pc %#llx, context %p\n", (unsigned long long)frame->pc, user_context );
 }
 
+/* M:N: act on a recorded preemption once the exit is fully handled, before the thread re-enters the guest and while
+ * in_syscall is still set (spec §7): give the slot to the waiter and queue again at the back of the FIFO */
+static void vcpu_preempt_point( struct vcpu_thread *vt )
+{
+    sigset_t old;
+
+    if (!vcpu_mn || !vt->preempt) return;
+    vt->preempt = FALSE;
+    if (vt->presenter) return;  /* EXEMPT set after the pick: the pool does not retract it (R10) */
+    block_all_signals( &old );
+    if (vcpu_release( vt )) atomic_fetch_add( &prof_rel_preempt, 1 );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
 /* write the whole frame into the vCPU and leave the syscall state (fault, kick, thread start) */
 static void vcpu_store_full( struct vcpu_thread *vt, const struct syscall_frame *frame )
 {
@@ -1224,6 +1255,11 @@ static void vcpu_store_full( struct vcpu_thread *vt, const struct syscall_frame 
     vel1_regs regs;
     int ret;
 
+    if (vcpu_mn)
+    {
+        vcpu_preempt_point( vt );
+        vcpu_ensure( vt );
+    }
     /* signals held back during the fault / kick handling arrive now, with the mark set: they take the host path
      * and edit the frame, which is read below */
     vcpu_unblock_signals();
@@ -1259,6 +1295,11 @@ static void vcpu_return( struct vcpu_thread *vt, struct vcpu_level *level, vel1_
     vel1_regs regs;
     int err;
 
+    if (vcpu_mn)
+    {
+        vcpu_preempt_point( vt );
+        vcpu_ensure( vt );
+    }
     atomic_store( &vt->in_syscall, 0 );
     atomic_signal_fence( memory_order_seq_cst );
     /* RESTORE_FLAGS_EMULATION only sends the EL0 return to the slow path (SIGUSR2); usr2_handler then enters the
@@ -1704,6 +1745,7 @@ NTSTATUS vcpu_user_mode_callback( ULONG64 user_sp, void **ret_ptr, ULONG *ret_le
     int err;
 
     if (thread_data->syscall_trace) trace_usercall( stack->id, (ULONG_PTR *)stack->args, stack->len );
+    if (vcpu_mn) vcpu_ensure( vt );  /* the syscall that dispatches this callback may have blocked and released */
 
     /* a unix-call exit saved only q8-q15 and no FPCR/FPSR, and the outer return rewrites all of them after a
      * callback: take the exact FP state from the vCPU, once per exit (before the first callback runs other guest
