@@ -97,6 +97,15 @@ static PEB64 *get_peb64( void )
     return (PEB64 *)(UINT_PTR)teb64->Peb;
 }
 
+/* a pointer as the 64-bit side sees it: in a vCPU WoW64 process 32-bit memory is at host BASE + p, and the 64-bit
+ * TEB's own address carries BASE (it sits in that window); BASE is 0 wherever the 64-bit TEB is below 4 GiB */
+static ULONG64 ptr_64( const void *ptr )
+{
+    TEB64 *teb64 = NtCurrentTeb64();
+
+    return (teb64 ? teb64->Tib.Self & ~(ULONG64)0xffffffff : 0) + PtrToUlong( ptr );
+}
+
 void locale_init(void)
 {
     const NLS_LOCALE_LCID_INDEX *entry;
@@ -166,18 +175,18 @@ void locale_init(void)
 
     NtGetNlsSectionPtr( 10, 0, NULL, &case_ptr, &size );
     NtCurrentTeb()->Peb->UnicodeCaseTableData = case_ptr;
-    if (peb64) peb64->UnicodeCaseTableData = PtrToUlong( case_ptr );
+    if (peb64) peb64->UnicodeCaseTableData = ptr_64( case_ptr );
     if (ansi_cp != CP_UTF8)
     {
         NtGetNlsSectionPtr( 11, ansi_cp, NULL, &ansi_ptr, &size );
         NtCurrentTeb()->Peb->AnsiCodePageData = ansi_ptr;
-        if (peb64) peb64->AnsiCodePageData = PtrToUlong( ansi_ptr );
+        if (peb64) peb64->AnsiCodePageData = ptr_64( ansi_ptr );
     }
     if (oem_cp != CP_UTF8)
     {
         NtGetNlsSectionPtr( 11, oem_cp, NULL, &oem_ptr, &size );
         NtCurrentTeb()->Peb->OemCodePageData = oem_ptr;
-        if (peb64) peb64->OemCodePageData = PtrToUlong( oem_ptr );
+        if (peb64) peb64->OemCodePageData = ptr_64( oem_ptr );
     }
     RtlInitNlsTables( ansi_ptr, oem_ptr, case_ptr, &nls_info );
     NlsAnsiCodePage     = nls_info.AnsiTableInfo.CodePage;

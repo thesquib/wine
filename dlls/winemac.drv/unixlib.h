@@ -75,5 +75,9 @@ struct dnd_query_exited_params
 
 static inline void *param_ptr(UINT64 param)
 {
+#if defined(WINE_UNIX_LIB) && defined(_WIN64)
+    /* a 32-bit caller's address: at BASE + p in a vCPU WoW64 process (wow64_host_ptr is a no-op elsewhere) */
+    if (param && param < ((UINT64)1 << 32)) return wow64_host_ptr(param);
+#endif
     return (void *)(UINT_PTR)param;
 }

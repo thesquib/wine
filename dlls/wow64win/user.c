@@ -1667,6 +1667,39 @@ NTSTATUS WINAPI wow64_NtUserCallHwndParam( UINT *args )
 
     switch (code)
     {
+    case NtUserCallHwndParam_ClientToScreen:
+    case NtUserCallHwndParam_ScreenToClient:
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)UlongToPtr( param ), code );
+
+    case NtUserCallHwndParam_GetChildRect:
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)UlongToPtr( param ), code );
+
+    case NtUserCallHwndParam_GetWindowInfo:
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)UlongToPtr( param ), code );
+
+    case NtUserCallHwndParam_GetWindowThread:
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)UlongToPtr( param ), code );
+
+    case NtUserCallHwndParam_GetPresentRect:
+        {
+            struct
+            {
+                ULONG rect;
+                UINT dpi;
+            } *params32 = UlongToPtr( param );
+            struct get_window_rects_params params;
+
+            params.rect = UlongToPtr( params32->rect );
+            params.dpi = params32->dpi;
+            return NtUserCallHwndParam( hwnd, (UINT_PTR)&params, code );
+        }
+
+    case NtUserCallHwndParam_ExposeWindowSurface:
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)UlongToPtr( param ), code );
+
+    case NtUserCallHwndParam_SetRawWindowPos:
+        return NtUserCallHwndParam( hwnd, (UINT_PTR)UlongToPtr( param ), code );
+
     case NtUserCallHwndParam_GetScrollInfo:
         {
             struct
@@ -1739,7 +1772,7 @@ NTSTATUS WINAPI wow64_NtUserCallHwndParam( UINT *args )
 
             params.flags = params32->flags;
             params.input = UlongToPtr( params32->input );
-            params.lparam = params32->lparam;
+            params.lparam = (LPARAM)UlongToPtr( params32->lparam );
             return NtUserCallHwndParam( hwnd, (UINT_PTR)&params, code );
         }
 
@@ -1782,7 +1815,20 @@ NTSTATUS WINAPI wow64_NtUserCallOneParam( UINT *args )
     ULONG_PTR arg = get_ulong( &args );
     ULONG code = get_ulong( &args );
 
-    return NtUserCallOneParam( arg, code );
+    switch (code)
+    {
+    case NtUserCallOneParam_GetPrimaryMonitorRect:
+        return NtUserCallOneParam( (UINT_PTR)UlongToPtr( arg ), code );
+
+    case NtUserCallOneParam_GetAsyncKeyboardState:
+        return NtUserCallOneParam( (UINT_PTR)UlongToPtr( arg ), code );
+
+    case NtUserCallOneParam_D3DKMTOpenAdapterFromGdiDisplayName:
+        return NtUserCallOneParam( (UINT_PTR)UlongToPtr( arg ), code );
+
+    default:
+        return NtUserCallOneParam( arg, code );
+    }
 }
 
 NTSTATUS WINAPI wow64_NtUserCallTwoParam( UINT *args )
@@ -1814,6 +1860,21 @@ NTSTATUS WINAPI wow64_NtUserCallTwoParam( UINT *args )
             if (info.fMask & MIM_STYLE)      info32->dwStyle = info.dwStyle;
             return TRUE;
         }
+
+    case NtUserCallTwoParam_GetMonitorInfo:
+        return NtUserCallTwoParam( arg1, (UINT_PTR)UlongToPtr( arg2 ), code );
+
+    case NtUserCallTwoParam_MonitorFromRect:
+        return NtUserCallTwoParam( (UINT_PTR)UlongToPtr( arg1 ), arg2, code );
+
+    case NtUserCallTwoParam_SetIMECompositionRect:
+        return NtUserCallTwoParam( arg1, (UINT_PTR)UlongToPtr( arg2 ), code );
+
+    case NtUserCallTwoParam_GetVirtualScreenRect:
+        return NtUserCallTwoParam( (UINT_PTR)UlongToPtr( arg1 ), arg2, code );
+
+    case NtUserCallTwoParam_AdjustWindowRect:
+        return NtUserCallTwoParam( (UINT_PTR)UlongToPtr( arg1 ), (UINT_PTR)UlongToPtr( arg2 ), code );
 
     default:
         return NtUserCallTwoParam( arg1, arg2, code );
@@ -3420,6 +3481,80 @@ NTSTATUS WINAPI wow64_NtUserMessageBeep( UINT *args )
     return NtUserMessageBeep( type );
 }
 
+/* messages whose wparam is a pointer in win32u's message_pointer_flags table
+ * (dlls/win32u/message.c ~351-409), for the default: case below. Only messages
+ * not already handled by an explicit case above are listed. */
+static BOOL message_has_pointer_wparam( UINT msg )
+{
+    switch (msg)
+    {
+    case EM_GETSEL:
+    case SBM_GETRANGE:
+    case CB_GETEDITSEL:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* messages whose lparam is a pointer in win32u's message_pointer_flags table
+ * (dlls/win32u/message.c ~351-409), for the default: case below. Only messages
+ * not already handled by an explicit case above are listed; WM_DEVICECHANGE,
+ * WM_DROPOBJECT, WM_QUERYDROPOBJECT, WM_DRAGLOOP, WM_DRAGSELECT and WM_DRAGMOVE
+ * are deliberately left out even though the table flags them (see the caller's
+ * report: their pointed-to structures contain pointer-sized fields). */
+static BOOL message_has_pointer_lparam( UINT msg )
+{
+    switch (msg)
+    {
+    case EM_GETSEL:  /* both wparam and lparam */
+    case SBM_GETRANGE:
+    case CB_GETEDITSEL:
+    case WM_SETTEXT:
+    case WM_GETTEXT:
+    case WM_WININICHANGE:
+    case WM_DEVMODECHANGE:
+    case WM_GETMINMAXINFO:
+    case WM_STYLECHANGING:
+    case WM_STYLECHANGED:
+    case EM_GETRECT:
+    case EM_SETRECT:
+    case EM_SETRECTNP:
+    case EM_REPLACESEL:
+    case EM_GETLINE:
+    case EM_SETTABSTOPS:
+    case SBM_SETSCROLLINFO:
+    case SBM_GETSCROLLINFO:
+    case SBM_GETSCROLLBARINFO:
+    case CB_ADDSTRING:
+    case CB_DIR:
+    case CB_GETLBTEXT:
+    case CB_INSERTSTRING:
+    case CB_FINDSTRING:
+    case CB_SELECTSTRING:
+    case CB_GETDROPPEDCONTROLRECT:
+    case CB_FINDSTRINGEXACT:
+    case LB_ADDSTRING:
+    case LB_INSERTSTRING:
+    case LB_GETTEXT:
+    case LB_SELECTSTRING:
+    case LB_DIR:
+    case LB_FINDSTRING:
+    case LB_GETSELITEMS:
+    case LB_SETTABSTOPS:
+    case LB_ADDFILE:
+    case LB_GETITEMRECT:
+    case LB_FINDSTRINGEXACT:
+    case WM_SIZING:
+    case WM_MOVING:
+    case WM_MDIGETACTIVE:
+    case WM_ASKCBFORMATNAME:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
 static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam,
                                     void *result_info, DWORD type, BOOL ansi )
 {
@@ -3499,7 +3634,8 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
             winpos_64to32( &winpos, UlongToPtr( params32->lppos ));
             return ret;
         }
-        return NtUserMessageCall( hwnd, msg, wparam, lparam, result_info, type, ansi );
+        /* wparam 0: lparam is a RECT */
+        return NtUserMessageCall( hwnd, msg, wparam, (LPARAM)ULongToPtr( lparam ), result_info, type, ansi );
 
     case WM_COMPAREITEM:
         {
@@ -3654,6 +3790,8 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         }
 
     default:
+        if (message_has_pointer_wparam( msg )) wparam = (WPARAM)ULongToPtr( wparam );
+        if (message_has_pointer_lparam( msg )) lparam = (LPARAM)ULongToPtr( lparam );
         return NtUserMessageCall( hwnd, msg, wparam, lparam, result_info, type, ansi );
     }
 }

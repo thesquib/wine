@@ -656,7 +656,7 @@ static NTSTATUS wow64_init(void *arg)
     } *params32 = arg;
     struct init_params params;
 
-    params.strings = UlongToPtr(params32->strings);
+    params.strings = wow64_host_ptr(params32->strings);
     params.app_icon_callback = params32->app_icon_callback;
     params.app_quit_request_callback = params32->app_quit_request_callback;
     return macdrv_init(&params);

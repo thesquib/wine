@@ -27,6 +27,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -739,9 +740,31 @@ static void setup_raise_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec
     {
         /* guest faults never arrive as signals in the vCPU mode: this is the host's own crash. Say so, rather than
          * redirecting the host into PE code it cannot execute (a second crash that hides this one). */
+        void **fp = (void **)FP_sig(sigcontext), *pcs[24];
+        unsigned int i, n = 0;
+        Dl_info info;
+
         fprintf( stderr, "wine: vCPU mode: host exception %#x at pc %p addr %p (lr %p sp %p)\n",
                  (UINT)rec->ExceptionCode, (void *)PC_sig(sigcontext), rec->ExceptionAddress,
                  (void *)LR_sig(sigcontext), (void *)SP_sig(sigcontext) );
+        /* pc, lr, then the frame-pointer chain: host code keeps frame records (Apple ABI) */
+        pcs[n++] = (void *)PC_sig(sigcontext);
+        pcs[n++] = (void *)LR_sig(sigcontext);
+        while (n < ARRAY_SIZE(pcs) && !((ULONG_PTR)fp & 7) && (char *)fp >= (char *)SP_sig(sigcontext) &&
+               (char *)fp < (char *)SP_sig(sigcontext) + 0x100000)  /* stay on this stack: no locks here */
+        {
+            pcs[n++] = fp[1];
+            fp = fp[0];
+        }
+        for (i = 0; i < n; i++)
+        {
+            if (dladdr( pcs[i], &info ) && info.dli_fname)
+                fprintf( stderr, "wine:   #%u %p %s+%#lx (%s+%#lx)\n", i, pcs[i], info.dli_fname,
+                         (unsigned long)((char *)pcs[i] - (char *)info.dli_fbase), info.dli_sname ? info.dli_sname : "?",
+                         info.dli_saddr ? (unsigned long)((char *)pcs[i] - (char *)info.dli_saddr) : 0ul );
+            else
+                fprintf( stderr, "wine:   #%u %p (no image)\n", i, pcs[i] );
+        }
         abort_process( 1 );
     }
 #endif
@@ -1186,6 +1209,16 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
     TRACE( "code=%x flags=%x addr=%p pc=%p tid=%04x\n",
            rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
            (void *)PC_sig(context), GetCurrentThreadId() );
+    if (TRACE_ON(seh))
+    {
+        Dl_info info;
+        void *pcs[2] = { (void *)PC_sig(context), (void *)LR_sig(context) };
+        for (i = 0; i < 2; i++)
+            if (dladdr( pcs[i], &info ) && info.dli_fname)
+                TRACE( " %s %p %s+%#lx (%s+%#lx)\n", i ? "lr" : "pc", pcs[i], info.dli_fname,
+                       (unsigned long)((char *)pcs[i] - (char *)info.dli_fbase), info.dli_sname ? info.dli_sname : "?",
+                       info.dli_saddr ? (unsigned long)((char *)pcs[i] - (char *)info.dli_saddr) : 0ul );
+    }
     for (i = 0; i < rec->NumberParameters; i++)
         TRACE( " info[%d]=%016lx\n", i, rec->ExceptionInformation[i] );
 
