@@ -86,6 +86,26 @@ static inline BOOL is_wow64(void)
     return !!wow_peb;
 }
 
+/* a value that only travels in a pointer-typed slot (a flag, a cookie): never widened */
+static inline void *wow64_value( ULONG v ) { return (void *)(ULONG_PTR)v; }
+
+#ifdef _WIN64
+/* PMW_VCPU: in a vCPU-mode WoW64 process the 32-bit address space lives at host BASE + p, BASE being what TEB32 aligns
+ * down to (0 wherever the 32-bit space sits at its own addresses, so this is then the plain zero extension). Widen an
+ * ADDRESS with ULongToPtr/UlongToPtr (0 stays NULL); a value that only travels in a pointer-typed slot uses
+ * wow64_value(). Local to ntdll/unix: never redefine these in basetsd.h. */
+static inline ULONG_PTR wow64_base(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb->WowTebOffset ? ((ULONG_PTR)teb + teb->WowTebOffset) & ~(ULONG_PTR)0xffffffff : 0;
+}
+static inline void *wow64_ptr( ULONG p ) { return p ? (void *)(wow64_base() + p) : NULL; }
+#undef ULongToPtr
+#undef UlongToPtr
+#define ULongToPtr(ul) wow64_ptr(ul)
+#define UlongToPtr(ul) wow64_ptr(ul)
+#endif
+
 /* check for old-style Wow64 (using a 32-bit ntdll.so) */
 static inline BOOL is_old_wow64(void)
 {

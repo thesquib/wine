@@ -275,7 +275,7 @@ static void __attribute__((used)) call_user_exception_dispatcher( EXCEPTION_RECO
             ARM_CONTEXT ctx = { CONTEXT_ARM_ALL };
 
             pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx );
-            stack = (struct stack_layout *)(ULONG_PTR)(ctx.Sp & ~3) - 1;
+            stack = (struct stack_layout *)ULongToPtr( ctx.Sp & ~3 ) - 1;
             stack->rec = *rec;
             stack->context = ctx;
 
@@ -505,7 +505,9 @@ NTSTATUS WINAPI wow64_NtClose( UINT *args )
 NTSTATUS WINAPI wow64_NtContinueEx( UINT *args )
 {
     void *context = get_ptr( &args );
-    KCONTINUE_ARGUMENT *cont_args = get_ptr( &args );
+    ULONG cont_arg32 = get_ulong( &args );
+    /* a KCONTINUE_ARGUMENT address, or a small TestAlert boolean: only an address is widened */
+    KCONTINUE_ARGUMENT *cont_args = cont_arg32 > 0xff ? ULongToPtr( cont_arg32 ) : wow64_value( cont_arg32 );
 
     NTSTATUS status = get_context_return_value( context );
     struct user_apc_frame *frame = NtCurrentTeb()->TlsSlots[WOW64_TLS_APCLIST];
@@ -1488,7 +1490,7 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
         ctx32.i386.ContextFlags = CONTEXT_I386_ALL;
         pBTCpuGetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx32.i386 );
         if (code == -1) break;
-        int_rec.ExceptionAddress = (void *)(ULONG_PTR)ctx32.i386.Eip;
+        int_rec.ExceptionAddress = ULongToPtr( ctx32.i386.Eip );
         switch (code)
         {
         case 0x00:  /* division by zero */
@@ -1501,7 +1503,7 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
             break;
         case 0x03:  /* breakpoint */
             int_rec.ExceptionCode = EXCEPTION_BREAKPOINT;
-            int_rec.ExceptionAddress = (void *)(ULONG_PTR)(ctx32.i386.Eip - 1);
+            int_rec.ExceptionAddress = ULongToPtr( ctx32.i386.Eip - 1 );
             int_rec.NumberParameters = 1;
             break;
         case 0x04:  /* overflow */
@@ -1533,13 +1535,13 @@ NTSTATUS WINAPI Wow64RaiseException( int code, EXCEPTION_RECORD *rec )
             ctx32.i386.Eip += 3;
             pBTCpuSetContext( GetCurrentThread(), GetCurrentProcess(), NULL, &ctx32.i386 );
             int_rec.ExceptionCode    = EXCEPTION_BREAKPOINT;
-            int_rec.ExceptionAddress = (void *)(ULONG_PTR)ctx32.i386.Eip;
+            int_rec.ExceptionAddress = ULongToPtr( ctx32.i386.Eip );
             int_rec.NumberParameters = 1;
             int_rec.ExceptionInformation[0] = ctx32.i386.Eax;
             break;
         default:
             int_rec.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
-            int_rec.ExceptionAddress = (void *)(ULONG_PTR)ctx32.i386.Eip;
+            int_rec.ExceptionAddress = ULongToPtr( ctx32.i386.Eip );
             int_rec.NumberParameters = 2;
             int_rec.ExceptionInformation[1] = 0xffffffff;
             break;

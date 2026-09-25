@@ -1450,7 +1450,7 @@ NTSTATUS WINAPI wow64_NtSetInformationJobObject( UINT *args )
             JOBOBJECT_ASSOCIATE_COMPLETION_PORT32 *info32 = ptr;
             JOBOBJECT_ASSOCIATE_COMPLETION_PORT info;
 
-            info.CompletionKey  = ULongToPtr( info32->CompletionKey );
+            info.CompletionKey  = wow64_value( info32->CompletionKey );  /* an opaque key */
             info.CompletionPort = LongToHandle( info32->CompletionPort );
             return NtSetInformationJobObject( handle, class, &info, sizeof(info) );
         }
@@ -1664,7 +1664,7 @@ static BOOL filter_out_state_change( HANDLE handle, DBGUI_WAIT_STATE_CHANGE *sta
     switch (state->NewState)
     {
     case DbgLoadDllStateChange:
-        filter_out = ((ULONG64)state->StateInfo.LoadDll.BaseOfDll >> 32) != 0;
+        filter_out = (((ULONG64)state->StateInfo.LoadDll.BaseOfDll - wow64_base()) >> 32) != 0;
         if (!filter_out)
         {
             USHORT machine;
@@ -1672,7 +1672,7 @@ static BOOL filter_out_state_change( HANDLE handle, DBGUI_WAIT_STATE_CHANGE *sta
         }
         break;
     case DbgUnloadDllStateChange:
-        filter_out = ((ULONG_PTR)state->StateInfo.UnloadDll.BaseAddress >> 32) != 0;
+        filter_out = (((ULONG_PTR)state->StateInfo.UnloadDll.BaseAddress - wow64_base()) >> 32) != 0;
         break;
     default:
         filter_out = FALSE;

@@ -162,6 +162,7 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
                 OBJECT_ATTRIBUTES attr;
                 UNICODE_STRING path;
 
+                ret->Attributes[i].ValuePtr = ULongToPtr( attr32->Attributes[i].Value );  /* an address */
                 path.Length = ret->Attributes[i].Size;
                 path.Buffer = ret->Attributes[i].ValuePtr;
                 InitializeObjectAttributes( &attr, &path, OBJ_CASE_INSENSITIVE, 0, 0 );
@@ -171,6 +172,9 @@ static PS_ATTRIBUTE_LIST *ps_attributes_32to64( PS_ATTRIBUTE_LIST **attr, const 
                     ret->Attributes[i].ValuePtr = attr.ObjectName->Buffer;
                 }
             }
+            break;
+        case PS_ATTRIBUTE_GROUP_AFFINITY:
+            ret->Attributes[i].ValuePtr = ULongToPtr( attr32->Attributes[i].Value );  /* an address */
             break;
         case PS_ATTRIBUTE_HANDLE_LIST:
         case PS_ATTRIBUTE_JOB_LIST:
@@ -1084,11 +1088,18 @@ NTSTATUS WINAPI wow64_NtSetInformationThread( UINT *args )
         else return STATUS_INVALID_PARAMETER;
 
     case ThreadAffinityMask:  /* ULONG_PTR */
-    case ThreadQuerySetWin32StartAddress:   /* PRTL_THREAD_START_ROUTINE */
         if (len == sizeof(ULONG))
         {
             ULONG_PTR mask = *(ULONG *)ptr;
             return NtSetInformationThread( handle, class, &mask, sizeof(mask) );
+        }
+        else return STATUS_INVALID_PARAMETER;
+
+    case ThreadQuerySetWin32StartAddress:   /* PRTL_THREAD_START_ROUTINE, an address */
+        if (len == sizeof(ULONG))
+        {
+            ULONG_PTR start = (ULONG_PTR)ULongToPtr( *(ULONG *)ptr );
+            return NtSetInformationThread( handle, class, &start, sizeof(start) );
         }
         else return STATUS_INVALID_PARAMETER;
 

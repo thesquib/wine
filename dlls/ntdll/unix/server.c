@@ -857,7 +857,7 @@ unsigned int server_wait_for_object( HANDLE handle, BOOL alertable, const LARGE_
  */
 NTSTATUS WINAPI NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
-    return NtContinueEx( context, ULongToPtr(alertable) );
+    return NtContinueEx( context, wow64_value( alertable ) );
 }
 
 
