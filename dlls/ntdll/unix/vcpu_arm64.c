@@ -1468,6 +1468,18 @@ void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsig
 }
 
 /***********************************************************************
+ *           __wine_vcpu_mark_presenter
+ */
+void __wine_vcpu_mark_presenter(void)
+{
+    struct vcpu_thread *vt;
+
+    if (!vcpu_mn || !(vt = vcpu_current()) || vt->presenter) return;
+    vt->presenter = TRUE;
+    vel1_pool_add_flags( &vt->pool_member, VEL1_POOL_EXEMPT );  /* add_flags: set_flags would replace every flag */
+}
+
+/***********************************************************************
  *           __wine_user_shared_data
  *
  * The host's mapping of the KUSER_SHARED_DATA page (include/wine/unixlib.h): unix-side code in other libraries

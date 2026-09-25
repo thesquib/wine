@@ -3345,6 +3345,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     uint32_t blit_count = 0;
     VkSemaphore blit_sema;
 
+#if defined(__APPLE__) && defined(__aarch64__)
+    {
+        static __thread BOOL presenter;
+        if (!presenter)
+        {
+            presenter = TRUE;
+            __wine_vcpu_mark_presenter();
+        }
+    }
+#endif
     TRACE( "queue %p, present_info %p\n", queue, present_info );
 
     if (!(swapchains = mem_alloc( &pool, present_info->swapchainCount * sizeof(*swapchains) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;

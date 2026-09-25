@@ -84,6 +84,10 @@ NTSYSAPI BOOLEAN KeAddSystemServiceTable( ULONG_PTR *funcs, ULONG_PTR *counters,
  * replaces it. Call it right after KeAddSystemServiceTable. */
 NTSYSAPI void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsigned int count );
 
+/* arm64 vCPU mode M:N: mark the calling thread as a presenter (the render thread): the vCPU slot pool never takes
+ * its vCPU (release at a block point, preemption, unblock), so frame pacing never waits for a slot */
+NTSYSAPI void __wine_vcpu_mark_presenter(void);
+
 /* arm64 vCPU mode: NtMapViewOfSection allocation type for a view only unix-side code reads. The guest can only be
  * given a copy of a file (gmm maps anonymous memory), taken when the view is mapped; a section another process
  * keeps writing (the server's session shared memory) must therefore stay a host mapping to be read live. Never
