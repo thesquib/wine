@@ -361,6 +361,12 @@ static BOOL increase_try_map_step = TRUE;
 ULONG_PTR user_space_wow_limit = 0;
 struct _KUSER_SHARED_DATA *user_shared_data = (void *)0x7ffe0000;
 
+/* PMW_VCPU WoW64 (W1/W2): the 4 GiB window W that holds the 32-bit address space at host BASE + p. wow_window is set
+ * only once the process is known to be WoW64 (vcpu_wow_window_open): then 32-bit requests are placed in W and 64-bit
+ * searches skip it. NULL everywhere else, so the code below that tests it does nothing. */
+static char *wow_window;
+#define WOW_WINDOW_SIZE ((ULONG_PTR)1 << 32)
+
 /* TEB allocation blocks */
 static void *teb_block;
 static void **next_free_teb;
@@ -3421,6 +3427,47 @@ static void fixup_effective_user_space_limit( const void **effective_user_space_
  * Create a view and mmap the corresponding memory area.
  * virtual_mutex must be held by caller.
  */
+/***********************************************************************
+ *           wow_window_request
+ *
+ * PMW_VCPU W2, wow_window set: translate a search's limits and say whether it is a 32-bit request. A limit below 4 GiB
+ * is guest-relative (zero_bits, user_space_wow_limit, limit_2g/4g) and gets BASE added; a request whose high limit
+ * then lies in W is a 32-bit request and its low limit is raised to at least BASE. Anything else (no high limit, or
+ * one outside W) is a 64-bit request, which must never be given W.
+ */
+static BOOL wow_window_request( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
+{
+    const ULONG_PTR base = (ULONG_PTR)wow_window;
+
+    if (!*limit_high) return FALSE;
+    if (*limit_high < WOW_WINDOW_SIZE) *limit_high += base;
+    if (*limit_high < base || *limit_high >= base + WOW_WINDOW_SIZE) return FALSE;
+    if (*limit_low < WOW_WINDOW_SIZE) *limit_low += base;
+    if (*limit_low < base) *limit_low = base;
+    return TRUE;
+}
+
+/* a 64-bit request in a WoW64 vCPU process: search [start, end) without W, in the order asked for */
+static void *alloc_outside_wow_window( char *start, char *end, size_t size, BOOL top_down, int unix_prot,
+                                       size_t align_mask, BOOL guest )
+{
+    char *w = wow_window, *w_end = wow_window + WOW_WINDOW_SIZE;
+    char *below_end = min( end, w ), *above_start = max( start, w_end );
+    void *ptr = NULL;
+
+    if (top_down)
+    {
+        if (above_start < end) ptr = alloc_free_area( above_start, end, size, TRUE, unix_prot, align_mask, guest );
+        if (!ptr && start < below_end) ptr = alloc_free_area( start, below_end, size, TRUE, unix_prot, align_mask, guest );
+    }
+    else
+    {
+        if (start < below_end) ptr = alloc_free_area( start, below_end, size, FALSE, unix_prot, align_mask, guest );
+        if (!ptr && above_start < end) ptr = alloc_free_area( above_start, end, size, FALSE, unix_prot, align_mask, guest );
+    }
+    return ptr;
+}
+
 static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
                           unsigned int alloc_type, unsigned int vprot,
                           ULONG_PTR limit_low, ULONG_PTR limit_high, size_t align_mask )
@@ -3470,6 +3517,15 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
     guest = vcpu_mode && !(vprot & (VPROT_SYSTEM | VPROT_HOSTONLY));
     if (guest) unix_prot = PROT_READ | PROT_WRITE;
 
+    /* a WoW64 vCPU process: an explicit base below 4 GiB is a 32-bit address (a PE image's preferred base, the
+     * server's dynamic base); the 32-bit space lives at BASE + p */
+    if (wow_window && base && (ULONG_PTR)base < WOW_WINDOW_SIZE)
+    {
+        base = wow_window + (ULONG_PTR)base;
+        if (limit_high && limit_high < WOW_WINDOW_SIZE) limit_high += (ULONG_PTR)wow_window;
+        if (limit_low && limit_low < WOW_WINDOW_SIZE) limit_low += (ULONG_PTR)wow_window;
+    }
+
     if (base)
     {
         if (is_beyond_limit( base, size, address_space_limit )) return STATUS_WORKING_SET_LIMIT_RANGE;
@@ -3485,11 +3541,17 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         void *start = address_space_start;
         void *end = min( effective_user_space_limit, host_addr_space_limit );
         size_t host_size = ROUND_SIZE( 0, size, host_page_mask );
+        BOOL outside_window = wow_window && !wow_window_request( &limit_low, &limit_high );
 
         if (limit_low && (void *)limit_low > start) start = (void *)limit_low;
         if (limit_high && (void *)limit_high < end) end = (char *)limit_high + 1;
 
-        if (!(ptr = alloc_free_area( start, end, host_size, top_down, unix_prot, align_mask, guest )))
+        if (outside_window)
+        {
+            if (!(ptr = alloc_outside_wow_window( start, end, host_size, top_down, unix_prot, align_mask, guest )))
+                return STATUS_NO_MEMORY;
+        }
+        else if (!(ptr = alloc_free_area( start, end, host_size, top_down, unix_prot, align_mask, guest )))
         {
             WARN("Allocation failed, clearing native views.\n");
 
@@ -4576,6 +4638,16 @@ static NTSTATUS map_image_view( struct file_view **view_ret, struct pe_image_inf
 
     limit_low = max( limit_low, (ULONG_PTR)address_space_start );  /* make sure the DOS area remains free */
     if (!limit_high) limit_high = (ULONG_PTR)user_space_limit;
+    if (wow_window && image_info->base < limit_4g)
+    {
+        /* a 32-bit image in a WoW64 vCPU process: guest-relative limits, which map_view places in W */
+        ULONG_PTR wow_limit = get_wow_user_space_limit();
+
+        if (!wow_limit) wow_limit = limit_2g - 1;  /* the main image, mapped before init_peb sets the limit */
+
+        limit_low = 0;
+        limit_high = (limit_high < WOW_WINDOW_SIZE) ? min( limit_high, wow_limit ) : wow_limit;
+    }
 
     /* first try the specified base */
 
@@ -5492,6 +5564,8 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
  * commit anything in W. Returns the TEB block's address inside W, or NULL (then the caller places it as before).
  * PMW_VCPU_WOW64_WINDOW=0 turns it off.
  */
+static char *vcpu_wow_reserve, *vcpu_wow_block, *vcpu_wow_block_end;
+
 static void *vcpu_reserve_wow_window( SIZE_T total, SIZE_T block_size )
 {
     /* the block ends below the KUSER twin hole [BASE + 0x7ffe0000, +64K) and below BASE + 2 GiB (a 32-bit image
@@ -5527,7 +5601,51 @@ static void *vcpu_reserve_wow_window( SIZE_T total, SIZE_T block_size )
     }
     TRACE_(vcpu)( "WoW64 window %p-%p, low mirror set, first TEB block %p\n", base, (char *)base + size,
                   (char *)base + ((block_end - total) & ~(block_size - 1)) );
-    return (char *)base + ((block_end - total) & ~(block_size - 1));
+    vcpu_wow_reserve = base;
+    vcpu_wow_block = (char *)base + ((block_end - total) & ~(block_size - 1));
+    vcpu_wow_block_end = (char *)base + block_end;
+    return vcpu_wow_block;
+}
+
+/***********************************************************************
+ *           vcpu_wow_window_open
+ *
+ * W2: the process is WoW64 (init_peb set wow_peb). W becomes a Wine reserved area, so 32-bit allocations are mapped
+ * MAP_FIXED over Wine's own mapping (no macOS mmap hint involved) and a free re-reserves instead of unmapping. The W
+ * view is released around the TEB block and the KUSER twin hole [BASE + 0x7ffe0000, +64K), which stays a reserved
+ * view that no search can hand out (gmm refuses any thin call touching it). The released pieces were never committed,
+ * so gmm sees a uniform NONE.
+ */
+static void vcpu_wow_window_open(void)
+{
+    char *base = vcpu_wow_reserve;
+    struct { char *start, *end; } pieces[3];
+    sigset_t sigset;
+    unsigned int i, status;
+
+    if (wow_window) return;  /* opened for the main image already (virtual_prepare_wow_window) */
+    if (!base)
+    {
+        ERR( "vCPU: WoW64 process without a 32-bit window (PMW_VCPU_WOW64_WINDOW=0?): 32-bit code cannot run\n" );
+        return;
+    }
+    pieces[0].start = base;                 pieces[0].end = vcpu_wow_block;
+    pieces[1].start = vcpu_wow_block_end;   pieces[1].end = base + 0x7ffe0000;
+    pieces[2].start = base + 0x7fff0000;    pieces[2].end = base + WOW_WINDOW_SIZE;
+
+    virtual_mutex_enter( &sigset );
+    mmap_add_reserved_area( base, WOW_WINDOW_SIZE );
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < ARRAY_SIZE(pieces); i++)
+    {
+        void *addr = pieces[i].start;
+        SIZE_T size = pieces[i].end - pieces[i].start;
+
+        if ((status = NtFreeVirtualMemory( NtCurrentProcess(), &addr, &size, MEM_RELEASE )))
+            ERR( "vCPU: releasing %p-%p of the 32-bit window failed %08x\n", pieces[i].start, pieces[i].end, status );
+    }
+    wow_window = base;
+    TRACE_(vcpu)( "WoW64 process: window %p-%p open for 32-bit memory\n", base, base + WOW_WINDOW_SIZE );
 }
 #endif
 
@@ -6717,7 +6835,13 @@ void virtual_set_large_address_space(void)
                 free_reserved_memory( 0, (char *)0x7ffe0000 );
 #endif
         }
-        else user_space_wow_limit = (is_large_address_aware() ? limit_4g : limit_2g) - 1;
+        else
+        {
+            user_space_wow_limit = (is_large_address_aware() ? limit_4g : limit_2g) - 1;
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (vcpu_mode) vcpu_wow_window_open();
+#endif
+        }
     }
     else
     {
@@ -6725,6 +6849,19 @@ void virtual_set_large_address_space(void)
         free_reserved_memory( (char *)0x80000000, address_space_limit );
     }
     user_space_limit = working_set_limit = address_space_limit;
+}
+
+
+/***********************************************************************
+ *           virtual_prepare_wow_window
+ *
+ * The server says the main image is 32-bit: in vCPU mode, open the WoW64 window before the image is mapped.
+ */
+void virtual_prepare_wow_window(void)
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (vcpu_mode) vcpu_wow_window_open();
+#endif
 }
 
 
@@ -6939,7 +7076,7 @@ static NTSTATUS get_extended_params( const MEM_EXTENDED_PARAMETER *parameters, U
             MEM_ADDRESS_REQUIREMENTS *r = parameters[i].Pointer;
             ULONG_PTR limit;
 
-            if (is_wow64()) limit = get_wow_user_space_limit();
+            if (is_wow64()) limit = get_wow_user_space_limit() + (ULONG_PTR)wow_window;  /* wow64 widened them */
             else limit = (ULONG_PTR)user_space_limit;
 
             if (r->Alignment)

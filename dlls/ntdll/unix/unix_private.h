@@ -352,6 +352,7 @@ extern NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buff
 extern void virtual_set_force_exec( BOOL enable );
 extern void virtual_enable_write_exceptions( BOOL enable );
 extern void virtual_set_large_address_space(void);
+extern void virtual_prepare_wow_window(void);
 extern void virtual_fill_image_information( const struct pe_image_info *pe_info,
                                             SECTION_IMAGE_INFORMATION *info );
 extern void *get_builtin_so_handle( void *module );

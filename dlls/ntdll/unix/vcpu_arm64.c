@@ -1629,8 +1629,9 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
         }
     }
     if (!vcpu_exit_to_exception( e, frame, &rec, &pc_adjust )) vcpu_fatal_exit( vt, e, frame );
-    TRACE( "fault %s code %#x at %p (far %#llx)\n", vel1_fault_class_name( e->fclass ), (UINT)rec.ExceptionCode,
-           rec.ExceptionAddress, (unsigned long long)e->far );
+    TRACE( "fault %s code %#x at %p (far %#llx) lr %#llx sp %#llx\n", vel1_fault_class_name( e->fclass ),
+           (UINT)rec.ExceptionCode, rec.ExceptionAddress, (unsigned long long)e->far, (unsigned long long)frame->lr,
+           (unsigned long long)frame->sp );
     if (rec.ExceptionCode == STATUS_ACCESS_VIOLATION && !virtual_handle_fault( &rec, (void *)frame->sp ))
     {
         if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_HANDLED];
