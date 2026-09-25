@@ -28,11 +28,23 @@ extern int vcpu_mode;
 extern void vcpu_init_process(void);
 extern void vcpu_start_kuser_publisher( const void *src );
 extern void vcpu_thread_exit(void);
+/* M:N block points (spec §6): server.c's wait_select_reply, sync.c's NtDelayExecution and NtWaitForAlertByThreadId */
+enum { VCPU_BLOCK_NONE, VCPU_BLOCK_PIPE, VCPU_BLOCK_FUTEX };
+#define VCPU_UNBLOCK_COOKIE 1  /* a wake_up_reply cookie no real wait uses (those are pointers; 0 kills the thread) */
+extern BOOL vcpu_block_begin( int kind, const LONG *word );
+extern void vcpu_block_end(void);
+extern void vcpu_block_rearm(void);
+extern void vcpu_futex_wake_word( const LONG *word );
 #else
 #define vcpu_mode 0
 static inline void vcpu_init_process(void) {}
 static inline void vcpu_start_kuser_publisher( const void *src ) {}
 static inline void vcpu_thread_exit(void) {}
+#define VCPU_UNBLOCK_COOKIE 1
+enum { VCPU_BLOCK_NONE, VCPU_BLOCK_PIPE, VCPU_BLOCK_FUTEX };
+static inline BOOL vcpu_block_begin( int kind, const LONG *word ) { return FALSE; }
+static inline void vcpu_block_end(void) {}
+static inline void vcpu_block_rearm(void) {}
 #endif
 
 /* PMW_VCPU_PROF (vcpu_arm64.c): time spent inside host-side paths, reported as "in:" rows (nested inside the
