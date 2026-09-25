@@ -1083,9 +1083,9 @@ static void vcpu_pool_line( char *buf, size_t size )
     vel1_pool_stats st;
 
     vel1_pool_get_stats( &vcpu_pool, &st );
-    snprintf( buf, size, "pool: free %u holders %u waiters %u | acquires %llu (waited %llu, %.1f ms total, max %.1f "
+    snprintf( buf, size, "pool: slots %u free %u holders %u waiters %u | acquires %llu (waited %llu, %.1f ms total, max %.1f "
               "ms) | releases %llu (block %llu, preempt %llu) preempts %llu unblocks %llu | threads %d (peak %d)",
-              st.free_now, st.holders_now, st.waiters_now, (unsigned long long)st.acquires,
+              vcpu_pool.cfg.slots, st.free_now, st.holders_now, st.waiters_now, (unsigned long long)st.acquires,
               (unsigned long long)st.acquire_waits, st.total_wait_ns / 1e6, st.max_wait_ns / 1e6,
               (unsigned long long)st.releases, (unsigned long long)atomic_load( &prof_rel_block ),
               (unsigned long long)atomic_load( &prof_rel_preempt ), (unsigned long long)st.preempts,
@@ -1322,17 +1322,14 @@ BOOL vcpu_block_begin( int kind, const LONG *word )
 void vcpu_block_end(void)
 {
     struct vcpu_thread *vt;
-    sigset_t old;
 
     if (!vcpu_mn || !(vt = vcpu_current()) || !vt->block_depth) return;
     if (--vt->block_depth) return;  /* the end of a nested block point */
     atomic_store( &vt->block_kind, VCPU_BLOCK_NONE );
     atomic_store( &vt->block_word, NULL );
     vel1_pool_note_block_end( &vt->pool_member );
-    block_all_signals( &old );  /* note_wait takes the pool lock: see vcpu_block_decide */
-    if (!sigismember( &old, SIGUSR1 ))
+    if (!vcpu_in_handler_mask())
         vel1_pool_note_wait( &vcpu_pool, &vt->pool_member, vel1_pool_now_ns() - vt->block_start );
-    pthread_sigmask( SIG_SETMASK, &old, NULL );
 }
 
 /* the wait was interrupted by the monitor's unblock: decide again (a waiter exists, so this releases) and wait on.
@@ -2105,7 +2102,15 @@ void vcpu_init_process(void)
     if (vcpu_mn)
     {
         vel1_pool_cfg pc = VEL1_POOL_CFG_DEFAULT;
+        int slots;
 
+        /* test knob, off by default: PMW_VCPU_MN_SLOTS=<n> shrinks the pool to n slots (2 to 63) so that even a small
+         * process must release and re-acquire vCPUs constantly. It can only reduce: 63 is what HVF allows */
+        if ((env = getenv( "PMW_VCPU_MN_SLOTS" )) && (slots = atoi( env )) > 0)
+        {
+            pc.slots = slots < 2 ? 2 : slots > (int)pc.slots ? pc.slots : slots;
+            if (pc.low_water > pc.slots) pc.low_water = pc.slots;
+        }
         if ((ret = vel1_pool_init( &vcpu_pool, &pc ))) vcpu_fatal( "vel1_pool_init: %d\n", ret );
         block_all_signals( &old );  /* the monitor thread inherits this (R10) */
         ret = vel1_pool_monitor_start2( &vcpu_pool, vcpu_pool_kick, vcpu_pool_unblock, NULL );
