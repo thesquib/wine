@@ -73,6 +73,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "vcpu_arm64.h"
 
 #include "fsync.h"
 #ifdef __APPLE__
@@ -2614,6 +2615,34 @@ NTSTATUS WINAPI NtYieldExecution(void)
 }
 
 
+/* NtDelayExecution's sleep. Under M:N (vcpu_block_begin said so) it also watches the thread's wait pipe, where the
+ * pool's monitor writes an unblock: the thread then decides again (releasing its vCPU slot) and sleeps on. Returns
+ * select()'s result; an unblock reads as -1/EINTR so the caller recomputes the time left. */
+static int delay_select( BOOL *watch, struct timeval *tv )
+{
+    int fd = ntdll_get_thread_data()->wait_fd[0], ret;
+    struct wake_up_reply reply;
+    fd_set rfds;
+
+    if (!*watch) return select( 0, NULL, NULL, NULL, tv );
+    FD_ZERO( &rfds );
+    FD_SET( fd, &rfds );
+    if ((ret = select( fd + 1, &rfds, NULL, NULL, tv )) <= 0) return ret;
+    if (read( fd, &reply, sizeof(reply) ) == sizeof(reply))
+    {
+        if (reply.cookie == VCPU_UNBLOCK_COOKIE) vcpu_block_rearm();
+        else
+        {
+            /* not ours: put it back for its own wait, and stop watching (it would read as ready forever) */
+            write( ntdll_get_thread_data()->wait_fd[1], &reply, sizeof(reply) );
+            *watch = FALSE;
+        }
+    }
+    errno = EINTR;
+    return -1;
+}
+
+
 /******************************************************************
  *		NtDelayExecution (NTDLL.@)
  */
@@ -2654,12 +2683,14 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE)  /* sleep forever */
     {
-        for (;;) select( 0, NULL, NULL, NULL, NULL );
+        BOOL watch = vcpu_block_begin( VCPU_BLOCK_PIPE, NULL );
+        for (;;) delay_select( &watch, NULL );
     }
     else
     {
         LARGE_INTEGER now;
         timeout_t when, diff;
+        BOOL tracked, watch;
 
         if ((when = timeout->QuadPart) < 0)
         {
@@ -2672,6 +2703,8 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
         status = NtYieldExecution();
         if (!when) return status;
 
+        tracked = vcpu_block_begin( VCPU_BLOCK_PIPE, NULL );  /* watch can drop to FALSE if a foreign reply is put back */
+        watch = tracked;
         for (;;)
         {
             struct timeval tv;
@@ -2680,8 +2713,9 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
             if (diff <= 0) break;
             tv.tv_sec  = diff / 1000000;
             tv.tv_usec = diff % 1000000;
-            if (select( 0, NULL, NULL, NULL, &tv ) != -1) break;
+            if (delay_select( &watch, &tv ) != -1) break;
         }
+        if (tracked) vcpu_block_end();
     }
     return STATUS_SUCCESS;
 }
