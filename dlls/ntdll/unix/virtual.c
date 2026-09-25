@@ -107,6 +107,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
 WINE_DECLARE_DEBUG_CHANNEL(module);
 WINE_DECLARE_DEBUG_CHANNEL(virtual_ranges);
 WINE_DECLARE_DEBUG_CHANNEL(virtstat);
+WINE_DECLARE_DEBUG_CHANNEL(vcpu);
 
 /* Gdb integration, in loader/main.c */
 static struct r_debug *wine_r_debug;
@@ -5477,6 +5478,59 @@ static TEB *init_teb( void *ptr, BOOL is_wow )
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           vcpu_reserve_wow_window
+ *
+ * vCPU mode, WoW64 W1 (proton-darwin docs/macos/wow64-w1-design-2026-09-25.md): the 32-bit address space of a
+ * WoW64 process lives at host [BASE, BASE + 4 GiB), and gmm mirrors it at the guest's [0, 4 GiB). TEB32 must lie
+ * in it, and the first TEB block is allocated here, before the server tells us the image's machine. So every vCPU
+ * process reserves a 4 GiB-aligned window W (a fixed base is unreliable on macOS, an aligned search is not), sets
+ * gmm's low mirror to it, and puts the first TEB block in it. W stays reserved for the life of the process, WoW64
+ * or not (choice (i): releasing pieces of it would let 64-bit allocations land in W and hit the KUSER twin hole).
+ * Order, as gmm v9 requires: reserve W (its view is a uniform NONE, no gmm record), gmm_set_low_mirror, only then
+ * commit anything in W. Returns the TEB block's address inside W, or NULL (then the caller places it as before).
+ * PMW_VCPU_WOW64_WINDOW=0 turns it off.
+ */
+static void *vcpu_reserve_wow_window( SIZE_T total, SIZE_T block_size )
+{
+    /* the block ends below the KUSER twin hole [BASE + 0x7ffe0000, +64K) and below BASE + 2 GiB (a 32-bit image
+     * that is not large-address-aware sees only the low 2 GiB) */
+    static const ULONG_PTR block_end = 0x7ff00000;
+    const char *env = getenv( "PMW_VCPU_WOW64_WINDOW" );
+    MEM_ADDRESS_REQUIREMENTS req = { 0 };
+    MEM_EXTENDED_PARAMETER ext = { 0 };
+    SIZE_T size = (SIZE_T)1 << 32, zero = 0;
+    void *base = NULL;
+    unsigned int status;
+    int ret;
+
+    if (env && !strcmp( env, "0" )) return NULL;
+    req.Alignment = size;
+    ext.Type = MemExtendedParameterAddressRequirements;
+    ext.Pointer = &req;
+    if ((status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size, MEM_RESERVE, PAGE_NOACCESS, &ext, 1 )))
+    {
+        ERR( "vCPU: no 4 GiB-aligned window for the 32-bit address space: %08x\n", status );
+        return NULL;
+    }
+    {
+        VCPU_GMM_BEGIN();
+        ret = gmm_set_low_mirror( vcpu_gmm(), (UINT_PTR)base );
+        VCPU_GMM_END();
+    }
+    if (ret)
+    {
+        ERR( "vCPU: gmm_set_low_mirror(%p) failed %d, window released\n", base, ret );
+        NtFreeVirtualMemory( NtCurrentProcess(), &base, &zero, MEM_RELEASE );
+        return NULL;
+    }
+    TRACE_(vcpu)( "WoW64 window %p-%p, low mirror set, first TEB block %p\n", base, (char *)base + size,
+                  (char *)base + ((block_end - total) & ~(block_size - 1)) );
+    return (char *)base + ((block_end - total) & ~(block_size - 1));
+}
+#endif
+
 /***********************************************************************
  *           virtual_alloc_first_teb
  */
@@ -5511,10 +5565,14 @@ TEB *virtual_alloc_first_teb(void)
         }
     }
 
-    /* the 64-bit TEB/PEB block goes below 2 GiB for the 32-bit views; the vCPU mode is 64-bit only and has no
-     * address space there */
-    NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 && !vcpu_mode ? limit_2g - 1 : 0, &total,
-                             MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
+    /* the 64-bit TEB/PEB block goes below 2 GiB for the 32-bit views; the vCPU mode has no address space there and
+     * puts it in the 32-bit window instead, reserved as part of the window (vcpu_reserve_wow_window) */
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (vcpu_mode) teb_block = vcpu_reserve_wow_window( total, block_size );
+#endif
+    if (!teb_block)
+        NtAllocateVirtualMemory( NtCurrentProcess(), &teb_block, is_win64 && !vcpu_mode ? limit_2g - 1 : 0, &total,
+                                 MEM_RESERVE | MEM_TOP_DOWN, PAGE_READWRITE );
     teb_block_pos = 30;
     ptr = (char *)teb_block + 30 * block_size;
     data_size = 2 * block_size;
