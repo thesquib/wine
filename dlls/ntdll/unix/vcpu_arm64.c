@@ -62,6 +62,7 @@
 #include "wine/unixlib.h"
 #include "unix_private.h"
 #include "vcpu_arm64.h"
+#include "vcpu/vel1_pool.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vcpu);
@@ -71,6 +72,14 @@ extern void trace_usercall( UINT id, ULONG_PTR *args, ULONG len );
 extern void trace_userret( void *ret_ptr, ULONG len, NTSTATUS status, UINT id );
 
 int vcpu_mode;
+/* M:N (docs/macos/vcpu-mn-release-on-block-design-2026-09-25.md): threads share the pool's 63 vCPU slots and give
+ * theirs back at a block point, so a process may run more than 63 threads. Default on; PMW_VCPU_MN=0 turns it off,
+ * which is exactly the old one-vCPU-per-thread mode. */
+static int vcpu_mn;
+static vel1_pool vcpu_pool;
+static _Atomic int prof_threads_live, prof_threads_peak;
+static _Atomic uint64_t prof_rel_block, prof_rel_preempt;
+static void vcpu_pool_line( char *buf, size_t size );  /* prof_thread, above its definition, prints it */
 int vcpu_check_s2;
 int vcpu_sect_alias;
 int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm-backed sections alias one object across processes */
@@ -918,6 +927,20 @@ struct vcpu_thread
     uint64_t            exits, syscalls, unix_calls, faults, kicks, kick_failures;
     uint64_t            unknown_exits; /* HV_EXIT_REASON_UNKNOWN exits re-entered (see vcpu_run) */
     unsigned int        unknown_run;   /* ... of them in a row, with no other exit in between */
+    vel1_pool_member    pool_member;   /* M:N: this thread's pool record; valid until vel1_pool_member_fini (R10) */
+    vel1_ctx            ctx;           /* M:N: the guest context while the thread holds no vCPU */
+    vel1_vcpu_cfg       cfg;           /* M:N: the create config, for every re-create (restore overwrites pc/sp) */
+    BOOL                has_vcpu;      /* always TRUE without M:N */
+    BOOL                stranded;      /* a vel1_vcpu_destroy failed: the slot is lost for good (D16) */
+    BOOL                preempt;       /* vel1_pool_take_preempt said so; acted on at the next preempt point */
+    BOOL                presenter;     /* __wine_vcpu_mark_presenter: EXEMPT, never released */
+    int                 unblock_fd;    /* the write end of this thread's wait pipe (the monitor's pipe wake) */
+    atomic_int          unblock_pending;  /* one unblock message in flight at most */
+    atomic_int          block_kind;    /* VCPU_BLOCK_NONE / _PIPE / _FUTEX: how the monitor can wake the wait */
+    const LONG *_Atomic block_word;    /* the futex word of a VCPU_BLOCK_FUTEX wait */
+    uint64_t            block_start;   /* vel1_pool_now_ns() at the block point */
+    unsigned int        block_depth;   /* nested block points (a suspend's server wait inside usr1_handler, inside a
+                                          wait): only the outermost one is tracked */
     uint64_t            prof_mark;     /* PMW_VCPU_PROF: when the last exit came back to the host */
     struct prof_bucket *prof_charge;   /* PMW_VCPU_PROF: what the host time since then is spent on */
     BOOL                prof_unix;     /* PMW_VCPU_PROF: that is a unix call */
@@ -1047,6 +1070,93 @@ static void DECLSPEC_NORETURN vcpu_fatal_exit( struct vcpu_thread *vt, const vel
 {
     vcpu_dump_exit( "fatal exit", vt, e, frame );
     abort_process( 1 );
+}
+
+static void vcpu_pool_line( char *buf, size_t size )
+{
+    vel1_pool_stats st;
+
+    vel1_pool_get_stats( &vcpu_pool, &st );
+    snprintf( buf, size, "pool: free %u holders %u waiters %u | acquires %llu (waited %llu, %.1f ms total, max %.1f "
+              "ms) | releases %llu (block %llu, preempt %llu) preempts %llu unblocks %llu | threads %d (peak %d)",
+              st.free_now, st.holders_now, st.waiters_now, (unsigned long long)st.acquires,
+              (unsigned long long)st.acquire_waits, st.total_wait_ns / 1e6, st.max_wait_ns / 1e6,
+              (unsigned long long)st.releases, (unsigned long long)atomic_load( &prof_rel_block ),
+              (unsigned long long)atomic_load( &prof_rel_preempt ), (unsigned long long)st.preempts,
+              (unsigned long long)st.unblocks, atomic_load( &prof_threads_live ), atomic_load( &prof_threads_peak ));
+}
+
+/* wait for a slot. Every signal blocked: a thread killed while queued would leave a dead member in the FIFO */
+static void vcpu_pool_acquire( struct vcpu_thread *vt )
+{
+    sigset_t old;
+    int ret;
+
+    block_all_signals( &old );
+    ret = vel1_pool_acquire( &vcpu_pool, &vt->pool_member );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    if (ret) vcpu_fatal( "vel1_pool_acquire for thread %04x failed %d\n", (UINT)GetCurrentThreadId(), ret );
+}
+
+static void vcpu_note_vcpu_up(void)
+{
+    int live = atomic_fetch_add( &prof_vcpus_live, 1 ) + 1, peak = atomic_load( &prof_vcpus_peak );
+    while (live > peak && !atomic_compare_exchange_weak( &prof_vcpus_peak, &peak, live )) ;
+}
+
+/* M:N: make sure the thread holds a vCPU before any vel1_* call on it (spec §5). Called with in_syscall set */
+static void vcpu_ensure( struct vcpu_thread *vt )
+{
+    sigset_t old;
+    int ret;
+
+    if (vt->has_vcpu) return;
+    vcpu_pool_acquire( vt );
+    block_all_signals( &old );  /* nothing may interrupt the create and restore (HVF, vel1 locks) */
+    ret = vcpu_create( &vt->vcpu, &vt->cfg );
+    if (!ret) ret = vel1_ctx_restore( &vt->vcpu, &vt->ctx );
+    if (ret)
+    {
+        char line[256];
+        vcpu_pool_line( line, sizeof(line) );
+        vcpu_fatal( "vCPU re-create for thread %04x failed %d (hv %#x); %s\n", (UINT)GetCurrentThreadId(), ret,
+                    vt->vcpu.last_hv_err, line );
+    }
+    vt->has_vcpu = TRUE;
+    vcpu_note_vcpu_up();
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
+/* M:N: give the vCPU and the slot back, the context into vt->ctx. The caller blocks signals. Destroy before release,
+ * always: the other order would let a waiter create while this vCPU still exists. FALSE: nothing was released */
+static BOOL vcpu_release( struct vcpu_thread *vt )
+{
+    int ret;
+
+    if (!vt->has_vcpu || vt->hv_depth || vt->presenter) return FALSE;
+    if (vel1_ctx_save( &vt->vcpu, &vt->ctx )) return FALSE;
+    if ((ret = vel1_vcpu_destroy( &vt->vcpu )))
+    {
+        vt->stranded = TRUE;
+        vcpu_fatal( "vel1_vcpu_destroy for thread %04x failed %d: its slot is lost (D16)\n",
+                    (UINT)GetCurrentThreadId(), ret );
+    }
+    vt->has_vcpu = FALSE;
+    atomic_fetch_sub( &prof_vcpus_live, 1 );
+    vel1_pool_release( &vcpu_pool, &vt->pool_member );
+    return TRUE;
+}
+
+/* the monitor's callbacks: under the pool lock, never block, never call the pool (R10) */
+static void vcpu_pool_kick( vel1_pool_member *m, void *arg )
+{
+    struct vcpu_thread *vt = CONTAINING_RECORD( m, struct vcpu_thread, pool_member );
+    vel1_kick_remote( &vt->vcpu );  /* victims are inside vel1_run; vel1 re-checks liveness under its own lock */
+}
+
+static void vcpu_pool_unblock( vel1_pool_member *m, void *arg )
+{
+    /* Task 4 fills this in */
 }
 
 static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
@@ -1533,25 +1643,37 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
 {
     struct vcpu_thread *vt = calloc( 1, sizeof(*vt) );
     struct vcpu_level level;
-    vel1_vcpu_cfg cfg;
     int ret;
 
     if (!vt) vcpu_fatal( "out of memory for thread %04x\n", (UINT)GetCurrentThreadId() );
-    memset( &cfg, 0, sizeof(cfg) );
-    cfg.ttbr0 = gmm_ttbr0( gmm );
-    cfg.blob_va = vcpu_blob_va();
-    cfg.sp_el1 = frame->sp;
-    cfg.pc = frame->pc;
-    cfg.cpsr = frame->cpsr;
-    cfg.x0 = frame->x[0];
+    memset( &vt->cfg, 0, sizeof(vt->cfg) );
+    vt->cfg.ttbr0 = gmm_ttbr0( gmm );
+    vt->cfg.blob_va = vcpu_blob_va();
+    vt->cfg.sp_el1 = frame->sp;
+    vt->cfg.pc = frame->pc;
+    vt->cfg.cpsr = frame->cpsr;
+    vt->cfg.x0 = frame->x[0];
     vcpu_block_signals( NULL );  /* no SIGQUIT between the create and the publish; vcpu_store_full unblocks */
-    if ((ret = vcpu_create( &vt->vcpu, &cfg )))
-        vcpu_fatal( "vel1_vcpu_create for thread %04x failed %d (hv %#x; at most %u vCPUs per process, %d live)\n",
-                    (UINT)GetCurrentThreadId(), ret, vt->vcpu.last_hv_err, VEL1_MAX_VCPUS - 1,
-                    atomic_load( &prof_vcpus_live ));
+    vt->unblock_fd = ntdll_get_thread_data()->wait_fd[1];
+    if (vcpu_mn)
     {
-        int live = atomic_fetch_add( &prof_vcpus_live, 1 ) + 1, peak = atomic_load( &prof_vcpus_peak );
-        while (live > peak && !atomic_compare_exchange_weak( &prof_vcpus_peak, &peak, live )) ;
+        if ((ret = vel1_pool_member_init( &vcpu_pool, &vt->pool_member, 0 )))
+            vcpu_fatal( "vel1_pool_member_init for thread %04x failed %d\n", (UINT)GetCurrentThreadId(), ret );
+        vcpu_pool_acquire( vt );
+    }
+    if ((ret = vcpu_create( &vt->vcpu, &vt->cfg )))
+    {
+        char line[256] = "";
+        if (vcpu_mn) vcpu_pool_line( line, sizeof(line) );
+        vcpu_fatal( "vel1_vcpu_create for thread %04x failed %d (hv %#x; at most %u vCPUs per process, %d live) %s\n",
+                    (UINT)GetCurrentThreadId(), ret, vt->vcpu.last_hv_err, VEL1_MAX_VCPUS - 1,
+                    atomic_load( &prof_vcpus_live ), line );
+    }
+    vt->has_vcpu = TRUE;
+    vcpu_note_vcpu_up();
+    {
+        int live = atomic_fetch_add( &prof_threads_live, 1 ) + 1, peak = atomic_load( &prof_threads_peak );
+        while (live > peak && !atomic_compare_exchange_weak( &prof_threads_peak, &peak, live )) ;
     }
     pthread_setspecific( vcpu_key, vt );
     atomic_store( &vt->in_syscall, 1 );
@@ -1721,10 +1843,24 @@ void vcpu_thread_exit(void)
         pthread_sigmask( SIG_BLOCK, &all, NULL );
     }
     pthread_setspecific( vcpu_key, NULL );
-    atomic_fetch_sub( &prof_vcpus_live, 1 );
+    atomic_fetch_sub( &prof_threads_live, 1 );
     if (vt->wait_t0) atomic_fetch_sub( &prof_parked, 1 );  /* ended inside a wait (NtTerminateThread) */
-    if ((ret = vel1_vcpu_destroy( &vt->vcpu ))) ERR( "vel1_vcpu_destroy failed %d\n", ret );
-    else free( vt );
+    if (vt->has_vcpu)
+    {
+        if ((ret = vel1_vcpu_destroy( &vt->vcpu )))
+        {
+            ERR( "vel1_vcpu_destroy failed %d: the slot stays taken (D16)\n", ret );
+            return;  /* stranded: vt stays allocated, the monitor may still walk its member */
+        }
+        atomic_fetch_sub( &prof_vcpus_live, 1 );
+        if (vcpu_mn) vel1_pool_release( &vcpu_pool, &vt->pool_member );
+    }
+    if (vcpu_mn && (ret = vel1_pool_member_fini( &vcpu_pool, &vt->pool_member )))
+    {
+        ERR( "vel1_pool_member_fini failed %d\n", ret );
+        return;
+    }
+    free( vt );
 }
 
 /***********************************************************************
@@ -1808,6 +1944,21 @@ void vcpu_init_process(void)
     ret = tlbi_status;
     pthread_mutex_unlock( &tlbi_mutex );
     if (ret) vcpu_fatal( "TLBI executor vCPU failed\n" );
+
+    vcpu_mn = vcpu_mode == 1 && !((env = getenv( "PMW_VCPU_MN" )) && atoi( env ) <= 0);
+    if (vcpu_mn)
+    {
+        vel1_pool_cfg pc = VEL1_POOL_CFG_DEFAULT;
+
+        if ((ret = vel1_pool_init( &vcpu_pool, &pc ))) vcpu_fatal( "vel1_pool_init: %d\n", ret );
+        block_all_signals( &old );  /* the monitor thread inherits this (R10) */
+        ret = vel1_pool_monitor_start2( &vcpu_pool, vcpu_pool_kick, vcpu_pool_unblock, NULL );
+        pthread_sigmask( SIG_SETMASK, &old, NULL );
+        if (ret) vcpu_fatal( "vel1_pool_monitor_start2: %d\n", ret );
+        TRACE( "M:N on: %u slots, low_water %u, sleepy %llu ms, quantum %llu ms\n", pc.slots, pc.low_water,
+               (unsigned long long)pc.sleepy_ns / 1000000, (unsigned long long)pc.quantum_ns / 1000000 );
+    }
+    else TRACE( "M:N off (PMW_VCPU_MN=0)\n" );
 
     TRACE( "VM up in %.1f us: IPA %u bits (max %u), hardware TSO %s, sys page %p, KUSER host %p\n",
            ticks_to_us( mach_absolute_time() - start ), info.ipa_bits, info.max_ipa_bits,
