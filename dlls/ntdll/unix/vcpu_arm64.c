@@ -1117,8 +1117,12 @@ static void vcpu_ensure( struct vcpu_thread *vt )
     int ret;
 
     if (vt->has_vcpu) return;
+    /* one blocked region from before the wait for a slot until the vCPU exists: a kill or suspend landing between the
+     * grant and the create would run a handler on a thread that holds a slot but no vCPU (the slot would leak in
+     * vcpu_thread_exit, which releases only what a vCPU holds). Nothing may interrupt the create and restore either
+     * (HVF, vel1 locks). */
+    block_all_signals( &old );
     vcpu_pool_acquire( vt );
-    block_all_signals( &old );  /* nothing may interrupt the create and restore (HVF, vel1 locks) */
     ret = vcpu_create( &vt->vcpu, &vt->cfg );
     if (!ret) ret = vel1_ctx_restore( &vt->vcpu, &vt->ctx );
     if (ret)
@@ -1288,12 +1292,14 @@ static void vcpu_block_decide( struct vcpu_thread *vt )
     BOOL released = FALSE;
 
     if (!vt->has_vcpu) return;
-    /* spec §5: release only while in_syscall is 1 (signal handlers then take the frame path, which needs no vCPU) */
-    if (atomic_load( &vt->in_syscall ) && !vcpu_in_handler_mask() && !vt->hv_depth && !vt->presenter &&
-        vel1_pool_should_release( &vcpu_pool, &vt->pool_member ))
+    /* spec §5: release only while in_syscall is 1 (signal handlers then take the frame path, which needs no vCPU).
+     * Every signal is blocked across the pool calls: vel1_pool_should_release takes the pool lock, and a kill landing
+     * inside it would run vcpu_thread_exit's pool calls in the handler and lock it a second time */
+    if (atomic_load( &vt->in_syscall ) && !vt->hv_depth && !vt->presenter)
     {
         block_all_signals( &old );
-        released = vcpu_release( vt );
+        if (!sigismember( &old, SIGUSR1 ) && vel1_pool_should_release( &vcpu_pool, &vt->pool_member ))
+            released = vcpu_release( vt );
         pthread_sigmask( SIG_SETMASK, &old, NULL );
         if (released) atomic_fetch_add( &prof_rel_block, 1 );
     }
@@ -1316,14 +1322,17 @@ BOOL vcpu_block_begin( int kind, const LONG *word )
 void vcpu_block_end(void)
 {
     struct vcpu_thread *vt;
+    sigset_t old;
 
     if (!vcpu_mn || !(vt = vcpu_current()) || !vt->block_depth) return;
     if (--vt->block_depth) return;  /* the end of a nested block point */
     atomic_store( &vt->block_kind, VCPU_BLOCK_NONE );
     atomic_store( &vt->block_word, NULL );
     vel1_pool_note_block_end( &vt->pool_member );
-    if (!vcpu_in_handler_mask())
+    block_all_signals( &old );  /* note_wait takes the pool lock: see vcpu_block_decide */
+    if (!sigismember( &old, SIGUSR1 ))
         vel1_pool_note_wait( &vcpu_pool, &vt->pool_member, vel1_pool_now_ns() - vt->block_start );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
 }
 
 /* the wait was interrupted by the monitor's unblock: decide again (a waiter exists, so this releases) and wait on.
