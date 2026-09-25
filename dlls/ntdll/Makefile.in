@@ -74,6 +74,7 @@ SOURCES = \
 	unix/vcpu_el1_live_arm64.c \
 	unix/vcpu_gmm_arm64.c \
 	unix/vcpu_gmm_walk_arm64.c \
+	unix/vcpu_pool_arm64.c \
 	unix/vcpu_pure_arm64.c \
 	unix/vcpu_shims_arm64.c \
 	unix/virtual.c \
