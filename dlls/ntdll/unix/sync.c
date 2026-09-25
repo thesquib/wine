@@ -2626,18 +2626,34 @@ NTSTATUS WINAPI NtYieldExecution(void)
 
 /* NtDelayExecution's sleep. Under M:N (vcpu_block_begin said so) it also watches the thread's wait pipe, where the
  * pool's monitor writes an unblock: the thread then decides again (releasing its vCPU slot) and sleeps on. Returns
- * select()'s result; an unblock reads as -1/EINTR so the caller recomputes the time left. */
+ * select()'s result; an unblock reads as -1/EINTR so the caller recomputes the time left. select() cannot watch an fd
+ * >= FD_SETSIZE (FD_SET would write past the fd_set): a process with hundreds of threads has such wait pipes, and
+ * those use poll(), whose timeout is in whole milliseconds. */
 static int delay_select( BOOL *watch, struct timeval *tv )
 {
-    int fd = ntdll_get_thread_data()->wait_fd[0], ret;
+    int fd = ntdll_get_thread_data()->wait_fd[0], ret, avail = 0;
     struct wake_up_reply reply;
-    fd_set rfds;
 
     if (!*watch) return select( 0, NULL, NULL, NULL, tv );
-    FD_ZERO( &rfds );
-    FD_SET( fd, &rfds );
-    if ((ret = select( fd + 1, &rfds, NULL, NULL, tv )) <= 0) return ret;
-    if (read( fd, &reply, sizeof(reply) ) == sizeof(reply))
+    if (fd < FD_SETSIZE)
+    {
+        fd_set rfds;
+
+        FD_ZERO( &rfds );
+        FD_SET( fd, &rfds );
+        ret = select( fd + 1, &rfds, NULL, NULL, tv );
+    }
+    else
+    {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+        ret = poll( &pfd, 1, tv ? tv->tv_sec * 1000 + (tv->tv_usec + 999) / 1000 : -1 );
+        if (ret > 0 && !(pfd.revents & POLLIN)) ret = 0;
+    }
+    if (ret <= 0) return ret;
+    /* readable does not mean a whole reply is still there: a SIGUSR1 handler on this thread (a suspend) may have read
+     * it from the same pipe in between, and a blocking read() would then wait for the next one */
+    if (!ioctl( fd, FIONREAD, &avail ) && avail >= sizeof(reply) && read( fd, &reply, sizeof(reply) ) == sizeof(reply))
     {
         if (reply.cookie == VCPU_UNBLOCK_COOKIE) vcpu_block_rearm();
         else
