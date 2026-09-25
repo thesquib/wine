@@ -299,6 +299,19 @@ NTSYSAPI int ntdll_wcsnicmp( const WCHAR *str1, const WCHAR *str2, int n );
 #define wcstol(str,e,b)    ntdll_wcstol(str,e,b)
 #define wcstoul(str,e,b)   ntdll_wcstoul(str,e,b)
 
+#ifdef _WIN64
+/* PMW_VCPU: a 32-bit ADDRESS from a WoW64 caller as the host sees it. In a vCPU-mode WoW64 process the 32-bit space
+ * is at host BASE + p (BASE = TEB32 aligned down to 4 GiB); elsewhere BASE is 0 and this is the plain zero extension.
+ * 0 stays NULL. For addresses only: values, handles and keys keep ULongToPtr / UlongToHandle. */
+static inline void *wow64_host_ptr( ULONG p )
+{
+    TEB *teb = NtCurrentTeb();
+    ULONG_PTR base = teb->WowTebOffset ? ((ULONG_PTR)teb + teb->WowTebOffset) & ~(ULONG_PTR)0xffffffff : 0;
+
+    return p ? (void *)(base + p) : NULL;
+}
+#endif
+
 #else /* WINE_UNIX_LIB */
 
 extern unixlib_handle_t __wine_unixlib_handle;
