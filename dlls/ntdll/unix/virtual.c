@@ -3448,6 +3448,32 @@ static BOOL wow_window_request( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
     return TRUE;
 }
 
+/***********************************************************************
+ *           wow_canon_arg
+ *
+ * PMW_VCPU W6, wow_window set: an address argument in (0, 4 GiB) of a current-process memory call is a 32-bit
+ * address that missed widening (the wow64 thunks pass BASE + p, guest 0 included). Use its canonical host address:
+ * the host side cannot touch the low twin, and Wine's views live at BASE + p. 0 stays 0 ("anywhere"); gmm_vm_canon
+ * leaves KUSER's legacy low page where it is. Counted as "w6:arg canon" under PMW_VCPU_PROF.
+ */
+static void *wow_canon_arg( const void *addr, const char *func )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    static LONG reported;
+    void *canon;
+
+    if (!wow_window || !addr || (ULONG_PTR)addr >= WOW_WINDOW_SIZE) return (void *)addr;
+    canon = (void *)(ULONG_PTR)gmm_vm_canon( vcpu_gmm(), (ULONG_PTR)addr );
+    if (canon == addr) return canon;
+    if (vcpu_prof_interval) vcpu_prof_add( VCPU_PROF_WOW_ARG_CANON, 0 );
+    if (InterlockedIncrement( &reported ) <= 16)
+        ERR( "%s: 32-bit address %p was not widened, using %p\n", func, addr, canon );
+    return canon;
+#else
+    return (void *)addr;
+#endif
+}
+
 /* a 64-bit request in a WoW64 vCPU process: search [start, end) without W, in the order asked for */
 static void *alloc_outside_wow_window( char *start, char *end, size_t size, BOOL top_down, int unix_prot,
                                        size_t align_mask, BOOL guest )
@@ -3520,9 +3546,10 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
     /* a WoW64 vCPU process: an explicit base below 4 GiB is a 32-bit address (a PE image's preferred base, the
      * server's dynamic base); the 32-bit space lives at BASE + p */
-    if (wow_window && base && (ULONG_PTR)base < WOW_WINDOW_SIZE)
+    if (wow_window && base && (ULONG_PTR)base < WOW_WINDOW_SIZE) base = wow_window + (ULONG_PTR)base;
+    /* its limits (zero_bits) are guest-relative too, also when the wow64 thunk already widened the base */
+    if (wow_window && base && (ULONG_PTR)((char *)base - wow_window) < WOW_WINDOW_SIZE)
     {
-        base = wow_window + (ULONG_PTR)base;
         if (limit_high && limit_high < WOW_WINDOW_SIZE) limit_high += (ULONG_PTR)wow_window;
         if (limit_low && limit_low < WOW_WINDOW_SIZE) limit_low += (ULONG_PTR)wow_window;
     }
@@ -7046,6 +7073,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
         }
         return result.virtual_alloc.status;
     }
+    *ret = wow_canon_arg( *ret, __func__ );
 
     if (!*ret)
         limit = get_zero_bits_limit( zero_bits );
@@ -7189,6 +7217,7 @@ NTSTATUS WINAPI NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE_T *s
         }
         return result.virtual_alloc_ex.status;
     }
+    *ret = wow_canon_arg( *ret, __func__ );
 
     return allocate_virtual_memory( ret, size_ptr, type, protect,
                                     limit_low, limit_high, align, attributes );
@@ -7231,6 +7260,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
         }
         return result.virtual_free.status;
     }
+    addr = wow_canon_arg( addr, __func__ );
 
     /* Fix the parameters */
 
@@ -7333,6 +7363,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
         else *old_prot = PAGE_NOACCESS;
         return result.virtual_protect.status;
     }
+    addr = wow_canon_arg( addr, __func__ );
 
     /* Fix the parameters */
 
@@ -8021,6 +8052,7 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
 
     TRACE("(%p, %p, info_class=%d, %p, %ld, %p)\n",
           process, addr, info_class, buffer, len, res_len);
+    if (process == NtCurrentProcess()) addr = wow_canon_arg( addr, __func__ );
 
     switch(info_class)
     {
@@ -8089,6 +8121,7 @@ NTSTATUS WINAPI NtLockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size, 
         }
         return result.virtual_lock.status;
     }
+    *addr = wow_canon_arg( *addr, __func__ );
 
     *size = ROUND_SIZE( *addr, *size, page_mask );
     *addr = ROUND_ADDR( *addr, page_mask );
@@ -8127,6 +8160,7 @@ NTSTATUS WINAPI NtUnlockVirtualMemory( HANDLE process, PVOID *addr, SIZE_T *size
         }
         return result.virtual_unlock.status;
     }
+    *addr = wow_canon_arg( *addr, __func__ );
 
     *size = ROUND_SIZE( *addr, *size, page_mask );
     *addr = ROUND_ADDR( *addr, page_mask );
@@ -8148,6 +8182,7 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
     unsigned int res;
     SIZE_T mask = granularity_mask;
     LARGE_INTEGER offset;
+    UINT_PTR guest_addr;
 
     offset.QuadPart = offset_ptr ? offset_ptr->QuadPart : 0;
 
@@ -8159,9 +8194,12 @@ NTSTATUS WINAPI NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_p
         return STATUS_INVALID_PARAMETER_4;
 
     /* If both addr_ptr and zero_bits are passed, they have match */
-    if (zero_bits && zero_bits < 32 && ((UINT_PTR)*addr_ptr >> (32 - zero_bits)))
+    guest_addr = (UINT_PTR)*addr_ptr;
+    /* PMW_VCPU W2: the wow64 thunk passes BASE + p with its default zero_bits mask; zero_bits bounds p */
+    if (wow_window && guest_addr - (UINT_PTR)wow_window < WOW_WINDOW_SIZE) guest_addr -= (UINT_PTR)wow_window;
+    if (zero_bits && zero_bits < 32 && (guest_addr >> (32 - zero_bits)))
         return STATUS_INVALID_PARAMETER_4;
-    if (zero_bits >= 32 && ((UINT_PTR)*addr_ptr & ~zero_bits))
+    if (zero_bits >= 32 && (guest_addr & ~zero_bits))
         return STATUS_INVALID_PARAMETER_4;
 
     if (!is_win64 && !is_wow64())
@@ -8316,6 +8354,7 @@ static NTSTATUS unmap_view_of_section( HANDLE process, PVOID addr, ULONG flags )
         if (status == STATUS_SUCCESS) status = result.unmap_view.status;
         return status;
     }
+    addr = wow_canon_arg( addr, "unmap_view_of_section" );
 
     virtual_mutex_enter( &sigset );
     if (!(view = find_view( addr, 0 )) || is_view_valloc( view )) goto done;
@@ -8512,6 +8551,7 @@ NTSTATUS WINAPI NtFlushVirtualMemory( HANDLE process, LPCVOID *addr_ptr,
         }
         return result.virtual_flush.status;
     }
+    addr = wow_canon_arg( addr, __func__ );
 
     virtual_mutex_enter( &sigset );
     if (!(view = find_view( addr, *size_ptr ))) status = STATUS_INVALID_PARAMETER;
@@ -8540,6 +8580,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
     NTSTATUS status = STATUS_SUCCESS;
     sigset_t sigset;
 
+    base = wow_canon_arg( base, __func__ );
     size = ROUND_SIZE( base, size, page_mask );
     base = ROUND_ADDR( base, page_mask );
 
@@ -8598,6 +8639,7 @@ NTSTATUS WINAPI NtResetWriteWatch( HANDLE process, PVOID base, SIZE_T size )
     NTSTATUS status = STATUS_SUCCESS;
     sigset_t sigset;
 
+    base = wow_canon_arg( base, __func__ );
     size = ROUND_SIZE( base, size, page_mask );
     base = ROUND_ADDR( base, page_mask );
 
@@ -8633,6 +8675,7 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
     }
     else if (process == GetCurrentProcess())
     {
+        addr = wow_canon_arg( addr, __func__ );
         __TRY
         {
             memmove( buffer, addr, size );
@@ -8670,6 +8713,7 @@ NTSTATUS WINAPI NtWriteVirtualMemory( HANDLE process, void *addr, const void *bu
 {
     unsigned int status;
 
+    if (process == GetCurrentProcess()) addr = wow_canon_arg( addr, __func__ );
     if (virtual_check_buffer_for_read( buffer, size ))
     {
         SERVER_START_REQ( write_process_memory )
@@ -8704,6 +8748,8 @@ NTSTATUS WINAPI NtAreMappedFilesTheSame(PVOID addr1, PVOID addr2)
 
     TRACE("%p %p\n", addr1, addr2);
 
+    addr1 = wow_canon_arg( addr1, __func__ );
+    addr2 = wow_canon_arg( addr2, __func__ );
     virtual_mutex_enter( &sigset );
 
     view1 = find_view( addr1, 0 );
@@ -8838,6 +8884,7 @@ NTSTATUS WINAPI NtFlushInstructionCache( HANDLE handle, const void *addr, SIZE_T
 #elif defined(HAVE___CLEAR_CACHE)
     if (handle == GetCurrentProcess())
     {
+        addr = wow_canon_arg( addr, __func__ );
         __clear_cache( (char *)addr, (char *)addr + size );
     }
     else
