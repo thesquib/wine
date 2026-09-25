@@ -62,6 +62,7 @@ enum vcpu_prof_id
     VCPU_PROF_FAULT_RAISED,  /* fault:raised     an exception delivered to the guest */
     VCPU_PROF_S2_MAP,        /* in:hv_vm_map     gmm's stage-2 map backend */
     VCPU_PROF_S2_UNMAP,      /* in:hv_vm_unmap   gmm's stage-2 unmap backend */
+    VCPU_PROF_WOW_ARG_CANON, /* w6:arg canon     a 32-bit syscall address that missed widening (count only) */
     VCPU_PROF_IDS
 };
 

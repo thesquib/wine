@@ -626,7 +626,7 @@ static double prof_ticks_per_us = 1;
 static const char * const prof_extra_names[VCPU_PROF_IDS] =
 {
     "in:s1 sync", "in:s1 revoke", "in:icache sync", "in:tlbi", "in:gmm_vm_fault", "lock:virtual_mutex",
-    "fault:retry", "fault:handled", "fault:raised", "in:hv_vm_map", "in:hv_vm_unmap",
+    "fault:retry", "fault:handled", "fault:raised", "in:hv_vm_map", "in:hv_vm_unmap", "w6:arg canon",
 };
 
 /* unix calls by (function table, index): a slot is filled once under prof_unix_mutex, then published by ready */
