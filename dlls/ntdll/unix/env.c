@@ -2153,6 +2153,8 @@ void init_startup_info(void)
     free( env );
     free( info );
 
+    /* a 32-bit main image: open the vCPU WoW64 window before it is mapped (init_peb only runs after) */
+    if (machine && !is_machine_64bit( machine )) virtual_prepare_wow_window();
     status = load_main_exe( &nt_name, machine, &module );
     if (!NT_SUCCESS(status))
     {
