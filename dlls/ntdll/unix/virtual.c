@@ -3432,7 +3432,7 @@ static void fixup_effective_user_space_limit( const void **effective_user_space_
  *
  * PMW_VCPU W2, wow_window set: translate a search's limits and say whether it is a 32-bit request. A limit below 4 GiB
  * is guest-relative (zero_bits, user_space_wow_limit, limit_2g/4g) and gets BASE added; a request whose high limit
- * then lies in W is a 32-bit request and its low limit is raised to at least BASE. Anything else (no high limit, or
+ * then lies in W is a 32-bit request and its low limit is raised to at least BASE + 0x10000. Anything else (no high limit, or
  * one outside W) is a 64-bit request, which must never be given W.
  */
 static BOOL wow_window_request( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
@@ -3443,7 +3443,8 @@ static BOOL wow_window_request( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
     if (*limit_high < WOW_WINDOW_SIZE) *limit_high += base;
     if (*limit_high < base || *limit_high >= base + WOW_WINDOW_SIZE) return FALSE;
     if (*limit_low < WOW_WINDOW_SIZE) *limit_low += base;
-    if (*limit_low < base) *limit_low = base;
+    /* never below guest 0x10000: guest 0 is NULL, and Windows keeps the first 64K free */
+    if (*limit_low < base + 0x10000) *limit_low = base + 0x10000;
     return TRUE;
 }
 
