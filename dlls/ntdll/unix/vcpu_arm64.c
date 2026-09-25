@@ -2237,4 +2237,3 @@ void vcpu_note_entered(void)
 }
 
 #endif /* __APPLE__ && __aarch64__ */
-void vcpu_futex_wake_word( const LONG *word ) { }  /* Task 6 moves this to sync.c */

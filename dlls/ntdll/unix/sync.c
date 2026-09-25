@@ -257,6 +257,15 @@ static inline int futex_wake_one( const LONG *addr )
 
 #endif /* __APPLE__ */
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* vCPU M:N: the pool monitor's unblock of a thread waiting in NtWaitForAlertByThreadId (a wake with the word still 0
+ * is a spurious wake to it: it decides again and waits on). Non-blocking, called under the pool lock */
+void vcpu_futex_wake_word( const LONG *word )
+{
+    futex_wake_one( word );
+}
+#endif
+
 /* create a struct security_descriptor and contained information in one contiguous piece of memory */
 unsigned int alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
                                       data_size_t *ret_len )
@@ -3911,6 +3920,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
     {
         LONG *futex = &entry->futex;
         ULONGLONG end;
+        BOOL tracked;
         int ret;
 
         if (timeout)
@@ -3923,6 +3933,9 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
         while (!InterlockedExchange( futex, 0 ))
         {
+            /* a zero timeout is a poll, not a block: releasing the vCPU for it would only cost the re-create.
+             * The M:N monitor wakes this word to unblock */
+            tracked = (!timeout || timeout->QuadPart) && vcpu_block_begin( VCPU_BLOCK_FUTEX, futex );
             if (timeout)
             {
                 LONGLONG timeleft = update_timeout( end );
@@ -3934,6 +3947,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
             }
             else
                 ret = futex_wait( futex, 0, NULL );
+            if (tracked) vcpu_block_end();
 
             WAIT_TRACE("WaitForAlert.futex.RET tid=%lu futex=%p ret=%d errno=%d",
                        (unsigned long)(uintptr_t)NtCurrentTeb()->ClientId.UniqueThread,
