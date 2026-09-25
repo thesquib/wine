@@ -414,7 +414,7 @@ NTSTATUS WINAPI wow64_NtGdiDdDDIAcquireKeyedMutex( UINT *args )
     if (!desc32) return STATUS_INVALID_PARAMETER;
     desc.hKeyedMutex = desc32->hKeyedMutex;
     desc.Key = desc32->Key;
-    desc.pTimeout = UlongToHandle( desc32->pTimeout );
+    desc.pTimeout = UlongToPtr( desc32->pTimeout );
     desc.FenceValue = desc32->FenceValue;
     status = NtGdiDdDDIAcquireKeyedMutex( &desc );
     desc32->FenceValue = desc.FenceValue;
@@ -439,9 +439,9 @@ NTSTATUS WINAPI wow64_NtGdiDdDDIAcquireKeyedMutex2( UINT *args )
     if (!desc32) return STATUS_INVALID_PARAMETER;
     desc.hKeyedMutex = desc32->hKeyedMutex;
     desc.Key = desc32->Key;
-    desc.pTimeout = UlongToHandle( desc32->pTimeout );
+    desc.pTimeout = UlongToPtr( desc32->pTimeout );
     desc.FenceValue = desc32->FenceValue;
-    desc.pPrivateRuntimeData = UlongToHandle( desc32->pPrivateRuntimeData );
+    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
     desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
     status = NtGdiDdDDIAcquireKeyedMutex2( &desc );
     desc32->FenceValue = desc.FenceValue;
@@ -1503,7 +1503,7 @@ NTSTATUS WINAPI wow64_NtGdiDdDDIReleaseKeyedMutex2( UINT *args )
     desc.hKeyedMutex = desc32->hKeyedMutex;
     desc.Key = desc32->Key;
     desc.FenceValue = desc32->FenceValue;
-    desc.pPrivateRuntimeData = UlongToHandle( desc32->pPrivateRuntimeData );
+    desc.pPrivateRuntimeData = UlongToPtr( desc32->pPrivateRuntimeData );
     desc.PrivateRuntimeDataSize = desc32->PrivateRuntimeDataSize;
     status = NtGdiDdDDIReleaseKeyedMutex2( &desc );
 
@@ -1723,6 +1723,10 @@ NTSTATUS WINAPI wow64_NtGdiExtCreatePen( UINT *args )
     ULONG dib_size = get_ulong( &args );
     BOOL old_style = get_ulong( &args );
     HBRUSH brush = get_handle( &args );
+
+    /* hatch is polymorphic: an address only for a DIB pattern pen (gdi32 maps BS_DIBPATTERN to BS_DIBPATTERNPT),
+     * a hatch style or a bitmap handle otherwise */
+    if (brush_style == BS_DIBPATTERNPT) hatch = (ULONG_PTR)ULongToPtr( hatch );
 
     return HandleToUlong( NtGdiExtCreatePen( style, width, brush_style, color, client_hatch,
                                              hatch, style_count, style_bits, dib_size,
@@ -2273,7 +2277,7 @@ NTSTATUS WINAPI wow64_NtGdiGetRealizationInfo( UINT *args )
 
 NTSTATUS WINAPI wow64_NtGdiGetRegionData( UINT *args )
 {
-    HRGN hrgn = get_ptr( &args );
+    HRGN hrgn = get_handle( &args );
     DWORD count = get_ulong( &args );
     RGNDATA *data = get_ptr( &args );
 
@@ -2282,7 +2286,7 @@ NTSTATUS WINAPI wow64_NtGdiGetRegionData( UINT *args )
 
 NTSTATUS WINAPI wow64_NtGdiGetTextCharsetInfo( UINT *args )
 {
-    HDC hdc = get_ptr( &args );
+    HDC hdc = get_handle( &args );
     FONTSIGNATURE *fs = get_ptr( &args );
     DWORD flags = get_ulong( &args );
 

@@ -47,9 +47,30 @@ typedef struct
     ULONG SecurityQualityOfService;
 } OBJECT_ATTRIBUTES32;
 
+/* PMW_VCPU: in a vCPU-mode WoW64 process the 32-bit address space lives at host BASE + p, with BASE 4 GiB aligned and
+ * TEB32 inside the window, so BASE is what TEB32 aligns down to. Wherever the 32-bit space sits at its own addresses
+ * (Windows, CrossOver, Linux Wine) BASE is 0 and everything below is the plain zero extension.
+ * ULongToPtr/UlongToPtr/get_ptr therefore widen an ADDRESS: 0 stays NULL, anything else becomes BASE + p. A value that
+ * only travels in a pointer-typed slot (an atom, a flag, an opaque key) must use wow64_value(), never the widening. */
+static inline ULONG_PTR wow64_base(void)
+{
+    TEB *teb = NtCurrentTeb();
+    return teb->WowTebOffset ? ((ULONG_PTR)teb + teb->WowTebOffset) & ~(ULONG_PTR)0xffffffff : 0;
+}
+static inline void *wow64_ptr( ULONG p ) { return p ? (void *)(wow64_base() + p) : NULL; }
+static inline void *wow64_value( ULONG v ) { return (void *)(ULONG_PTR)v; }
+#undef ULongToPtr
+#undef UlongToPtr
+#define ULongToPtr(ul) wow64_ptr(ul)
+#define UlongToPtr(ul) wow64_ptr(ul)
+
+/* a string address or an atom/resource id (IS_INTRESOURCE): a value below 0x10000 is never an address, so it is not widened */
+static inline void *wow64_str_or_atom( ULONG v ) { return v < 0x10000 ? wow64_value( v ) : wow64_ptr( v ); }
+
 static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
 static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
 static inline void *get_ptr( UINT **args ) { return ULongToPtr( *(*args)++ ); }
+static inline void *get_str( UINT **args ) { return wow64_str_or_atom( *(*args)++ ); }
 
 static inline void **addr_32to64( void **addr, ULONG *addr32 )
 {
@@ -80,7 +101,7 @@ static inline UNICODE_STRING *unicode_str_32to64( UNICODE_STRING *str, const UNI
     if (!str32) return NULL;
     str->Length = str32->Length;
     str->MaximumLength = str32->MaximumLength;
-    str->Buffer = ULongToPtr( str32->Buffer );
+    str->Buffer = wow64_str_or_atom( str32->Buffer );  /* a class name is an atom when Length is 0 */
     return str;
 }
 

@@ -440,8 +440,8 @@ static struct client_menu_name *client_menu_name_32to64( struct client_menu_name
                                                          const struct client_menu_name32 *name32 )
 {
     if (!name32) return NULL;
-    name->nameA = UlongToPtr( name32->nameA );
-    name->nameW = UlongToPtr( name32->nameW );
+    name->nameA = wow64_str_or_atom( name32->nameA );
+    name->nameW = wow64_str_or_atom( name32->nameW );
     name->nameUS = UlongToPtr( name32->nameUS );
     return name;
 }
@@ -491,8 +491,8 @@ static void createstruct_32to64( const CREATESTRUCT32 *from, CREATESTRUCTW *to )
     to->x              = from->x;
     to->style          = from->style;
     to->dwExStyle      = from->dwExStyle;
-    to->lpszName       = UlongToPtr( from->lpszName );
-    to->lpszClass      = UlongToPtr( from->lpszClass );
+    to->lpszName       = wow64_str_or_atom( from->lpszName );
+    to->lpszClass      = wow64_str_or_atom( from->lpszClass );
 }
 
 static void createstruct_64to32( const CREATESTRUCTW *from, CREATESTRUCT32 *to )
@@ -1972,7 +1972,7 @@ NTSTATUS WINAPI wow64_NtUserCreateWindowEx( UINT *args )
     void *params = get_ptr( &args );
     DWORD flags = get_ulong( &args );
     HINSTANCE client_instance = get_ptr( &args );
-    const WCHAR *class = get_ptr( &args );
+    const WCHAR *class = get_str( &args );
     BOOL ansi = get_ulong( &args );
 
     UNICODE_STRING class_name, version, window_name;
@@ -2484,7 +2484,7 @@ NTSTATUS WINAPI wow64_NtUserGetCursor( UINT *args )
 
 NTSTATUS WINAPI wow64_NtUserGetCursorFrameInfo( UINT *args )
 {
-    HCURSOR cursor = get_ptr( &args );
+    HCURSOR cursor = get_handle( &args );
     DWORD istep = get_ulong( &args );
     DWORD *rate_jiffies = get_ptr( &args );
     DWORD *num_steps = get_ptr( &args );
@@ -2884,7 +2884,7 @@ NTSTATUS WINAPI wow64_NtUserGetProcessWindowStation( UINT *args )
 NTSTATUS WINAPI wow64_NtUserGetProp( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    const WCHAR *str = get_ptr( &args );
+    const WCHAR *str = get_str( &args );
 
     return HandleToUlong( NtUserGetProp( hwnd, str ));
 }
@@ -3093,15 +3093,15 @@ NTSTATUS WINAPI wow64_NtUserRegisterClassExWOW( UINT *args )
 
     wc.cbSize = sizeof(wc);
     wc.style = wc32->style;
-    wc.lpfnWndProc = UlongToPtr( wc32->lpfnWndProc );
+    wc.lpfnWndProc = wow64_value( wc32->lpfnWndProc );
     wc.cbClsExtra = wc32->cbClsExtra;
     wc.cbWndExtra = wc32->cbWndExtra;
     wc.hInstance = UlongToPtr( wc32->hInstance );
     wc.hIcon = LongToHandle( wc32->hIcon );
     wc.hCursor = LongToHandle( wc32->hCursor );
     wc.hbrBackground = UlongToHandle( wc32->hbrBackground );
-    wc.lpszMenuName = UlongToPtr( wc32->lpszMenuName );
-    wc.lpszClassName = UlongToPtr( wc32->lpszClassName );
+    wc.lpszMenuName = wow64_str_or_atom( wc32->lpszMenuName );
+    wc.lpszClassName = wow64_str_or_atom( wc32->lpszClassName );
     wc.hIconSm = LongToHandle( wc32->hIconSm );
 
     return NtUserRegisterClassExWOW( &wc,
@@ -3431,7 +3431,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_CREATE:
         if (lparam)
         {
-            CREATESTRUCT32 *cs32 = (void *)lparam;
+            CREATESTRUCT32 *cs32 = ULongToPtr( lparam );
             CREATESTRUCTW cs;
 
             createstruct_32to64( cs32, &cs );
@@ -3452,11 +3452,11 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MDICREATE:
         {
-            MDICREATESTRUCT32 *cs32 = (void *)lparam;
+            MDICREATESTRUCT32 *cs32 = ULongToPtr( lparam );
             MDICREATESTRUCTW cs;
 
-            cs.szClass = UlongToPtr( cs32->szClass );
-            cs.szTitle = UlongToPtr( cs32->szTitle );
+            cs.szClass = wow64_str_or_atom( cs32->szClass );
+            cs.szTitle = wow64_str_or_atom( cs32->szTitle );
             cs.hOwner = LongToHandle( cs32->hOwner );
             cs.x = cs32->x;
             cs.y = cs32->y;
@@ -3471,7 +3471,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_WINDOWPOSCHANGING:
     case WM_WINDOWPOSCHANGED:
         {
-            WINDOWPOS32 *winpos32 = (void *)lparam;
+            WINDOWPOS32 *winpos32 = ULongToPtr( lparam );
             WINDOWPOS winpos;
 
             winpos_32to64( &winpos, winpos32 );
@@ -3483,7 +3483,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_NCCALCSIZE:
         if (wparam)
         {
-            NCCALCSIZE_PARAMS32 *params32 = (void *)lparam;
+            NCCALCSIZE_PARAMS32 *params32 = ULongToPtr( lparam );
             NCCALCSIZE_PARAMS params;
             WINDOWPOS winpos;
 
@@ -3503,7 +3503,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_COMPAREITEM:
         {
-            COMPAREITEMSTRUCT32 *cis32 = (void *)lparam;
+            COMPAREITEMSTRUCT32 *cis32 = ULongToPtr( lparam );
             COMPAREITEMSTRUCT cis;
 
             cis.CtlType    = cis32->CtlType;
@@ -3519,7 +3519,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_DELETEITEM:
         {
-            DELETEITEMSTRUCT32 *dis32 = (void *)lparam;
+            DELETEITEMSTRUCT32 *dis32 = ULongToPtr( lparam );
             DELETEITEMSTRUCT dis;
 
             dis.CtlType  = dis32->CtlType;
@@ -3532,7 +3532,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_MEASUREITEM:
         {
-            MEASUREITEMSTRUCT32 *mis32 = (void *)lparam;
+            MEASUREITEMSTRUCT32 *mis32 = ULongToPtr( lparam );
             MEASUREITEMSTRUCT mis;
 
             mis.CtlType    = mis32->CtlType;
@@ -3553,7 +3553,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_DRAWITEM:
         {
-            DRAWITEMSTRUCT32 *dis32 = (void *)lparam;
+            DRAWITEMSTRUCT32 *dis32 = ULongToPtr( lparam );
             DRAWITEMSTRUCT dis;
 
             dis.CtlType       = dis32->CtlType;
@@ -3573,7 +3573,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_COPYDATA:
         {
-            COPYDATASTRUCT32 *cds32 = (void *)lparam;
+            COPYDATASTRUCT32 *cds32 = ULongToPtr( lparam );
             COPYDATASTRUCT cds;
 
             cds.dwData = cds32->dwData;
@@ -3584,7 +3584,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_HELP:
         {
-            HELPINFO32 *hi32 = (void *)lparam;
+            HELPINFO32 *hi32 = ULongToPtr( lparam );
             HELPINFO hi64;
 
             hi64.cbSize       = sizeof(hi64);
@@ -3599,7 +3599,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
     case WM_GETDLGCODE:
         if (lparam)
         {
-            MSG32 *msg32 = (MSG32 *)lparam;
+            MSG32 *msg32 = ULongToPtr( lparam );
             MSG msg64;
 
             return NtUserMessageCall( hwnd, msg, wparam, (LPARAM)msg_32to64( &msg64, msg32 ),
@@ -3609,7 +3609,7 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
 
     case WM_NEXTMENU:
         {
-            MDINEXTMENU32 *next32 = (void *)lparam;
+            MDINEXTMENU32 *next32 = ULongToPtr( lparam );
             MDINEXTMENU next;
 
             next.hmenuIn   = LongToHandle( next32->hmenuIn );
@@ -3626,13 +3626,13 @@ static LRESULT message_call_32to64( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
         {
             PAINTSTRUCT ps;
 
-            paintstruct_32to64( &ps, (PAINTSTRUCT32 *)lparam );
+            paintstruct_32to64( &ps, ULongToPtr( lparam ) );
             return NtUserMessageCall( hwnd, msg, wparam, (LPARAM)&ps, result_info, type, ansi );
         }
 
     case CB_GETCOMBOBOXINFO:
         {
-            COMBOBOXINFO32 *ci32 = (COMBOBOXINFO32 *)lparam;
+            COMBOBOXINFO32 *ci32 = ULongToPtr( lparam );
             COMBOBOXINFO ci;
 
             ci.cbSize      = ci32->cbSize;
@@ -3676,7 +3676,7 @@ NTSTATUS WINAPI wow64_NtUserMessageCall( UINT *args )
             struct win_proc_params32 *params32 = result_info;
             struct win_proc_params params;
 
-            if (type == NtUserCallWindowProc) params.func = UlongToPtr( params32->func );
+            if (type == NtUserCallWindowProc) params.func = wow64_value( params32->func );
 
             if (!NtUserMessageCall( hwnd, msg, wparam, lparam, &params, type, ansi ))
                 return FALSE;
@@ -3750,7 +3750,7 @@ NTSTATUS WINAPI wow64_NtUserMessageCall( UINT *args )
             } *params32 = result_info;
             struct ime_driver_call_params params;
             if (msg == WINE_IME_POST_UPDATE) ERR( "Unexpected WINE_IME_POST_UPDATE message\n" );
-            params.himc = UlongToPtr( params32->himc );
+            params.himc = UlongToHandle( params32->himc );
             params.state = UlongToPtr( params32->state );
             params.compstr = UlongToPtr( params32->compstr );
             params.key_consumed = UlongToPtr( params32->key_consumed );
@@ -4085,7 +4085,7 @@ NTSTATUS WINAPI wow64_NtUserRegisterRawInputDevices( UINT *args )
         devices64[i].usUsagePage = devices32[i].usUsagePage;
         devices64[i].usUsage = devices32[i].usUsage;
         devices64[i].dwFlags = devices32[i].dwFlags;
-        devices64[i].hwndTarget = UlongToPtr( devices32[i].hwndTarget );
+        devices64[i].hwndTarget = UlongToHandle( devices32[i].hwndTarget );
     }
 
     return NtUserRegisterRawInputDevices( devices64, count, sizeof(*devices64) );
@@ -4138,7 +4138,7 @@ NTSTATUS WINAPI wow64_NtUserRemoveMenu( UINT *args )
 NTSTATUS WINAPI wow64_NtUserRemoveProp( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    const WCHAR *str = get_ptr( &args );
+    const WCHAR *str = get_str( &args );
 
     return HandleToUlong( NtUserRemoveProp( hwnd, str ));
 }
@@ -4547,7 +4547,7 @@ NTSTATUS WINAPI wow64_NtUserSetProgmanWindow( UINT *args )
 NTSTATUS WINAPI wow64_NtUserSetProp( UINT *args )
 {
     HWND hwnd = get_handle( &args );
-    const WCHAR *str = get_ptr( &args );
+    const WCHAR *str = get_str( &args );
     HANDLE handle = get_handle( &args );
 
     return NtUserSetProp( hwnd, str, handle );

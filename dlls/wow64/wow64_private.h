@@ -77,6 +77,22 @@ static inline TEB32 *NtCurrentTeb32(void)
     return (TEB32 *)((char *)NtCurrentTeb() + NtCurrentTeb()->WowTebOffset);
 }
 
+/* PMW_VCPU: in a vCPU-mode WoW64 process the 32-bit address space lives at host BASE + p, with BASE 4 GiB aligned and
+ * TEB32 inside the window, so BASE is what TEB32 aligns down to. Wherever the 32-bit space sits at its own addresses
+ * (Windows, CrossOver, Linux Wine) BASE is 0 and everything below is the plain zero extension.
+ * ULongToPtr/UlongToPtr/get_ptr therefore widen an ADDRESS: 0 stays NULL, anything else becomes BASE + p. A value that
+ * only travels in a pointer-typed slot (an atom, a flag, an opaque key) must use wow64_value(), never the widening. */
+static inline ULONG_PTR wow64_base(void)
+{
+    return NtCurrentTeb()->WowTebOffset ? (ULONG_PTR)NtCurrentTeb32() & ~(ULONG_PTR)0xffffffff : 0;
+}
+static inline void *wow64_ptr( ULONG p ) { return p ? (void *)(wow64_base() + p) : NULL; }
+static inline void *wow64_value( ULONG v ) { return (void *)(ULONG_PTR)v; }
+#undef ULongToPtr
+#undef UlongToPtr
+#define ULongToPtr(ul) wow64_ptr(ul)
+#define UlongToPtr(ul) wow64_ptr(ul)
+
 static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
 static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
 static inline void *get_ptr( UINT **args ) { return ULongToPtr( *(*args)++ ); }
@@ -117,7 +133,7 @@ static inline void *apc_32to64( ULONG func )
 
 static inline void *apc_param_32to64( ULONG func, ULONG context )
 {
-    if (!func) return ULongToPtr( context );
+    if (!func) return wow64_value( context );  /* an opaque cookie, handed back as is */
     return (void *)(ULONG_PTR)(((ULONG64)func << 32) | context);
 }
 
