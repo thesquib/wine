@@ -79,6 +79,7 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "unix_private.h"
+#include "vcpu_arm64.h"
 #include "ddk/wdm.h"
 
 #include "fsync.h"
@@ -367,6 +368,11 @@ static int wait_select_reply( void *cookie )
         ret = read( ntdll_get_thread_data()->wait_fd[0], &reply, sizeof(reply) );
         if (ret == sizeof(reply))
         {
+            if (vcpu_mode && reply.cookie == VCPU_UNBLOCK_COOKIE)
+            {
+                vcpu_block_rearm();  /* the M:N monitor wants this thread's vCPU slot: decide again, wait on */
+                continue;
+            }
             if (!reply.cookie) abort_thread( reply.signaled );  /* thread got killed */
             if (wine_server_get_ptr(reply.cookie) == cookie) return reply.signaled;
             /* we stole another reply, wait for the real one */
@@ -784,7 +790,9 @@ unsigned int server_select( const union select_op *select_op, data_size_t size, 
         if (signaled) break;
 
         FTRACE_BLOCK_START("select_reply")
+        vcpu_block_begin( VCPU_BLOCK_PIPE, NULL );
         ret = wait_select_reply( &cookie );
+        vcpu_block_end();
         FTRACE_BLOCK_END()
     }
     while (ret == STATUS_USER_APC || ret == STATUS_KERNEL_APC);

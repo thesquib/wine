@@ -1162,7 +1162,30 @@ static void vcpu_pool_kick( vel1_pool_member *m, void *arg )
 
 static void vcpu_pool_unblock( vel1_pool_member *m, void *arg )
 {
-    /* Task 4 fills this in */
+    struct vcpu_thread *vt = CONTAINING_RECORD( m, struct vcpu_thread, pool_member );
+
+    switch (atomic_load( &vt->block_kind ))
+    {
+    case VCPU_BLOCK_PIPE:
+        if (!atomic_exchange( &vt->unblock_pending, 1 ))
+        {
+            struct wake_up_reply reply;
+
+            memset( &reply, 0, sizeof(reply) );
+            reply.cookie = VCPU_UNBLOCK_COOKIE;
+            /* one message in flight at most: the pipe cannot fill, so this cannot block */
+            if (write( vt->unblock_fd, &reply, sizeof(reply) ) != sizeof(reply)) atomic_store( &vt->unblock_pending, 0 );
+        }
+        break;
+    case VCPU_BLOCK_FUTEX:
+    {
+        const LONG *word = atomic_load( &vt->block_word );
+        if (word) vcpu_futex_wake_word( word );
+        break;
+    }
+    default:
+        break;  /* the thread just left its wait: a spurious unblock, allowed */
+    }
 }
 
 static vel1_exit_kind vcpu_run( struct vcpu_thread *vt, vel1_exit *e )
@@ -1246,6 +1269,75 @@ static void vcpu_preempt_point( struct vcpu_thread *vt )
     block_all_signals( &old );
     if (vcpu_release( vt )) atomic_fetch_add( &prof_rel_preempt, 1 );
     pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
+/* SIGUSR1 blocked: maybe inside a signal handler (our suspend waits in the server from usr1_handler). No pool call
+ * that can release, and no note_wait, from there (R10 and the SIGUSR1 limit) */
+static BOOL vcpu_in_handler_mask(void)
+{
+    sigset_t cur;
+
+    pthread_sigmask( SIG_BLOCK, NULL, &cur );
+    return sigismember( &cur, SIGUSR1 );
+}
+
+/* at a block point: release under the pool's policy, or mark the slot as held across the wait (R15) */
+static void vcpu_block_decide( struct vcpu_thread *vt )
+{
+    sigset_t old;
+    BOOL released = FALSE;
+
+    if (!vt->has_vcpu) return;
+    /* spec §5: release only while in_syscall is 1 (signal handlers then take the frame path, which needs no vCPU) */
+    if (atomic_load( &vt->in_syscall ) && !vcpu_in_handler_mask() && !vt->hv_depth && !vt->presenter &&
+        vel1_pool_should_release( &vcpu_pool, &vt->pool_member ))
+    {
+        block_all_signals( &old );
+        released = vcpu_release( vt );
+        pthread_sigmask( SIG_SETMASK, &old, NULL );
+        if (released) atomic_fetch_add( &prof_rel_block, 1 );
+    }
+    if (!released) vel1_pool_note_block_begin( &vt->pool_member, vel1_pool_now_ns() );
+}
+
+BOOL vcpu_block_begin( int kind, const LONG *word )
+{
+    struct vcpu_thread *vt;
+
+    if (!vcpu_mn || !(vt = vcpu_current())) return FALSE;
+    if (vt->block_depth++) return FALSE;  /* nested (a signal handler's wait inside a wait): the outer one tracks */
+    vt->block_start = vel1_pool_now_ns();
+    atomic_store( &vt->block_word, word );
+    atomic_store( &vt->block_kind, kind );
+    vcpu_block_decide( vt );
+    return TRUE;
+}
+
+void vcpu_block_end(void)
+{
+    struct vcpu_thread *vt;
+
+    if (!vcpu_mn || !(vt = vcpu_current()) || !vt->block_depth) return;
+    if (--vt->block_depth) return;  /* the end of a nested block point */
+    atomic_store( &vt->block_kind, VCPU_BLOCK_NONE );
+    atomic_store( &vt->block_word, NULL );
+    vel1_pool_note_block_end( &vt->pool_member );
+    if (!vcpu_in_handler_mask())
+        vel1_pool_note_wait( &vcpu_pool, &vt->pool_member, vel1_pool_now_ns() - vt->block_start );
+}
+
+/* the wait was interrupted by the monitor's unblock: decide again (a waiter exists, so this releases) and wait on.
+ * block_start and the wait average stay for the whole wait */
+void vcpu_block_rearm(void)
+{
+    struct vcpu_thread *vt;
+
+    if (!vcpu_mn || !(vt = vcpu_current())) return;
+    atomic_store( &vt->unblock_pending, 0 );
+    /* consumed by a nested wait (inside a signal handler): drop it; the monitor unblocks again after a quantum */
+    if (vt->block_depth != 1 || vcpu_in_handler_mask()) return;
+    vel1_pool_note_block_end( &vt->pool_member );
+    vcpu_block_decide( vt );
 }
 
 /* write the whole frame into the vCPU and leave the syscall state (fault, kick, thread start) */
@@ -2145,3 +2237,4 @@ void vcpu_note_entered(void)
 }
 
 #endif /* __APPLE__ && __aarch64__ */
+void vcpu_futex_wake_word( const LONG *word ) { }  /* Task 6 moves this to sync.c */
