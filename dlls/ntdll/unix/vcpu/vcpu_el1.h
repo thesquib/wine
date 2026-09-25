@@ -240,6 +240,37 @@
  *      the default is still reported): rung RQ's `vtoff=keep` A/B only, NOT for Wine, which then gets HVF's
  *      undocumented default. STATUS: LIVE (rung RQ 2026-09-25, 1+1+1+5 runs + R1: every guest read inside its
  *      host window; HVF's own default was also 0 on every vCPU, so the set pins today's behaviour; README "RQ").
+ * [D20] vel1_ctx (2026-09-25; M:N release-on-block, openrosetta docs/superpowers/specs/2026-09-25-mn-release-on-block-
+ *      design.md). A thread's complete guest context, portable between vel1 vCPUs of the same VM (a new one, or
+ *      another thread's): vel1_state (the MnSaveImage/MnLoadImage sets and vel1's bookkeeping: pc_in_blob, the
+ *      logical PC/CPSR, last) plus SP_EL0, which vel1_state lacks (rung RM, calibration emurm=nosp0), plus a version
+ *      word (VEL1_CTX_VERSION; restore refuses any other value, and a vel1_state that is not valid, with VEL1_E_ARG).
+ *      vel1_ctx_save: on the owning thread, at an exit. A stub/vector exit (SYSCALL, UNIX_CALL, a vector slot: the
+ *      real PC is in the blob, pc_in_blob set [D7]) is saved as is. vel1_ctx_restore: into any vel1 vCPU of the VM,
+ *      new or old, on its owning thread, before it runs; the caller then resumes it exactly as it would have resumed
+ *      the old vCPU (vel1_syscall_return / vel1_call_return / vel1_return_from_vector / vel1_regs_set), and [D7]'s
+ *      NOT_RESUMED rule holds on the new vCPU (the raw PC restored into the blob is never run). ESR_EL1/FAR_EL1 are
+ *      saved but never restored: the guest never reads them, because every vector entry exits to the host first.
+ *      Refused, nothing read (VEL1_E_NOT_RESUMED): a state that cannot be resumed at all, i.e. a NESTED_FAULT last
+ *      exit [D7]. A TLBI stub's fatal VEL1_E_STUB/VEL1_E_HV is NOT detected: vel1 has no marker that tells it from a
+ *      normal stub exit (tlbi_bad_* are diagnostics, zero for the E_HV case), and the gmm backend aborts on it anyway.
+ *      The hv_* sequence is RM's proven S and L blocks (rmshape.sh): vel1_state_save + get_sys_reg SP_EL0, and
+ *      vel1_state_restore + set_sys_reg SP_EL0. NOT carried: anything the caller sets on a vCPU after create outside
+ *      vel1_state (e.g. a future CNTKCTL_EL1 write, debug registers, any other sysreg vel1_state lacks). The new vCPU
+ *      has only what vel1_vcpu_create gives every vCPU, so such a setting must go through vel1_vcpu_create's cfg (a
+ *      new cfg field, applied at every create) or be re-applied by the caller after every vel1_ctx_restore.
+ *      STATUS: LIVE-PROVEN. Rung RM proved HOSTCALL-exit moves live (migrate: 9999 hops; reborn: 999 rebirths).
+ *      Rung RP proved the stub-exit move live (2026-09-25, vel1-gmm-v7): step 0b, one thread, ~199 moves,
+ *      checksum exact every move; step 2, the same move under concurrency (16 threads on 8 slots). See this
+ *      file's README, "RP live results".
+ *
+ * M:N (release-on-block; openrosetta docs/superpowers/specs/2026-09-25-mn-release-on-block-design.md). vel1 itself
+ *      knows nothing about a slot pool: it only offers vel1_ctx_save/restore [D20] so a thread's context can move
+ *      between vCPUs. The policy — how many vCPUs may be live at once, who releases at a block point, the
+ *      preemption monitor, its kick and its unblock of holders blocked without releasing (R15) — is vel1_pool
+ *      (vel1_pool.h, a separate MIT file: pure host C, no hv_* call, no dependency on this header). Wine links both;
+ *      see vel1_pool.h's own contract comment and this README's "How Wine calls it" and "RP" sections for the call
+ *      sequence.
  */
 #ifndef VCPU_EL1_H
 #define VCPU_EL1_H
@@ -612,6 +643,21 @@ typedef struct {
 } vel1_state;
 int vel1_state_save(vel1_vcpu* v, vel1_state* s);
 int vel1_state_restore(vel1_vcpu* v, const vel1_state* s);
+
+/* [D20] A thread's complete guest context, portable between vel1 vCPUs of the same VM: vel1_state + SP_EL0 + a
+   version word. Save on the owning thread at an exit (including a stub/vector exit: the context is saved as is);
+   restore on the destination's owning thread before it runs, then resume exactly as on the old vCPU. ESR_EL1/FAR_EL1
+   are not carried (saved, never restored), nor is any setting made after create outside vel1_state (it goes through
+   the create cfg, or the caller re-applies it). Refused (VEL1_E_NOT_RESUMED): a NESTED_FAULT last exit. See [D20]
+   above; HOSTCALL-exit moves are live-proven (RM), stub-exit moves only in the host tests until rung RP. */
+#define VEL1_CTX_VERSION 1u
+typedef struct {
+  uint32_t version;
+  uint64_t sp_el0;
+  vel1_state st;
+} vel1_ctx;
+int vel1_ctx_save(vel1_vcpu* v, vel1_ctx* c);
+int vel1_ctx_restore(vel1_vcpu* v, const vel1_ctx* c);
 
 /* ---- the initiator TLBI executor [D18] ---------------------------------------------------------------------- */
 /* On the owning thread, with the vCPU stopped at an exit (not from a handler inside vel1_run): `tlbi vale1is` for

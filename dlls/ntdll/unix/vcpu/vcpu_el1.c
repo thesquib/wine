@@ -979,6 +979,31 @@ int vel1_state_restore(vel1_vcpu* v, const vel1_state* s) {
   return VEL1_OK;
 }
 
+int vel1_ctx_save(vel1_vcpu* v, vel1_ctx* c) { /* [D20] */
+  const int u = usable(v);
+  if (u != VEL1_OK) return u;
+  if (!c) return VEL1_E_ARG;
+  /* A stub/vector exit (pc_in_blob, the logical PC, last) is saved as is and resumed after the restore exactly as on
+     the old vCPU. Only an unresumable state is refused: a NESTED_FAULT last exit (fatal [D7]). */
+  if (v->last.kind == VEL1_EXIT_NESTED_FAULT) return VEL1_E_NOT_RESUMED;
+  c->version = 0;
+  const int r = vel1_state_save(v, &c->st);
+  if (r != VEL1_OK) return r;
+  HVCHK(v, v->ops->get_sys_reg(v->id, HV_SYS_REG_SP_EL0, &c->sp_el0));
+  c->version = VEL1_CTX_VERSION;
+  return VEL1_OK;
+}
+
+int vel1_ctx_restore(vel1_vcpu* v, const vel1_ctx* c) { /* [D20] */
+  const int u = usable(v);
+  if (u != VEL1_OK) return u;
+  if (!c || c->version != VEL1_CTX_VERSION || !c->st.valid) return VEL1_E_ARG;
+  const int r = vel1_state_restore(v, &c->st);
+  if (r != VEL1_OK) return r;
+  HVCHK(v, v->ops->set_sys_reg(v->id, HV_SYS_REG_SP_EL0, c->sp_el0));
+  return VEL1_OK;
+}
+
 /* ================================================================================== initiator TLBI [D18] */
 /* A fatal stub outcome: the vCPU's PC is somewhere in the blob and its registers are the stub's, so vel1_run must
    refuse to re-enter until the caller writes PC (it never should: the gmm backend aborts on this error). */
