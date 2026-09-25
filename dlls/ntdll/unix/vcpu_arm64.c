@@ -1787,6 +1787,11 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     vt->cfg.cpsr = frame->cpsr;
     vt->cfg.x0 = frame->x[0];
     vcpu_block_signals( NULL );  /* no SIGQUIT between the create and the publish; vcpu_store_full unblocks */
+    /* counted before the slot wait: "threads" is every Windows thread that exists, queued ones included */
+    {
+        int live = atomic_fetch_add( &prof_threads_live, 1 ) + 1, peak = atomic_load( &prof_threads_peak );
+        while (live > peak && !atomic_compare_exchange_weak( &prof_threads_peak, &peak, live )) ;
+    }
     vt->unblock_fd = ntdll_get_thread_data()->wait_fd[1];
     if (vcpu_mn)
     {
@@ -1804,10 +1809,6 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     }
     vt->has_vcpu = TRUE;
     vcpu_note_vcpu_up();
-    {
-        int live = atomic_fetch_add( &prof_threads_live, 1 ) + 1, peak = atomic_load( &prof_threads_peak );
-        while (live > peak && !atomic_compare_exchange_weak( &prof_threads_peak, &peak, live )) ;
-    }
     pthread_setspecific( vcpu_key, vt );
     atomic_store( &vt->in_syscall, 1 );
     vcpu_store_full( vt, frame );
