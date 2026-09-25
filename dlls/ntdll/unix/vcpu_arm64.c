@@ -916,6 +916,8 @@ struct vcpu_thread
     volatile sig_atomic_t hv_depth;    /* inside a vel1 call: never destroy the vCPU from a handler then */
     struct vcpu_level  *level;
     uint64_t            exits, syscalls, unix_calls, faults, kicks, kick_failures;
+    uint64_t            unknown_exits; /* HV_EXIT_REASON_UNKNOWN exits re-entered (see vcpu_run) */
+    unsigned int        unknown_run;   /* ... of them in a row, with no other exit in between */
     uint64_t            prof_mark;     /* PMW_VCPU_PROF: when the last exit came back to the host */
     struct prof_bucket *prof_charge;   /* PMW_VCPU_PROF: what the host time since then is spent on */
     BOOL                prof_unix;     /* PMW_VCPU_PROF: that is a unix call */
@@ -1381,6 +1383,28 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
     vcpu_store_full( vt, frame );
 }
 
+/* hv_vcpu_run returned HV_SUCCESS with HV_EXIT_REASON_UNKNOWN (no syndrome, no pc). Seen in the full Steam bottle
+ * (2026-09-25): 1-8 per run, only while the UI was in use and with the host deep in swap, each killing a whole
+ * renderer or the network service. No other exit reason is lost with it, so treat it like a kick exit: take the
+ * registers, honour a kick it may have swallowed (the loop checks vel1_kick_take after any exit), write them back and
+ * re-enter. A vCPU that keeps returning it is really stuck: that stays fatal. */
+static BOOL vcpu_spurious_unknown( struct vcpu_thread *vt, const vel1_exit *e )
+{
+    static _Atomic uint64_t count;
+    uint64_t n;
+
+    if (e->hv_reason != HV_EXIT_REASON_UNKNOWN || e->hv_err || e->err) return FALSE;
+    if (++vt->unknown_run > 64) return FALSE;
+    vt->unknown_exits++;
+    n = atomic_fetch_add_explicit( &count, 1, memory_order_relaxed ) + 1;
+    if (n <= 32 || !(n & 0xff))
+        fprintf( stderr, "wine: vCPU mode: HV_EXIT_REASON_UNKNOWN #%llu in pid %d, thread %04x (run of %u; exits %llu "
+                 "kicks %llu faults %llu): re-entering\n", (unsigned long long)n, (int)getpid(),
+                 (UINT)GetCurrentThreadId(), vt->unknown_run, (unsigned long long)vt->exits,
+                 (unsigned long long)vt->kicks, (unsigned long long)vt->faults );
+    return TRUE;
+}
+
 /***********************************************************************
  *           vcpu_loop
  *
@@ -1410,6 +1434,8 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
     {
         kind = vcpu_run( vt, &e );
         frame = get_syscall_frame();
+        if (kind == VEL1_EXIT_UNKNOWN && vcpu_spurious_unknown( vt, &e )) kind = VEL1_EXIT_KICK;
+        else vt->unknown_run = 0;
         switch (kind)
         {
         case VEL1_EXIT_SYSCALL:
