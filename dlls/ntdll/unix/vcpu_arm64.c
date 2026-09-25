@@ -1597,13 +1597,18 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
 {
     EXCEPTION_RECORD rec;
     ULONG64 pc_adjust;
+    uint64_t far = e->far;
+    BOOL mem_abort = e->kind == VEL1_EXIT_FAULT_SYNC && (e->fclass == VEL1_FC_DATA_ABORT || e->fclass == VEL1_FC_INSN_ABORT);
 
+    /* W5: 32-bit code reaches W through gmm's low mirror, so it faults at p < 4 GiB while Wine's views (guard pages,
+     * write watches, stack growth) live at BASE + p. Gated on is_wow64(): the mirror is set in every vCPU process. */
+    if (mem_abort && is_wow64() && far < ((uint64_t)1 << 32)) far = gmm_vm_canon( gmm, far );
     vt->faults++;
     if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_RAISED];
-    if (e->kind == VEL1_EXIT_FAULT_SYNC && (e->fclass == VEL1_FC_DATA_ABORT || e->fclass == VEL1_FC_INSN_ABORT))
+    if (mem_abort)
     {
         uint64_t t0 = prof_interval ? prof_now() : 0;
-        gmm_vfault_t vf = gmm_vm_fault( gmm, e->far, e->esr );
+        gmm_vfault_t vf = gmm_vm_fault( gmm, far, e->esr );
 
         if (prof_interval) vcpu_prof_add( VCPU_PROF_VM_FAULT, prof_now() - t0 );
         switch (vf)
@@ -1629,14 +1634,19 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
         }
     }
     if (!vcpu_exit_to_exception( e, frame, &rec, &pc_adjust )) vcpu_fatal_exit( vt, e, frame );
-    TRACE( "fault %s code %#x at %p (far %#llx) lr %#llx sp %#llx\n", vel1_fault_class_name( e->fclass ),
-           (UINT)rec.ExceptionCode, rec.ExceptionAddress, (unsigned long long)e->far, (unsigned long long)frame->lr,
-           (unsigned long long)frame->sp );
-    if (rec.ExceptionCode == STATUS_ACCESS_VIOLATION && !virtual_handle_fault( &rec, (void *)frame->sp ))
+    TRACE( "fault %s code %#x at %p (far %#llx canon %#llx) lr %#llx sp %#llx\n", vel1_fault_class_name( e->fclass ),
+           (UINT)rec.ExceptionCode, rec.ExceptionAddress, (unsigned long long)e->far, (unsigned long long)far,
+           (unsigned long long)frame->lr, (unsigned long long)frame->sp );
+    if (rec.ExceptionCode == STATUS_ACCESS_VIOLATION)
     {
-        if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_HANDLED];
-        vcpu_store_full( vt, frame );  /* guard page, write watch or stack growth handled: retry */
-        return;
+        rec.ExceptionInformation[1] = far;
+        if (!virtual_handle_fault( &rec, (void *)frame->sp ))
+        {
+            if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_HANDLED];
+            vcpu_store_full( vt, frame );  /* guard page, write watch or stack growth handled: retry */
+            return;
+        }
+        rec.ExceptionInformation[1] = e->far;  /* the faulting code sees the address it used */
     }
     if (e->fclass == VEL1_FC_BRK && (e->esr & 0xffff) == 0xf003)
         vcpu_raise_exception_second_chance( frame, &rec );  /* __fastfail: no user handlers, as on the EL0 path */
