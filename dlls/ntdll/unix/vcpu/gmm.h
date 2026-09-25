@@ -84,6 +84,13 @@ typedef struct {
   // one s2_map per 16K chunk (the Wine M1 behaviour, and what every pre-existing caller gets). The legacy region
   // API (gmm_commit/gmm_section_create) is unaffected: it always maps per chunk.
   unsigned s2_run_chunks;
+  // v8 (vel1-gmm-v8, WoW64): the low mirror of the THIN API. 0 = off (v7 behaviour, byte for byte). Otherwise a
+  // 4 GiB-aligned, host-valid base: every thin/view descriptor for a page in W = [low_mirror_base, +4G) is also
+  // written at va - low_mirror_base, and shot down there too. Must not equal or overlap [alias_base, +4G).
+  // Refusals and the invariant: the "Coexistence" paragraph below, and README "v8: the low mirror (WoW64)".
+  // Spec: openrosetta docs/superpowers/specs/2026-09-25-wow64-vcpu-design.md §4.
+  // v9: or set later, once, with gmm_set_low_mirror (declared after gmm_vm_canon), under the same validation.
+  uint64_t low_mirror_base;
 } gmm_config_t;
 
 // gmm_config_t.flags.
@@ -334,8 +341,27 @@ gmm_fault_t gmm_fault(gmm_t *gmm, uint64_t far, uint64_t esr);
 //
 // Coexistence: the thin API and the legacy region API may share one gmm_t (one set of tables, one IPA allocator);
 // their ranges must not overlap (GMM_EEXIST), and neither may touch the low-4GiB alias window
-// [alias_base, alias_base+4G) when alias_base != 0. The thin API never writes an alias (it is for 64-bit memory;
-// low-4GiB pages keep using gmm_reserve(GMM_RESERVE_LOW4G), whose backing gmm owns).
+// [alias_base, alias_base+4G) when alias_base != 0. The thin API never writes the legacy alias window. With
+// low_mirror_base == 0 it writes no alias at all (64-bit memory; low-4GiB pages keep using
+// gmm_reserve(GMM_RESERVE_LOW4G), whose backing gmm owns). v8: with low_mirror_base set, every thin/view descriptor
+// for a page in W = [low_mirror_base, +4G) is also written, identically, at its low twin va - low_mirror_base, and
+// shot down there too; the space below 4 GiB then belongs to the mirror: every THIN mutator (gmm_vm_range_set[_pages],
+// gmm_view_map, gmm_view_unmap's thin path, gmm_view_alias) refuses a range below 4G with GMM_EEXIST (GMM_S1_NONE
+// included), and so a range in W whose twin would touch a legacy region, the legacy alias window, or a v3 anchor/view
+// (checked on the 16K-rounded range, NONE included). A legacy gmm_reserve below 4G stays legal (KUSER's LOW4G page).
+// The reverse: gmm_reserve/gmm_map_view (any flags) are GMM_EEXIST over a low twin in use, and over any part of W
+// itself (W holds thin/view memory only). A v3 anchor inside W is NOT refused (anchors write no stage-1 leaves), but
+// W is for 32-bit memory only (spec W1): never put an anchor there.
+// THE KUSER TWIN HOLE: with Wine's KUSER (a 64K GMM_RESERVE_LOW4G region at 0x7ffe0000), every thin call whose
+// 16K-rounded range touches [BASE+0x7ffe0000, BASE+0x7fff0000) is GMM_EEXIST -- GMM_S1_NONE too, so revokes and
+// reservation syncs as well. It depends on order: a whole-W NONE succeeds before KUSER is reserved and fails after
+// (mirror set at gmm_init; with v9's gmm_set_low_mirror the dividing point is the set instead, see below).
+// Wine's vcpu_revoke_pages abort()s on a NONE failure, so Wine's 32-bit allocator must keep guest [0x7ffe0000,
+// 0x7fff0000) a permanent hole (large-address-aware and top-down allocations included). A missed widening (a thin
+// call with a VA below 4G, NONE included) is GMM_EEXIST too, and would abort the same way.
+// PT pool: a fully populated W costs about 8 MiB of leaf tables per side (4 GiB / 4 KiB x 8 bytes), about 16 MiB in
+// all for the 32-bit space (the mirror adds half of it), against Wine's 64 MiB VCPU_PT_POOL_SIZE.
+// README "v8: the low mirror (WoW64)".
 
 // Per-4K target stage-1 state. A page is "committed" (its 16K chunk stays stage-2 mapped) iff GMM_S1_COMMIT is
 // set; its descriptor is valid iff it is committed AND has at least one access bit. W implies R (AArch64 has no
@@ -405,7 +431,11 @@ uint64_t gmm_debug_ipa_available(gmm_t *gmm);
 // IPA + offset with that page's committed bit set. Returns 0, or the number of violations (each printed).
 // v6: also the invariant the uniform-NONE early-out relies on (gmm.c, thin_apply_locked): outside legacy regions, the
 // alias window and registered views, every non-zero stage-1 leaf lies in a 16K chunk some run record covers (skipped
-// once a legacy region has been released: gmm_release leaves GMM_TAG_DECOMMITTED leaves behind).
+// once a legacy region has been released: gmm_release leaves GMM_TAG_DECOMMITTED leaves behind). A low twin (v8) is
+// exempt from it when its canonical page is a run record's or a view's.
+// v8: with low_mirror_base set, the mirror invariant: for every 4K page of W, the low twin's leaf and the canonical
+// leaf are both invalid or the same valid descriptor (a missing leaf table reads as invalid); a low page inside a
+// legacy region is not a twin, and its W page must be invalid. Checked always (not skipped after gmm_release).
 int gmm_debug_check(gmm_t *gmm);
 // TEST SUPPORT (v6): what the thin mutator did since gmm_init. none_early_outs: uniform GMM_S1_NONE calls that returned
 // at once because no run record touches their (16K-rounded) range; none_clips: uniform NONE calls whose range was cut
@@ -417,6 +447,46 @@ void gmm_debug_thin_counts(gmm_t *gmm, gmm_debug_thin_t *out);
 // Identity backing: returns (void *)va if the 4K page at va is committed through the thin API, else NULL.
 // (gmm_host_ptr() answers the same for thin pages, so existing callers work on either kind of memory.)
 void *gmm_vm_host_ptr(gmm_t *gmm, uint64_t va);
+// v8: the canonical VA of `va`: with the low mirror on, a VA below 4 GiB that no legacy region covers is the low twin
+// of va + low_mirror_base; anything else is returned unchanged. Wine widens a vCPU FAR with it (spec W5).
+// NOTE gmm_vm_canon(0) == low_mirror_base (0 is a VA below 4G like any other). Wine's W6 (canonicalising direct
+// Nt*VirtualMemory/section/flush address arguments below 4G) must leave 0 alone (it means "anywhere") and otherwise
+// use gmm_vm_canon, NOT +BASE: gmm_vm_canon keeps KUSER's legacy low page at 0x7ffe0000 where it is, while +BASE
+// would send a 32-bit query of KUSER to BASE+0x7ffe0000, an empty page (the KUSER twin hole above).
+// ONLY these accept either form (they canonicalise): gmm_vm_host_ptr, gmm_host_ptr (its thin branch), gmm_vm_s2_mapped
+// and gmm_vm_chunk_ipa. Canonical-only: gmm_vm_s2_run, gmm_sect_view_at (0 for a twin), the legacy gmm_query and
+// gmm_fault (they do not dealias twins), the legacy branch of gmm_host_ptr (a VA inside a legacy region is its own
+// canonical VA), and every mutator. gmm_vm_fault walks the twin as given, with the same verdict as at the canonical VA
+// (the twin's leaf equals the canonical one), but Wine canonicalises before it anyway, for virtual_handle_fault's sake.
+uint64_t gmm_vm_canon(gmm_t *gmm, uint64_t va);
+// v9 (vel1-gmm-v9, appended): turn the low mirror on AFTER gmm_init. The result is exactly the state gmm_init with
+// cfg.low_mirror_base = base would have produced, given what the gmm_t holds now. Why: Wine calls gmm_init inside
+// virtual_init, before it knows the process is WoW64 and before its allocator exists; a fixed 4 GiB reservation for W
+// is unreliable, while a 4 GiB-aligned allocator reservation works (it returned 0x3_0000_0000; Wine's measurement,
+// proton-darwin b5d7b96d). So BASE is known only after gmm_init.
+// Contract: call it once, after reserving W and before any thin/view use of W or of a VA below 4 GiB. Other gmm calls
+// may run concurrently on other threads: it takes the gmm mutex, and every reader of low_mirror_base holds that mutex
+// (gmm.c, at gmm_set_low_mirror). It writes no descriptor, issues no TLBI and makes no backend call: the refusals
+// below leave nothing in W or below 4 GiB that would need a twin.
+// Wine's order, in EVERY vCPU process, WoW64 or not (proton-darwin relay 2026-09-25; gmm_test.c N26d replays it):
+// (1) gmm_init(low_mirror_base = 0), KUSER's 64K GMM_RESERVE_LOW4G region reserved at 0x7ffe0000; (2) W reserved
+// through Wine's allocator (NtAllocateVirtualMemoryEx, 4 GiB alignment): no gmm call with PMW_VCPU_SKIP_NONE_SYNC
+// (Wine's default), else ONE gmm_vm_range_set(W, 4G, GMM_S1_NONE), which with the mirror still off succeeds and
+// records nothing (v6's uniform-NONE early-out) -- it must come BEFORE step 3: after it, a whole-W NONE touches the
+// KUSER twin hole and is GMM_EEXIST; (3) gmm_set_low_mirror(g, W): 0 in both variants, KUSER present; (4) only then
+// the TEB block, TEB32/PEB32 or any 32-bit view in W. A 64-bit process leaves the mirror set (there is no unset call).
+//   GMM_EINVAL (checked first): gmm NULL, or `base` fails gmm_init's v8 validation of cfg.low_mirror_base (the same
+//     function): 0, not 4 GiB-aligned, base > host VA max - 4G, base + 4G > 2^(64 - t0sz), or [base, +4G) touching
+//     [alias_base, +4G) when alias_base != 0.
+//   GMM_EEXIST, nothing changed: the mirror is already on (from gmm_init or an earlier call; the same base too), or the
+//     contents break a v8 invariant: a thin chunk (any stage-2 mapped identity chunk: committed, NOACCESS or retained)
+//     or a registered view or anchor touching W; a thin chunk or a registered view below 4 GiB; a legacy region
+//     (gmm_reserve or gmm_map_view, any flags) touching W. A legacy region below 4 GiB (KUSER's LOW4G page at
+//     0x7ffe0000) is allowed, as with the mirror set at init (the KUSER twin hole then applies to later thin calls). A
+//     thin reservation left at GMM_S1_NONE holds no chunk and is no obstacle, step (2)'s whole-W NONE included. An
+//     anchor touching W is refused here, although with the mirror set at init gmm_sect_create would accept one (W is
+//     for 32-bit memory only; spec W1).
+int gmm_set_low_mirror(gmm_t *gmm, uint64_t base);
 
 // gmm_vm_fault: the thin API's fault question -- "is the access this ESR describes permitted by the stage-1
 // descriptor as it is NOW?". gmm keeps no Windows state, so it never decides guard/write-watch/stack growth:

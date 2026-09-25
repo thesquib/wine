@@ -15,6 +15,20 @@
  * Threading: acquire/release/should_release/note_wait/note_block_begin/note_block_end/member_fini are called by the
  * member's own thread only. set_flags/add_flags/clear_flags may be called by any thread. Every function is safe
  * against every other member's calls.
+ *
+ * Signals (Wine's M:N review, proton-darwin 838a65d1, 2026-09-25). The pool lock p->mu is a default pthread mutex:
+ * not recursive, not async-signal-safe. These take it: init, destroy, member_init, member_fini, acquire (and waits
+ * on a condition variable under it), release, should_release, get_stats, pick_victim, pick_unblock,
+ * monitor_start/start2/stop. These do not (atomics or the caller's own member fields): note_wait, note_run_begin/end,
+ * note_block_begin/end, take_preempt, set/add/clear_flags, now_ns. Two rules for a caller whose thread can be ENDED
+ * FROM A SIGNAL HANDLER that itself calls release/member_fini (Wine: TerminateThread's SIGQUIT -> vcpu_thread_exit):
+ *   1. Every lock-taking call on that thread runs with every signal blocked. Otherwise a kill landing inside one
+ *      locks p->mu again on the same thread: that thread deadlocks, and with it every pool call in the process.
+ *   2. Keep signals blocked across each window where "holds a slot" and "owns a vCPU" disagree: from before acquire
+ *      until the vCPU is created, and from before the destroy until release returns. An exit path that releases only
+ *      what a vCPU holds otherwise leaks the slot, and member_fini then returns E_STATE (Wine reproduced this).
+ * Wine's wait pipes: with ~200+ threads the block points' fds pass FD_SETSIZE, which select() cannot watch on
+ * macOS; use poll() for any fd-based unblock.
  */
 #ifndef VEL1_POOL_H
 #define VEL1_POOL_H

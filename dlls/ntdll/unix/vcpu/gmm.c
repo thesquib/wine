@@ -81,6 +81,11 @@ enum {
   GMM_MUT_NONE_PROBE_C0 = 0x400,      // the early-out asks only whether a record covers the range's first chunk
   GMM_MUT_NONE_CLIP_WIDE = 0x800,     // the clip keeps the whole first/last 16K chunk, past the caller's va/va+sz
   GMM_MUT_DESC_SKIP_1G = 0x1000,      // the descriptor loop skips to the next 1 GiB line past ANY missing leaf table
+  // v9 (N26m): a test ENABLER, not a bug -- a thin run skips the caller-backing guard, so a native test can put a thin
+  // chunk below 4 GiB, where the 4 GiB __PAGEZERO leaves no host memory (recording backend only; nothing touched) --
+  // and the mutant proper, gmm_set_low_mirror without its contents check (gmm_debug_check must catch it)
+  GMM_MUT_NO_CALLER_GUARD = 0x2000,
+  GMM_MUT_LATE_NO_SCAN = 0x4000,
 };
 int gmm_debug_mutant;
 #define MUT(m) ((gmm_debug_mutant & (m)) != 0)
@@ -892,6 +897,45 @@ static gmm_region_t *find_region(gmm_t *g, uint64_t va) {
   }
   return NULL;
 }
+// v8 (the low mirror, gmm.h gmm_config_t.low_mirror_base): W = [low_mirror_base, +4G).
+#define GMM_4G 0x100000000ull
+#define GMM_HOST_VA_MAX 0x00007FFFFE000000ull  // MACH_VM_MAX_ADDRESS_RAW (arm64): W must be host-valid
+// The v8 rule for a low_mirror_base b != 0, shared by gmm_init and gmm_set_low_mirror (v9) so the two cannot drift:
+// W must be 4 GiB-aligned, host-valid, inside TTBR0, clear of the alias window [a, a+4G) (a = alias_base, 0 = none).
+// b > MAX - 4G, not b + 4G > MAX: a base near 2^64 must not wrap past the limit (then b + 4G cannot overflow).
+static int lm_base_ok(uint64_t b, uint64_t a, unsigned t0sz) {
+  return b && (b & (GMM_4G - 1)) == 0 && b <= GMM_HOST_VA_MAX - GMM_4G && b + GMM_4G <= (1ull << (64 - t0sz)) &&
+         !(a && b < a + GMM_4G && a < b + GMM_4G);
+}
+static inline int lm_in_window(const gmm_t *g, uint64_t va) {
+  const uint64_t b = g->cfg.low_mirror_base;
+  return b && va >= b && va - b < GMM_4G;
+}
+// Caller holds g->mtx (find_region walks g->regions).
+static uint64_t lm_canon_locked(gmm_t *g, uint64_t va) {
+  const uint64_t b = g->cfg.low_mirror_base;
+  return (b && va < GMM_4G && !find_region(g, va)) ? va + b : va;
+}
+uint64_t gmm_vm_canon(gmm_t *g, uint64_t va) {
+  pthread_mutex_lock(&g->mtx);
+  const uint64_t r = lm_canon_locked(g, va);
+  pthread_mutex_unlock(&g->mtx);
+  return r;
+}
+// v8, the reverse check: a legacy region (gmm_reserve, gmm_map_view) over [lo, hi) may not touch a low twin in use,
+// i.e. [lo, hi)'s part below 4 GiB, moved up into W, may hold no thin chunk and touch no view. Mirror off: 0.
+static int lm_twin_taken(gmm_t *g, uint64_t lo, uint64_t hi) {
+  const uint64_t b = g->cfg.low_mirror_base;
+  if (!b || lo >= GMM_4G || hi <= lo) return 0;
+  if (hi > GMM_4G) hi = GMM_4G;
+  return tchunk_any_in(&g->thin, lo + b, hi - lo) || views_touch(g, lo + b, hi + b);
+}
+// v8, ruling R8: a legacy region (gmm_reserve, gmm_map_view; any flags) may not overlap W itself: W holds thin/view
+// memory only (spec W1), and a legacy region there would have no twins (the §4 invariant, lm_canon_locked). Off: 0.
+static int lm_touches_window(const gmm_t *g, uint64_t lo, uint64_t hi) {
+  const uint64_t b = g->cfg.low_mirror_base;
+  return b && hi > lo && lo < b + GMM_4G && b < hi;
+}
 static gmm_region_t *find_region_exact(gmm_t *g, uint64_t base) {
   for (size_t i = 0; i < g->nregions; i++)
     if (g->regions[i].base == base) return &g->regions[i];
@@ -1218,6 +1262,8 @@ int gmm_init(gmm_t **out, const gmm_config_t *cfg, const gmm_backend_t *backend)
   if (!out || !cfg || !backend || !backend->s2_map || !backend->s2_unmap || !backend->tlbi_sync) return -1;
   if (!cfg->pt_pool_host || cfg->pt_pool_sz < 4096 || (cfg->pt_pool_sz % 4096) != 0) return -1;
   if (cfg->ipa_hi <= cfg->ipa_lo || (cfg->ipa_lo % 16384) != 0 || (cfg->ipa_hi % 16384) != 0) return -1;
+  // v8: W must be 4 GiB-aligned, host-valid, inside TTBR0, clear of the alias window (lm_base_ok, shared with v9)
+  if (cfg->low_mirror_base && !lm_base_ok(cfg->low_mirror_base, cfg->alias_base, cfg->t0sz)) return GMM_EINVAL;
 
   gmm_t *g = calloc(1, sizeof(gmm_t));
   if (!g) return -1;
@@ -1288,6 +1334,44 @@ void gmm_destroy(gmm_t *g) {
 uint64_t gmm_ttbr0(gmm_t *g) { return g->root_ipa; }
 
 // ================================================================================================================
+// v9 (vel1-gmm-v9): gmm_set_low_mirror, the low mirror set after gmm_init (gmm.h). Wine's gmm_init runs before it
+// knows the process is WoW64; BASE comes later, from a 4 GiB-aligned allocator reservation.
+// Why the refusals make the result equal gmm_init's: with the mirror on, the §4 invariant asks every W page's twin to
+// carry its leaf, and v8's refusals keep thin/view memory out of the low 4 GiB and legacy regions out of W. A gmm_t with
+// no thin chunk, view or anchor in W, no thin chunk or view below 4 GiB and no legacy region in W holds no valid leaf
+// in W (a W page without a chunk or view is RESERVED, 0, or a released legacy region's DECOMMITTED: invalid either
+// way), so every twin is already correct and there is nothing to write or shoot down; everything else it may hold
+// (64-bit thin memory and views, legacy regions below 4 GiB, NONE-only thin reservations) is what v8 allows too.
+// CONCURRENCY (the v9 audit): low_mirror_base is the one gmm_config_t field that changes after gmm_init, only here,
+// once, from 0 to BASE, under g->mtx. Every read of it holds g->mtx: the helpers lm_in_window, lm_canon_locked,
+// lm_twin_taken, lm_touches_window, lm_range_forbidden and lm_slot, and the direct reads, are reached only from
+// gmm_vm_canon, gmm_reserve, gmm_map_view, gmm_host_ptr, gmm_vm_s2_mapped, gmm_vm_host_ptr, gmm_vm_chunk_ipa,
+// gmm_view_alias, gmm_debug_check (dcheck_leaves, dcheck_mirror) and the mutators thin_apply_locked,
+// view_apply_locked and view_unmap_locked, whose callers hold the mutex for the whole call (none drops it). These never
+// read it: gmm_ttbr0 and gmm_walk (lock-free), gmm_fault and gmm_vm_fault (they take the mutex), and the vCPUs' own
+// table walks. So a
+// plain field is enough: the mutex orders the setter against every reader; a call on another thread runs wholly before
+// it (and its state is what the setter checks) or wholly after (and sees BASE). alias_base and t0sz, read here before
+// the lock, never change after gmm_init.
+int gmm_set_low_mirror(gmm_t *g, uint64_t base) {
+  if (!g || !lm_base_ok(base, g->cfg.alias_base, g->cfg.t0sz)) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  int rc = GMM_EEXIST;
+  if (g->cfg.low_mirror_base) goto out;  // once only, the same base included
+  if (!MUT(GMM_MUT_LATE_NO_SCAN) &&
+      (tchunk_any_in(&g->thin, base, GMM_4G) || views_touch(g, base, base + GMM_4G) ||  // thin/view memory in W
+       anchors_touch(g, base, base + GMM_4G) ||                                         // an anchor in W (spec W1)
+       tchunk_any_in(&g->thin, 0, GMM_4G) || views_touch(g, 0, GMM_4G) ||            // thin/view memory below 4G
+       regions_overlap(g, base, GMM_4G)))  // a legacy region touching W (lm_touches_window's rule, ruling R8)
+    goto out;
+  g->cfg.low_mirror_base = base;  // no descriptor, no TLBI, no backend call (see above)
+  rc = 0;
+out:
+  pthread_mutex_unlock(&g->mtx);
+  return rc;
+}
+
+// ================================================================================================================
 // gmm_reserve.
 int gmm_reserve(gmm_t *g, uint64_t va, size_t sz, unsigned flags) {
   if (sz == 0 || (va % 65536) != 0 || (sz % 65536) != 0) return -1;
@@ -1303,6 +1387,10 @@ int gmm_reserve(gmm_t *g, uint64_t va, size_t sz, unsigned flags) {
   if (regions_overlap(g, va, sz)) goto out;
   if (tchunk_any_in(&g->thin, va, sz)) goto out;  // Wine M1: never over committed thin/identity memory
   if (sect_overlap_forbidden(g, va, va + sz)) goto out;  // v3: never over an anchor or a view
+  if (lm_twin_taken(g, va, va + sz) || lm_touches_window(g, va, va + sz)) {  // v8: no mirrored twin; not in W (R8)
+    rc = GMM_EEXIST;
+    goto out;
+  }
 
   gmm_region_t rec = {0};
   rec.base = va;
@@ -1646,6 +1734,10 @@ int gmm_map_view(gmm_t *g, gmm_section_t *section, uint64_t off, uint64_t va, si
   if (regions_overlap(g, va, sz)) goto out;
   if (tchunk_any_in(&g->thin, va, sz)) goto out;  // Wine M1: never over committed thin/identity memory
   if (sect_overlap_forbidden(g, va & ~16383ull, round16k(va + sz))) goto out;  // v3: never over an anchor/view
+  if (lm_twin_taken(g, va & ~16383ull, round16k(va + sz)) || lm_touches_window(g, va, va + sz)) {  // v8 (+R8)
+    rc = GMM_EEXIST;
+    goto out;
+  }
 
   gmm_region_t rec = {0};
   rec.base = va;
@@ -1763,6 +1855,7 @@ void *gmm_host_ptr(gmm_t *g, uint64_t va) {
       p = (uint8_t *)r->section->host[sidx] + (soff - sidx * 16384);
     }
   } else {
+    va = lm_canon_locked(g, va);  // v8: the low twin answers as its canonical page (as in gmm_vm_host_ptr)
     int handled;  // v3: a view page (committed descriptor) or an anchor (NULL)
     p = v3_host_ptr_locked(g, va, &handled);
     // Wine M1 thin/identity memory: the host pointer IS the VA, while the 4K page is committed.
@@ -2005,6 +2098,26 @@ static int thin_overlap_forbidden(gmm_t *g, uint64_t va, uint64_t sz) {
   }
   // v3 layer 2: anchors and views are never identity memory
   return !MUT(GMM_MUT_NO_LAYER2) && sect_overlap_forbidden(g, va, va + sz);
+}
+// v8: [va, va+sz)'s part inside W may not have a low twin touching a legacy region, the legacy alias window or a v3
+// anchor/view. A range below 4 GiB is refused outright while the mirror is on: that space is the mirror's.
+static int lm_range_forbidden(gmm_t *g, uint64_t va, uint64_t sz) {
+  const uint64_t b = g->cfg.low_mirror_base;
+  if (!b) return 0;
+  if (va < GMM_4G) return 1;
+  const uint64_t lo = va > b ? va : b, hi = va + sz < b + GMM_4G ? va + sz : b + GMM_4G;
+  return lo < hi && thin_overlap_forbidden(g, lo - b, hi - lo);
+}
+// v8: the low twin's leaf slot for canonical pva (in W), with a one-entry 2 MiB leaf cache like the V6 loop's.
+static uint64_t *lm_slot(gmm_t *g, uint64_t pva, uint64_t **leaf, uint64_t *leaf2m) {
+  const uint64_t lva = pva - g->cfg.low_mirror_base;
+  if (!V6) return pt_lookup_slot(g, lva);
+  if ((lva & ~0x1FFFFFull) != *leaf2m) {
+    uint64_t span = 0;
+    *leaf = pt_lookup_leaf(g, lva, &span);
+    *leaf2m = lva & ~0x1FFFFFull;
+  }
+  return *leaf ? &(*leaf)[(lva >> 12) & 0x1FFull] : NULL;
 }
 
 // ================================================================================================================
@@ -2276,7 +2389,8 @@ static int view_apply_locked(gmm_t *g, const view_rec_t *v, uint64_t va, size_t 
   const uint64_t so0 = v->off + (va - v->va);  // section offset of the first page
   const uint64_t base = MUT(GMM_MUT_CHUNK_BY_VIEW) ? v->va - v->off : s->anchor;  // chunk key/host base
   const size_t nch = (size_t)((round16k(so0 + (uint64_t)npages * 4096) - (so0 & ~16383ull)) / 16384);
-  uint64_t *ck = malloc(nch * sizeof *ck), *tl = malloc(npages * sizeof *tl);
+  // v8: with the mirror on, every page may also have its low twin shot down
+  uint64_t *ck = malloc(nch * sizeof *ck), *tl = malloc((g->cfg.low_mirror_base ? 2 : 1) * npages * sizeof *tl);
   int rc = GMM_ENOMEM;
   if (!ck || !tl) goto out;
   size_t n = 0;
@@ -2290,8 +2404,11 @@ static int view_apply_locked(gmm_t *g, const view_rec_t *v, uint64_t va, size_t 
   if (ipa_available(g) < n) goto out;
   for (size_t i = 0; i < npages; i++) {
     const uint64_t pva = va + (uint64_t)i * 4096;
-    if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni) || pt_lookup_slot(g, pva)) continue;
-    if ((rc = pt_ensure(g, pva)) != 0) goto out;
+    if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
+    if (!pt_lookup_slot(g, pva) && (rc = pt_ensure(g, pva)) != 0) goto out;
+    if (lm_in_window(g, pva) && !pt_lookup_slot(g, pva - g->cfg.low_mirror_base) &&  // v8: the low twin's too
+        (rc = pt_ensure(g, pva - g->cfg.low_mirror_base)) != 0)
+      goto out;
   }
   if ((rc = sect_map_chunks_locked(g, s, base, ck, n)) != 0) goto out;  // (A) guard + reserve, (B) the maps
   size_t nt = 0;
@@ -2315,6 +2432,23 @@ static int view_apply_locked(gmm_t *g, const view_rec_t *v, uint64_t va, size_t 
     __atomic_store_n(slot, new_desc, __ATOMIC_RELEASE);
     trace_push(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva, leaf_trace_ipa(new_desc));
     if (valid_change_needs_tlbi(g, old_desc, new_desc)) tl[nt++] = pva;
+    // v8: the low twin mirrors every canonical write, as in thin_apply_locked. The skips above (old == new, no
+    // canonical table) need no twin write: by the mirror invariant the twin already equals the canonical leaf there.
+    if (lm_in_window(g, pva)) {
+      const uint64_t lva = pva - g->cfg.low_mirror_base;
+      uint64_t *ls = pt_lookup_slot(g, lva);
+      const uint64_t lold = ls ? *ls : 0;
+      if (!ls && (new_desc & 1ull)) {
+        fprintf(stderr, "gmm: BUG: no low-twin table for view va=0x%llx after pt_ensure -- aborting\n",
+                (unsigned long long)pva);
+        abort();
+      }
+      if (ls && lold != new_desc) {
+        __atomic_store_n(ls, new_desc, __ATOMIC_RELEASE);
+        trace_push(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, lva, leaf_trace_ipa(new_desc));
+      }
+      if (valid_change_needs_tlbi(g, lold, new_desc)) tl[nt++] = lva;
+    }
   }
   if (nt && !MUT(GMM_MUT_NO_VIEW_TLBI)) do_tlbi(g, tl, nt);  // (D)
   rc = 0;
@@ -2336,7 +2470,7 @@ static int view_unmap_locked(gmm_t *g, view_rec_t *v) {
     abort();
   }
   const size_t np = (size_t)(v->size / 4096);
-  uint64_t *tl = malloc(np * sizeof *tl);
+  uint64_t *tl = malloc((g->cfg.low_mirror_base ? 2 : 1) * np * sizeof *tl);  // v8: room for the low twins
   if (!tl) return GMM_ENOMEM;
   size_t nt = 0;
   const uint64_t inv = (uint64_t)GMM_TAG_RESERVED << GMM_TAG_SHIFT;
@@ -2348,6 +2482,15 @@ static int view_unmap_locked(gmm_t *g, view_rec_t *v) {
     __atomic_store_n(slot, inv, __ATOMIC_RELEASE);
     trace_push(g, GMM_EV_PTE_INVALID, pva, GMM_TAG_RESERVED);
     if (old_desc & 1ull) tl[nt++] = pva;
+    if (lm_in_window(g, pva)) {  // v8: the low twin the same way (the skip above: the twin already equals it)
+      const uint64_t lva = pva - g->cfg.low_mirror_base;
+      uint64_t *ls = pt_lookup_slot(g, lva);
+      if (!ls || *ls == inv) continue;
+      const uint64_t lold = *ls;
+      __atomic_store_n(ls, inv, __ATOMIC_RELEASE);
+      trace_push(g, GMM_EV_PTE_INVALID, lva, GMM_TAG_RESERVED);
+      if (lold & 1ull) tl[nt++] = lva;
+    }
   }
   if (nt) do_tlbi(g, tl, nt);
   free(tl);
@@ -2364,7 +2507,8 @@ int gmm_view_alias(gmm_t *g, gmm_sect_t *s, uint64_t off, uint64_t va, size_t si
   int rc = GMM_EINVAL;
   if (!anchor_node_of(&g->anchors, g->anchors.root, s) || off >= s->size || size > s->size - off) goto out;
   rc = GMM_EEXIST;
-  if (thin_overlap_forbidden(g, va, len) || tchunk_any_in(&g->thin, va, len)) goto out;
+  if (thin_overlap_forbidden(g, va, len) || tchunk_any_in(&g->thin, va, len) || lm_range_forbidden(g, va, len))
+    goto out;  // v8: nor below 4 GiB, nor with a low twin over a legacy region/window or an anchor/view
   rc = GMM_EGUARD;
   if (!MUT(GMM_MUT_NO_LAYER3) && !view_remap_ok(s, off, va, len)) goto out;
   rc = GMM_ENOMEM;
@@ -2483,6 +2627,7 @@ typedef struct {
 } tgroup_t;
 typedef struct {
   uint64_t va, desc;  // a survivor descriptor saved across a whole-run remap
+  uint64_t key;       // v8: the canonical page va belongs to (== va, or va + low_mirror_base for a low twin)
 } tsaved_t;
 
 // The one mutator behind gmm_vm_range_set/_pages/gmm_view_map/gmm_view_unmap. Caller holds g->mtx.
@@ -2513,6 +2658,8 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
   // Checked on the 16K-rounded range: a stage-2 map covers the whole host page, so a thin range may not even share
   // a 16K chunk with a legacy region or the alias window.
   if (thin_overlap_forbidden(g, c0, (uint64_t)nchunks * 16384)) return GMM_EEXIST;
+  // v8: nor may its low twin touch any of those (and, with the mirror on, nothing below 4 GiB is thin memory)
+  if (lm_range_forbidden(g, c0, (uint64_t)nchunks * 16384)) return GMM_EEXIST;
   // v6 (vel1-gmm-v6), the uniform-NONE early-out and clip (gmm/README.md "v6 memop"; relay openrosetta
   // docs/relays/fex-side-memop-cost-2026-09-25.md): Wine's reserve and release of a multi-GiB view is a NONE call over
   // the whole range, and every loop below is O(pages) -- ~5.5 ns per 4K page with nothing to do (16 GiB: 23.8 ms).
@@ -2600,8 +2747,10 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     for (size_t i = 0; i < npages; i++) {
       const uint64_t pva = va + i * 4096;
       if (!s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
-      if (pt_lookup_slot(g, pva)) continue;
-      if ((rc = pt_ensure(g, pva)) != 0) goto out;
+      if (!pt_lookup_slot(g, pva) && (rc = pt_ensure(g, pva)) != 0) goto out;
+      if (lm_in_window(g, pva) && !pt_lookup_slot(g, pva - g->cfg.low_mirror_base) &&  // v8: the low twin's too
+          (rc = pt_ensure(g, pva - g->cfg.low_mirror_base)) != 0)
+        goto out;
     }
   } else if (s1arr || s1_is_valid_desc(s1uni)) {
     uint64_t done2m = ~0ull;  // the 2 MiB span whose leaf table is known to exist
@@ -2609,6 +2758,8 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       const uint64_t pva = va + i * 4096;
       if ((pva & ~0x1FFFFFull) == done2m || !s1_is_valid_desc(s1arr ? s1arr[i] : s1uni)) continue;
       if ((rc = pt_ensure(g, pva)) != 0) goto out;
+      // v8: the low twin's leaf table too (W is 4 GiB-aligned, so the twin's 2 MiB span is the same stride)
+      if (lm_in_window(g, pva) && (rc = pt_ensure(g, pva - g->cfg.low_mirror_base)) != 0) goto out;
       done2m = pva & ~0x1FFFFFull;
     }
   }
@@ -2618,7 +2769,8 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
   for (size_t ci = 0; ci < nchunks; ci++) {
     if (!plan[ci].need_map) continue;
     uint64_t rend = 0;
-    if (caller_region_end(plan[ci].va, &rend) != 0) {
+    if (MUT(GMM_MUT_NO_CALLER_GUARD)) rend = UINT64_MAX;  // v9 N26m test enabler (gmm_test_mut only)
+    else if (caller_region_end(plan[ci].va, &rend) != 0) {
       rc = GMM_EGUARD;
       goto out;
     }
@@ -2732,8 +2884,10 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     }
   }
   PROF_LAP(URECS);
-  tlbi_va = malloc((npages + nsaved_cap + 1) * sizeof(uint64_t));
-  saved = malloc((nsaved_cap + 1) * sizeof(tsaved_t));
+  // v8: with the mirror on, every page and every saved survivor may also have its low twin shot down / saved
+  const size_t lmf = g->cfg.low_mirror_base ? 2 : 1;
+  tlbi_va = malloc((lmf * (npages + nsaved_cap) + 1) * sizeof(uint64_t));
+  saved = malloc((lmf * nsaved_cap + 1) * sizeof(tsaved_t));
   if (!tlbi_va || !saved || tchunk_reserve(&g->thin, need_map) != 0 ||
       rec_reserve(g, ngrp + 2 * nchunks + 2 * nurec + 2) != 0) {
     for (size_t gj = 0; gj < ngrp; gj++) free_ipa_range(g, grp[gj].ipa, grp[gj].n);
@@ -2806,6 +2960,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
   if (!s1arr) tmpl[s1uni] = s1_encode(s1uni, 0), have_tmpl = 1u << s1uni;
   const int tracing = (g->cfg.flags & GMM_CFG_TRACE) != 0;
   uint64_t *leaf = NULL, leaf2m = ~0ull;  // the leaf table of the 2 MiB span leaf2m (NULL: missing)
+  uint64_t *lleaf = NULL, lleaf2m = ~0ull;  // v8: the same for the low twin (lm_slot)
   for (size_t i = 0; i < npages; i++) {
     const uint64_t pva = va + i * 4096;
     const unsigned s1 = s1arr ? s1arr[i] : s1uni;
@@ -2843,6 +2998,24 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     if (tracing)
       trace_append(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva, leaf_trace_ipa(new_desc), 0);
     if (valid_change_needs_tlbi(g, old_desc, new_desc)) tlbi_va[ntlbi++] = pva;
+    // v8: the low twin mirrors every canonical write. The skips above (old == new, no canonical table, a missing
+    // subtree) need no twin write: by the mirror invariant the twin already equals the canonical leaf there.
+    if (lm_in_window(g, pva)) {
+      uint64_t *ls = lm_slot(g, pva, &lleaf, &lleaf2m);
+      const uint64_t lold = ls ? *ls : 0;
+      if (!ls && (new_desc & 1ull)) {
+        fprintf(stderr, "gmm: BUG: no low-twin table for va=0x%llx after pt_ensure -- aborting\n",
+                (unsigned long long)pva);
+        abort();
+      }
+      if (ls && lold != new_desc) {
+        __atomic_store_n(ls, new_desc, __ATOMIC_RELEASE);
+        if (tracing)
+          trace_append(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva - g->cfg.low_mirror_base,
+                       leaf_trace_ipa(new_desc), 0);
+      }
+      if (valid_change_needs_tlbi(g, lold, new_desc)) tlbi_va[ntlbi++] = pva - g->cfg.low_mirror_base;
+    }
   }
   for (size_t ci = 0; ci < nchunks; ci++)
     if (plan[ci].e) plan[ci].e->committed = plan[ci].new_mask;
@@ -2864,11 +3037,20 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
           const uint64_t pva = cva + (uint64_t)p * 4096;
           uint64_t *slot = pt_lookup_slot(g, pva);
           if (!slot || !(*slot & 1ull)) continue;
-          saved[nsaved++] = (tsaved_t){pva, *slot};
+          saved[nsaved++] = (tsaved_t){pva, *slot, pva};
           const uint64_t inv = (uint64_t)GMM_TAG_NOACCESS << GMM_TAG_SHIFT;
           __atomic_store_n(slot, inv, __ATOMIC_RELEASE);
           trace_push(g, GMM_EV_PTE_INVALID, pva, GMM_TAG_NOACCESS);
           tlbi_va[ntlbi++] = pva;
+          if (lm_in_window(g, pva)) {  // v8: the low twin the same way (restored with it in (E))
+            const uint64_t lva = pva - g->cfg.low_mirror_base;
+            uint64_t *ls = pt_lookup_slot(g, lva);
+            if (!ls || !(*ls & 1ull)) continue;
+            saved[nsaved++] = (tsaved_t){lva, *ls, pva};
+            __atomic_store_n(ls, inv, __ATOMIC_RELEASE);
+            trace_push(g, GMM_EV_PTE_INVALID, lva, GMM_TAG_NOACCESS);
+            tlbi_va[ntlbi++] = lva;
+          }
         }
       }
     }
@@ -2955,7 +3137,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
         c += n;
       }
       for (size_t i = 0; i < nsaved; i++) {
-        if (saved[i].va < old.va || saved[i].va >= old.va + old.nchunks * 16384) continue;
+        if (saved[i].key < old.va || saved[i].key >= old.va + old.nchunks * 16384) continue;  // v8: key, not va
         __atomic_store_n(pt_lookup_slot(g, saved[i].va), saved[i].desc, __ATOMIC_RELEASE);
         trace_push(g, GMM_EV_PTE_VALID, saved[i].va, leaf_trace_ipa(saved[i].desc));
       }
@@ -3050,6 +3232,7 @@ int gmm_view_unmap(gmm_t *g, uint64_t va, size_t size) {
 }
 int gmm_vm_s2_mapped(gmm_t *g, uint64_t va) {
   pthread_mutex_lock(&g->mtx);
+  va = lm_canon_locked(g, va);  // v8: the low twin answers as its canonical page
   // v3: an anchor page is mapped from its chunk's first commit through a view until gmm_sect_destroy; a view VA
   // never is (Wine may replace the view's host remap once gmm_view_unmap returned).
   const anchor_rec_t *a = anchor_at(g, va);
@@ -3061,6 +3244,7 @@ int gmm_vm_s2_mapped(gmm_t *g, uint64_t va) {
 }
 void *gmm_vm_host_ptr(gmm_t *g, uint64_t va) {
   pthread_mutex_lock(&g->mtx);
+  va = lm_canon_locked(g, va);  // v8: the low twin answers as its canonical page
   int handled;
   void *p = v3_host_ptr_locked(g, va, &handled);
   if (!handled) {
@@ -3116,6 +3300,7 @@ void gmm_vm_s2_stats(gmm_t *g, gmm_s2_stats_t *out) {
 }
 uint64_t gmm_vm_chunk_ipa(gmm_t *g, uint64_t va) {
   pthread_mutex_lock(&g->mtx);
+  va = lm_canon_locked(g, va);  // v8: the low twin answers as its canonical page
   const anchor_rec_t *a = anchor_at(g, va);  // v3: an anchor chunk's IPA; a view VA owns no chunk
   const tchunk_t *c = view_owning(g, va) ? NULL : tchunk_find(a ? &a->sect->chunks : &g->thin, va & ~16383ull);
   const uint64_t ipa = c ? c->ipa : UINT64_MAX;
@@ -3168,9 +3353,35 @@ static int dcheck_leaves(gmm_t *g, uint64_t table_ipa, int level, uint64_t va_ba
     }
     if (find_region(g, va) || view_owning(g, va) || rec_find(g, va & ~16383ull)) continue;
     if (g->cfg.alias_base && va >= g->cfg.alias_base && va - g->cfg.alias_base < 0x100000000ull) continue;
+    if (g->cfg.low_mirror_base && va < GMM_4G &&
+        (rec_find(g, (va + g->cfg.low_mirror_base) & ~16383ull) || view_owning(g, va + g->cfg.low_mirror_base)))
+      continue;  // v8: a low twin; its equality with the canonical leaf is dcheck_mirror's
     if (++bad <= 8)
       fprintf(stderr, "gmm_debug_check: va 0x%llx has descriptor 0x%llx but no run record covers its chunk (the "
                       "NONE early-out's invariant)\n", (unsigned long long)va, (unsigned long long)d);
+  }
+  return bad;
+}
+// v8: the mirror invariant (spec §4): for every 4K page of W, the low twin's leaf equals the canonical leaf -- both
+// invalid, or the same valid descriptor (a missing leaf table reads as invalid). Exception: a low page inside a legacy
+// region (KUSER's LOW4G shape) is not a twin; there only the canonical side is checked, and it must be invalid (the
+// thin/view refusals keep that W page unused). Walks W in 2 MiB leaf tables. Prints at most 8 violations.
+static int dcheck_mirror(gmm_t *g, int bad) {
+  const uint64_t b = g->cfg.low_mirror_base;
+  if (!b) return bad;
+  for (uint64_t off = 0; off < GMM_4G; off += 0x200000ull) {
+    uint64_t sh = 0, sl = 0;
+    const uint64_t *lh = pt_lookup_leaf(g, b + off, &sh), *ll = pt_lookup_leaf(g, off, &sl);
+    if (!lh && !ll) continue;
+    for (unsigned i = 0; i < 512; i++) {
+      const uint64_t h = lh ? lh[i] : 0, l = ll ? ll[i] : 0, lva = off + i * 4096ull;
+      if ((h & 1) == (l & 1) && (!(h & 1) || h == l)) continue;
+      if (!(h & 1) && find_region(g, lva)) continue;  // a legacy low page, its W page unused
+      if (++bad <= 8)
+        fprintf(stderr, "gmm_debug_check: low twin 0x%llx has 0x%llx but its canonical 0x%llx has 0x%llx\n",
+                (unsigned long long)lva, (unsigned long long)l, (unsigned long long)(b + lva),
+                (unsigned long long)h);
+    }
   }
   return bad;
 }
@@ -3356,6 +3567,9 @@ int gmm_debug_check(gmm_t *g) {
   // DECOMMITTED leaves behind (g->legacy_released: the early-out is off then too)
   if (!g->legacy_released)
     bad = dcheck_leaves(g, g->root_ipa, gmm_start_level_for_t0sz(g->cfg.t0sz), 0, bad);
+  // v8: the mirror invariant. Not under the legacy_released skip: a released legacy region leaves only invalid leaves
+  // behind, and dcheck_mirror compares valid bits and valid descriptors only.
+  bad = dcheck_mirror(g, bad);
   // legacy chunks and section chunks: never in the free list
   for (size_t i = 0; i < g->nregions; i++) {
     const gmm_region_t *r = &g->regions[i];
