@@ -592,9 +592,10 @@ static int battleye_launcher_redirect_hack( const WCHAR *app_name, WCHAR *new_na
 /* Proton macOS 2026-09-26: PROTON_LAUNCHER_REDIRECT="<launcher.exe>=<game exe relative to the launcher's dir>[;...]"
  * starts the game instead of a launcher that does not work in our stack, when Steam's Play runs the launcher (Steam's
  * only launch entry for DOOM Eternal is launcher\idTechLauncher.exe, whose CEF error-loops):
- * "idTechLauncher.exe=..\DOOMEternalx64vk.exe". The launcher is matched by file name, case-insensitively; the target
- * must exist, else the launcher runs. The command line keeps the launcher's arguments and the working directory
- * becomes the game's directory. Set in Steam's environment (the recipes' bottle.protonConfig.launcherRedirect). */
+ * "idTechLauncher.exe=..\DOOMEternalx64vk.exe". The launcher is matched by file name, case-insensitively; the first
+ * entry whose target exists wins (titles share launcher names), and with none the launcher runs. The command line
+ * keeps the launcher's arguments and the working directory becomes the game's directory. Set in Steam's environment
+ * (the recipes' bottle.protonConfig.launcherRedirect). */
 static BOOL proton_launcher_redirect( const WCHAR *app_name, WCHAR *new_name, DWORD new_name_len, WCHAR *new_dir,
                                       DWORD new_dir_len )
 {
@@ -623,9 +624,9 @@ static BOOL proton_launcher_redirect( const WCHAR *app_name, WCHAR *new_name, DW
         attr = GetFileAttributesW( new_name );
         if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
         {
-            WARN( "launcher %s: redirect target %s not found, running the launcher\n", debugstr_w(app_name),
-                  debugstr_w(new_name) );
-            return FALSE;
+            /* titles share launcher names (both DOOMs run idTechLauncher.exe): try the next entry */
+            WARN( "launcher %s: redirect target %s not found\n", debugstr_w(app_name), debugstr_w(new_name) );
+            continue;
         }
         if (wcslen( new_name ) >= new_dir_len) return FALSE;
         wcscpy( new_dir, new_name );
