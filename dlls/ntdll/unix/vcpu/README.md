@@ -5,7 +5,11 @@ Hypervisor.framework vCPU. Nothing here is built on any other platform: the `*_a
 nothing unless `__APPLE__ && __aarch64__`.
 
 Source: fex_macos, branch `upstream-sync-20260921`, `openrosetta/hvf_proto/{vcpu_el1,gmm}/`, at two tags:
-- `gmm.[ch]`: tag `vel1-gmm-v9` (fex commit `18e47cbc4`); `gmm_walk.[ch]` are unchanged since v6 (`22a644a27`). v6 is the
+- `gmm.[ch]`: tag `vel1-gmm-v10` (fex commit `c3ad23ef3`, code as of `339a2887f`). v10 lets the page-table pool span
+  several host map entries (XNU splits an anonymous mmap into 128 MiB entries; v9 capped the pool there), mapping
+  each piece with its own `s2_map`, and adds `gmm_pt_pool_stats` (`size`, `used` = the high-water mark, `enopt`),
+  which the `PMW_VCPU_PROF` "pt pool" line prints. The pool must still be ONE `gmm_alloc_backing` allocation.
+  `gmm_walk.[ch]` are unchanged since v6 (`22a644a27`). v6 is the
   memory-op speed fix (the event trace is opt-in, `GMM_CFG_TRACE`, which Wine must not set, a uniform-NONE early-out, a
   faster descriptor loop). v5 added `gmm_sect_anchor_from_fd`, which Wine doesn't use (shared-section anchors are made in
   `virtual.c`). v8 adds the WoW64 low mirror (`cfg.low_mirror_base`: the 32-bit space at `BASE + p` is also mapped at `p`).

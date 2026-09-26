@@ -159,15 +159,23 @@ static int host_region_at(uint64_t va, host_region_t *out) {
 // Returns 0 if [host, host+sz) is entirely our own VM_MAKE_TAG'd, non-executable anonymous memory; -1 otherwise.
 // Callers abort() on -1 (§2: "before every s2_map, mach_vm_region must show the GMM tag and no VM_PROT_EXECUTE,
 // else abort" — extends hvf_fex_vk.cpp:367-374's executable-anonymous-memory guard with the tag check).
+// The shape half of the guard, for the entry `hr` that host_region_at(va) returned: something is mapped AT va (no gap),
+// not a submap, our tag, not executable. Coverage (how far the entry reaches) is the caller's: gmm_backing_check wants
+// one entry to cover the whole range; v10's pool walk (gmm_init) takes the range entry by entry, each piece through
+// this same predicate.
+static int backing_entry_ok(const host_region_t *hr, uint64_t va) {
+  if (hr->start > va) return 0;       // nothing mapped at va: a gap
+  if (hr->is_submap) return 0;
+  if (hr->tag != GMM_VM_TAG) return 0;
+  if (hr->prot & VM_PROT_EXECUTE) return 0;
+  return 1;
+}
 static int gmm_backing_check(void *host, size_t sz) {
   const uint64_t va = (uint64_t)(uintptr_t)host;
   host_region_t hr;
   if (host_region_at(va, &hr) != 0) return -1;
-  if (hr.start > va) return -1;       // nothing mapped at host: a gap
+  if (!backing_entry_ok(&hr, va)) return -1;
   if (hr.end < va + sz) return -1;    // region doesn't cover the whole chunk
-  if (hr.is_submap) return -1;
-  if (hr.tag != GMM_VM_TAG) return -1;
-  if (hr.prot & VM_PROT_EXECUTE) return -1;
   return 0;
 }
 
@@ -628,6 +636,7 @@ struct gmm {
 
   uint64_t root_ipa;      // TTBR0 value: IPA of the top-level table
   uint64_t pt_pool_used;   // bump allocator into cfg.pt_pool_host/pt_pool_sz; "tables never freed" (§2)
+  uint64_t pt_pool_enopt;  // v10: failed table allocations (pool full), for gmm_pt_pool_stats
 
   uint64_t ipa_bump;        // lowest never-handed-out data IPA: [ipa_bump, cfg.ipa_hi) is free
   // Freed IPA ranges, reusable once their revocation's tlbi_sync AND s2_unmap have returned (§2, quarantine: since
@@ -984,7 +993,10 @@ static uint64_t dealias(gmm_t *g, uint64_t va) {
 // ================================================================================================================
 // PT pool suballocator + descriptor tree (§2, GuestMirror pattern: same 4-level-max walk, tables never freed).
 static uint64_t pt_alloc_table(gmm_t *g) {
-  if (g->pt_pool_used + 4096 > g->cfg.pt_pool_sz) return GMM_IPA_NONE;
+  if (g->pt_pool_used + 4096 > g->cfg.pt_pool_sz) {
+    g->pt_pool_enopt++;  // v10: counted for gmm_pt_pool_stats (every caller holds g->mtx, or is gmm_init)
+    return GMM_IPA_NONE;
+  }
   uint64_t ipa = g->cfg.pt_pool_ipa + g->pt_pool_used;
   memset((uint8_t *)g->cfg.pt_pool_host + g->pt_pool_used, 0, 4096);
   g->pt_pool_used += 4096;
@@ -1257,6 +1269,87 @@ void gmm_free_backing(void *p, size_t sz) { gmm_host_free(p, sz); }
 int gmm_debug_tag_flag(void) { return gmm_tag_flag(); }
 
 // ================================================================================================================
+// v10: the PT pool, piece by piece. Pass 1 walks [host, host+sz) entry by entry and checks every piece
+// [va, min(entry end, host+sz)) with the backing guard's own predicate (backing_entry_ok: no gap, no submap, tag 250,
+// not executable) -- the caller-supplied pool is memory a live backend hands to hv_vm_map, so it must pass the guard;
+// fail rather than abort, since gmm_init has a clean error path and the caller may retry with a correct allocation.
+// Pass 2 maps each piece at pt_pool_ipa + (va - host), R|W, in order; on a failure it unmaps the pieces already
+// mapped (reverse order) -- never build tables into a pool the VM cannot see (G1 review) -- and returns -1.
+// The unwind aborts if an s2_unmap of a piece fails, like every other exact rollback unmap in gmm: returning -1 with
+// a piece still stage-2 mapped would let the caller free (and the kernel reuse) memory the VM can still reach.
+// On success the piece list is handed to the caller (*pcs, *npcs; free with pool_pieces_free), so gmm_init can undo
+// the maps with the same unwind if a later step fails.
+typedef struct {
+  uint64_t va, sz;
+} pool_piece_t;
+static void pool_unmap_pieces(gmm_t *g, const pool_piece_t *pc, size_t n) {
+  const uint64_t host = (uint64_t)(uintptr_t)g->cfg.pt_pool_host;
+  while (n--) {
+    const uint64_t ipa = g->cfg.pt_pool_ipa + (pc[n].va - host);
+    const uint32_t ur = g->backend.s2_unmap(ipa, (size_t)pc[n].sz);
+    if (ur != 0) {
+      fprintf(stderr, "gmm: PT pool rollback s2_unmap(ipa=0x%llx, %llu KiB) FAILED 0x%x -- aborting with it mapped\n",
+              (unsigned long long)ipa, (unsigned long long)(pc[n].sz >> 10), ur);
+      abort();
+    }
+  }
+}
+static int pool_map_pieces(gmm_t *g, pool_piece_t **pcs, size_t *npcs) {
+  const uint64_t host = (uint64_t)(uintptr_t)g->cfg.pt_pool_host, end = host + g->cfg.pt_pool_sz;
+  *pcs = NULL;
+  *npcs = 0;
+  if (end < host) return -1;
+  pool_piece_t *pc = NULL;
+  size_t n = 0, cap = 0;
+  for (uint64_t va = host; va < end;) {
+    host_region_t hr;
+    if (host_region_at(va, &hr) != 0 || !backing_entry_ok(&hr, va) || hr.end <= va) goto fail;
+    const uint64_t pend = hr.end < end ? hr.end : end;
+    if (n == cap) {
+      const size_t ncap = cap ? 2 * cap : 4;
+      pool_piece_t *np = realloc(pc, ncap * sizeof *np);
+      if (!np) goto fail;
+      pc = np;
+      cap = ncap;
+    }
+    pc[n++] = (pool_piece_t){va, pend - va};
+    va = pend;
+  }
+  for (size_t i = 0; i < n; i++) {
+    const uint64_t ipa = g->cfg.pt_pool_ipa + (pc[i].va - host);
+    if (g->backend.s2_map((void *)(uintptr_t)pc[i].va, ipa, (size_t)pc[i].sz, GMM_S2_R | GMM_S2_W) != 0) {
+      pool_unmap_pieces(g, pc, i);  // aborts if an unmap fails
+      goto fail;
+    }
+  }
+  *pcs = pc;
+  *npcs = n;
+  return 0;
+fail:
+  free(pc);
+  return -1;
+}
+
+int gmm_pt_pool_stats(gmm_t *g, gmm_pt_pool_stats_t *out) {
+  if (!g || !out) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  *out = (gmm_pt_pool_stats_t){.size = g->cfg.pt_pool_sz, .used = g->pt_pool_used, .enopt = g->pt_pool_enopt};
+  pthread_mutex_unlock(&g->mtx);
+  return 0;
+}
+
+#ifdef GMM_TEST_HOOKS
+int gmm_debug_pt_pool_skip(gmm_t *g, uint64_t bytes) {
+  if (!g || (bytes % 4096) != 0) return GMM_EINVAL;
+  pthread_mutex_lock(&g->mtx);
+  const int ok = bytes <= g->cfg.pt_pool_sz - g->pt_pool_used;
+  if (ok) g->pt_pool_used += bytes;
+  pthread_mutex_unlock(&g->mtx);
+  return ok ? 0 : GMM_EINVAL;
+}
+#endif
+
+// ================================================================================================================
 // gmm_init / gmm_destroy.
 int gmm_init(gmm_t **out, const gmm_config_t *cfg, const gmm_backend_t *backend) {
   if (!out || !cfg || !backend || !backend->s2_map || !backend->s2_unmap || !backend->tlbi_sync) return -1;
@@ -1272,27 +1365,25 @@ int gmm_init(gmm_t **out, const gmm_config_t *cfg, const gmm_backend_t *backend)
   pthread_mutex_init(&g->mtx, NULL);
   g->ipa_bump = cfg->ipa_lo;
 
-  // PT pool: one anon pool, s2_map'd once before any vCPU (GuestMirror::Init() pattern, §2).
-  if (gmm_backing_check(cfg->pt_pool_host, cfg->pt_pool_sz) != 0) {
-    // The caller-supplied pool must ALSO satisfy the backing guard (it is memory that will be handed to
-    // hv_vm_map by a live backend): fail rather than abort here, since gmm_init has a clean error path and the
-    // caller may want to retry with a correctly-tagged allocation.
-    pthread_mutex_destroy(&g->mtx);
-    free(g);
-    return -1;
-  }
-  uint32_t r = backend->s2_map(cfg->pt_pool_host, cfg->pt_pool_ipa, cfg->pt_pool_sz, GMM_S2_R | GMM_S2_W);
-  if (r != 0) { // G1 review: never build tables into a pool the VM cannot see
+  // PT pool: s2_map'd before any vCPU (GuestMirror::Init() pattern, §2). v10: one s2_map per host VM map entry the
+  // pool spans (XNU splits an anonymous mmap > 128 MiB into 128 MiB entries; v9 demanded one entry, capping the pool
+  // at 128 MiB). A pool inside one entry takes exactly v9's path: one s2_map of the whole pool.
+  pool_piece_t *pc;
+  size_t npc;
+  if (pool_map_pieces(g, &pc, &npc) != 0) {
     pthread_mutex_destroy(&g->mtx);
     free(g);
     return -1;
   }
   g->root_ipa = pt_alloc_table(g);
-  if (g->root_ipa == GMM_IPA_NONE) {
+  if (g->root_ipa == GMM_IPA_NONE) {  // unreachable (pt_pool_sz >= 4096 was checked); undo the pool maps anyway
+    pool_unmap_pieces(g, pc, npc);
+    free(pc);
     pthread_mutex_destroy(&g->mtx);
     free(g);
     return -1;
   }
+  free(pc);
   *out = g;
   return 0;
 }
