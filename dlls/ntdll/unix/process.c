@@ -337,6 +337,44 @@ static ULONG get_env_size( const RTL_USER_PROCESS_PARAMETERS *params, char **win
 
 
 /***********************************************************************
+ *           get_title_unix_env
+ *
+ * Proton macOS 2026-09-26: "NAME=VALUE" strings, for the grandchild to putenv as it does WINEDEBUG, of every variable
+ * named in the new environment's PMW_TITLE_UNIX_KEYS (comma separated; kernelbase apply_title_env sets both from the
+ * title's recipe file), so a game started by Steam's Play gets its settings in its unix environment too.
+ */
+static char **get_title_unix_env( const RTL_USER_PROCESS_PARAMETERS *params )
+{
+    static const WCHAR keysW[] = {'P','M','W','_','T','I','T','L','E','_','U','N','I','X','_','K','E','Y','S','=',0};
+    const WCHAR *ptr, *keys = NULL, *k, *comma;
+    char **ret;
+    int count = 1, i = 0;
+    size_t klen;
+    DWORD len;
+
+    for (ptr = params->Environment; *ptr; ptr += wcslen(ptr) + 1)
+        if (!wcsncmp( ptr, keysW, ARRAY_SIZE(keysW) - 1 )) keys = ptr + ARRAY_SIZE(keysW) - 1;
+    if (!keys || !*keys) return NULL;
+    for (k = keys; *k; k++) if (*k == ',') count++;
+    if (!(ret = calloc( count + 1, sizeof(*ret) ))) return NULL;
+
+    for (k = keys; *k && i < count; k = *comma ? comma + 1 : comma)
+    {
+        if (!(comma = wcschr( k, ',' ))) comma = k + wcslen( k );
+        klen = comma - k;
+        for (ptr = params->Environment; *ptr; ptr += wcslen(ptr) + 1)
+        {
+            if (wcsncmp( ptr, k, klen ) || ptr[klen] != '=') continue;
+            len = wcslen(ptr) * 3 + 1;
+            if ((ret[i] = malloc( len ))) ntdll_wcstoumbs( ptr, wcslen(ptr) + 1, ret[i++], len, FALSE );
+            break;
+        }
+    }
+    return ret;
+}
+
+
+/***********************************************************************
  *           get_unix_curdir
  */
 static int get_unix_curdir( const RTL_USER_PROCESS_PARAMETERS *params )
@@ -407,12 +445,13 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     NTSTATUS status = STATUS_SUCCESS;
     int stdin_fd = -1, stdout_fd = -1;
     pid_t pid;
-    char **argv;
+    char **argv, **title_env, **e;
     BOOL new_session;
 
     /* everything the child needs from params and the PEB is read here: in the vCPU mode, guest memory is not
      * inherited by fork() (virtual.c: anon_mmap_fixed_tag) */
     if (!(argv = build_argv( &params->CommandLine, 2 ))) return STATUS_NO_MEMORY;
+    title_env = get_title_unix_env( params );
     new_session = (peb->ProcessParameters && params->ProcessGroupId != peb->ProcessParameters->ProcessGroupId) ||
                   params->ConsoleHandle == CONSOLE_HANDLE_ALLOC ||
                   params->ConsoleHandle == CONSOLE_HANDLE_ALLOC_NO_WINDOW ||
@@ -441,6 +480,7 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
             if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
 
             if (winedebug) putenv( winedebug );
+            if (title_env) for (e = title_env; *e; e++) putenv( *e );
             if (unixdir != -1)
             {
                 fchdir( unixdir );
@@ -465,6 +505,11 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     else status = STATUS_NO_MEMORY;
 
     free( argv );
+    if (title_env)
+    {
+        for (e = title_env; *e; e++) free( *e );
+        free( title_env );
+    }
     if (stdin_fd != -1 && stdin_fd != 0) close( stdin_fd );
     if (stdout_fd != -1 && stdout_fd != 1) close( stdout_fd );
     return status;
