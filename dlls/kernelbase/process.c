@@ -589,6 +589,74 @@ static int battleye_launcher_redirect_hack( const WCHAR *app_name, WCHAR *new_na
     return 1;
 }
 
+/* Proton macOS 2026-09-26: PROTON_LAUNCHER_REDIRECT="<launcher.exe>=<game exe relative to the launcher's dir>[;...]"
+ * starts the game instead of a launcher that does not work in our stack, when Steam's Play runs the launcher (Steam's
+ * only launch entry for DOOM Eternal is launcher\idTechLauncher.exe, whose CEF error-loops):
+ * "idTechLauncher.exe=..\DOOMEternalx64vk.exe". The launcher is matched by file name, case-insensitively; the target
+ * must exist, else the launcher runs. The command line keeps the launcher's arguments and the working directory
+ * becomes the game's directory. Set in Steam's environment (the recipes' bottle.protonConfig.launcherRedirect). */
+static BOOL proton_launcher_redirect( const WCHAR *app_name, WCHAR *new_name, DWORD new_name_len, WCHAR *new_dir,
+                                      DWORD new_dir_len )
+{
+    WCHAR list[1024], target[MAX_PATH], *entry, *next, *eq, *p;
+    const WCHAR *base;
+    DWORD len, attr;
+
+    if (!(len = GetEnvironmentVariableW( L"PROTON_LAUNCHER_REDIRECT", list, ARRAY_SIZE(list) )) ||
+        len >= ARRAY_SIZE(list))
+        return FALSE;
+    base = app_name + wcslen( app_name );
+    while (base != app_name && base[-1] != '\\' && base[-1] != '/') --base;
+
+    for (entry = list; entry && *entry; entry = next)
+    {
+        if ((next = wcschr( entry, ';' ))) *next++ = 0;
+        if (!(eq = wcschr( entry, '=' ))) continue;
+        *eq = 0;
+        if (wcsicmp( entry, base )) continue;
+
+        if ((base - app_name) + wcslen( eq + 1 ) + 1 > ARRAY_SIZE(target)) return FALSE;
+        memcpy( target, app_name, (base - app_name) * sizeof(WCHAR) );
+        wcscpy( target + (base - app_name), eq + 1 );
+        len = GetFullPathNameW( target, new_name_len, new_name, NULL );
+        if (!len || len >= new_name_len) return FALSE;
+        attr = GetFileAttributesW( new_name );
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            WARN( "launcher %s: redirect target %s not found, running the launcher\n", debugstr_w(app_name),
+                  debugstr_w(new_name) );
+            return FALSE;
+        }
+        if (wcslen( new_name ) >= new_dir_len) return FALSE;
+        wcscpy( new_dir, new_name );
+        if ((p = wcsrchr( new_dir, '\\' ))) *p = 0;
+        ERR( "launcher %s redirected to %s (PROTON_LAUNCHER_REDIRECT)\n", debugstr_w(app_name), debugstr_w(new_name) );
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* the command line with its first token (the program) replaced by "new_name" */
+static WCHAR *replace_cmdline_program( const WCHAR *cmdline, const WCHAR *new_name )
+{
+    const WCHAR *args = cmdline;
+    WCHAR *ret;
+    size_t size;
+
+    while (*args == ' ' || *args == '\t') args++;
+    if (*args == '"')
+    {
+        if ((args = wcschr( args + 1, '"' ))) args++;
+        else args = cmdline + wcslen( cmdline );
+    }
+    else while (*args && *args != ' ' && *args != '\t') args++;
+
+    size = wcslen( new_name ) + wcslen( args ) + 3;
+    if (!(ret = RtlAllocateHeap( GetProcessHeap(), 0, size * sizeof(WCHAR) ))) return NULL;
+    swprintf( ret, size, L"\"%s\"%s", new_name, args );
+    return ret;
+}
+
 /* Proton macOS 2026-09-25: PMW_CEF_EXTRA_FLAGS appends its value to the main steamwebhelper.exe browser process's
  * command line (not to --type= children), after any injected flags: Chromium diagnostics such as
  * "--enable-logging --v=1" for the vCPU route, where the webhelper never launches a renderer. */
@@ -761,7 +829,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
                                                       PROCESS_INFORMATION *info, HANDLE *new_token )
 {
     const struct proc_thread_attr *handle_list = NULL, *job_list = NULL;
-    WCHAR name[MAX_PATH];
+    WCHAR name[MAX_PATH], redirect_name[MAX_PATH], redirect_dir[MAX_PATH];
     WCHAR *p, *tidy_cmdline = cmd_line, *orig_app_name = NULL;
     RTL_USER_PROCESS_PARAMETERS *params = NULL;
     RTL_USER_PROCESS_INFORMATION rtl_info = { 0 };
@@ -820,6 +888,20 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
             else HeapFree( GetProcessHeap(), 0, cmdline_new );
         }
         app_name = name;
+    }
+
+    if (proton_launcher_redirect( app_name, redirect_name, ARRAY_SIZE(redirect_name), redirect_dir,
+                                  ARRAY_SIZE(redirect_dir) ))
+    {
+        WCHAR *new_cmdline = replace_cmdline_program( tidy_cmdline, redirect_name );
+
+        if (new_cmdline)
+        {
+            if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
+            tidy_cmdline = new_cmdline;
+            app_name = redirect_name;
+            cur_dir = redirect_dir;
+        }
     }
 
     product_name = get_product_name( app_name );
