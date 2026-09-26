@@ -86,7 +86,7 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
 
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
-#define VCPU_PT_POOL_SIZE  (64ull << 20)             /* default; PMW_VCPU_PT_POOL_MB overrides */
+#define VCPU_PT_POOL_SIZE  (128ull << 20)            /* default (64 MiB ran out in KCD2); PMW_VCPU_PT_POOL_MB overrides */
 /* gmm's backing guard wants the pool in ONE host VM region, and XNU splits an anonymous mmap into 128 MiB regions
  * (measured 2026-09-26: 192 and 256 MiB maps start with a 128 MiB region), so a bigger pool fails gmm_init. The IPA
  * layout alone would allow 768 MiB (the pool must end below the data IPAs at 1 GiB). */

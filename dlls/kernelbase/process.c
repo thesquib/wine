@@ -636,6 +636,66 @@ static BOOL proton_launcher_redirect( const WCHAR *app_name, WCHAR *new_name, DW
     return FALSE;
 }
 
+/* Proton macOS 2026-09-26: PMW_TITLE_ENV_DIR (a Windows path) holds one "<installDir>.env" per title, KEY=VALUE lines
+ * ('#' comments), which the vCPU Steam launcher writes from the recipes. A program under
+ * ...\steamapps\common\<installDir>\ gets that file's variables in its environment, and their names in
+ * PMW_TITLE_UNIX_KEYS, from which ntdll's spawn_process also exports them to the new process's unix environment
+ * (the vCPU, KosmicKrisp and WINEDLLOVERRIDES settings are read there). So Steam's Play gets each title its recipe's
+ * settings without putting them all in Steam's own environment. */
+static void apply_title_env( WCHAR **env, const WCHAR *app_name )
+{
+    static const WCHAR common[] = L"\\steamapps\\common\\";
+    WCHAR dir[MAX_PATH], path[MAX_PATH * 2], keys[4096], *wline;
+    const WCHAR *start, *end;
+    char buf[16384], *line, *next, *eq;
+    UNICODE_STRING name, value;
+    DWORD len, got, klen = 0;
+    HANDLE file;
+    int n;
+
+    if (!(len = GetEnvironmentVariableW( L"PMW_TITLE_ENV_DIR", dir, ARRAY_SIZE(dir) )) || len >= ARRAY_SIZE(dir))
+        return;
+    for (start = app_name; *start; start++)
+        if (!wcsnicmp( start, common, wcslen( common ) )) break;
+    if (!*start) return;
+    start += wcslen( common );
+    if (!(end = wcschr( start, '\\' )) || end == start) return;
+    if (swprintf( path, ARRAY_SIZE(path), L"%s\\%.*s.env", dir, (int)(end - start), start ) < 0) return;
+
+    file = CreateFileW( path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (file == INVALID_HANDLE_VALUE) return;
+    got = 0;
+    if (!ReadFile( file, buf, sizeof(buf) - 1, &got, NULL )) got = 0;
+    CloseHandle( file );
+    buf[got] = 0;
+
+    keys[0] = 0;
+    for (line = buf; line && *line; line = next)
+    {
+        if ((next = strchr( line, '\n' ))) *next++ = 0;
+        if ((n = strlen( line )) && line[n - 1] == '\r') line[n - 1] = 0;
+        if (*line == '#' || !(eq = strchr( line, '=' )) || eq == line) continue;
+        n = MultiByteToWideChar( CP_UTF8, 0, line, -1, NULL, 0 );
+        if (!(wline = HeapAlloc( GetProcessHeap(), 0, n * sizeof(WCHAR) ))) continue;
+        MultiByteToWideChar( CP_UTF8, 0, line, -1, wline, n );
+        wline[eq - line] = 0;
+        RtlInitUnicodeString( &name, wline );
+        RtlInitUnicodeString( &value, wline + (eq - line) + 1 );
+        RtlSetEnvironmentVariable( env, &name, &value );
+        if (klen + wcslen( wline ) + 2 < ARRAY_SIZE(keys))
+        {
+            if (klen) keys[klen++] = ',';
+            wcscpy( keys + klen, wline );
+            klen += wcslen( wline );
+        }
+        HeapFree( GetProcessHeap(), 0, wline );
+    }
+    RtlInitUnicodeString( &name, L"PMW_TITLE_UNIX_KEYS" );
+    RtlInitUnicodeString( &value, keys );
+    RtlSetEnvironmentVariable( env, &name, klen ? &value : NULL );
+    if (klen) ERR( "%s: title environment %s (%s)\n", debugstr_w(app_name), debugstr_w(path), debugstr_w(keys) );
+}
+
 /* the command line with its first token (the program) replaced by "new_name" */
 static WCHAR *replace_cmdline_program( const WCHAR *cmdline, const WCHAR *new_name )
 {
@@ -976,6 +1036,8 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
             RtlInitUnicodeString( &value, orig_app_name );
             RtlSetEnvironmentVariable( &new_env, &name, &value );
         }
+
+        apply_title_env( &new_env, app_name );
 
         HeapFree( GetProcessHeap(), 0, orig_app_name );
         params = create_process_params( app_name, tidy_cmdline, cur_dir, new_env, flags | CREATE_UNICODE_ENVIRONMENT, startup_info );
