@@ -86,7 +86,9 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
 
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
-#define VCPU_PT_POOL_SIZE  (128ull << 20)            /* default (64 MiB ran out in KCD2); PMW_VCPU_PT_POOL_MB overrides */
+/* default; PMW_VCPU_PT_POOL_MB overrides. 64 MiB ran out in KCD2; KCD2 uses ~70 MiB after its world load and then
+ * grows ~0.5 MiB/min (2026-09-26, 7 min). Untouched pool pages cost nothing, so leave headroom. */
+#define VCPU_PT_POOL_SIZE  (256ull << 20)
 #define VCPU_DATA_IPA_LO   (1ull << 30)             /* 1 GiB */
 /* the pool must end below the data IPAs: 768 MiB. XNU splits an anonymous mmap into 128 MiB regions; gmm v10 maps
  * such a pool one region at a time (v9 wanted one region, which capped the pool at 128 MiB). */
