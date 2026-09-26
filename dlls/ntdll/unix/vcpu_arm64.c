@@ -87,11 +87,10 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
 #define VCPU_PT_POOL_SIZE  (128ull << 20)            /* default (64 MiB ran out in KCD2); PMW_VCPU_PT_POOL_MB overrides */
-/* gmm's backing guard wants the pool in ONE host VM region, and XNU splits an anonymous mmap into 128 MiB regions
- * (measured 2026-09-26: 192 and 256 MiB maps start with a 128 MiB region), so a bigger pool fails gmm_init. The IPA
- * layout alone would allow 768 MiB (the pool must end below the data IPAs at 1 GiB). */
-#define VCPU_PT_POOL_MAX   (128ull << 20)
 #define VCPU_DATA_IPA_LO   (1ull << 30)             /* 1 GiB */
+/* the pool must end below the data IPAs: 768 MiB. XNU splits an anonymous mmap into 128 MiB regions; gmm v10 maps
+ * such a pool one region at a time (v9 wanted one region, which capped the pool at 128 MiB). */
+#define VCPU_PT_POOL_MAX   (VCPU_DATA_IPA_LO - VCPU_PT_POOL_IPA)
 #define VCPU_DATA_IPA_HI   (1ull << VCPU_IPA_BITS)
 /* the guest-only mirror window of gmm's low-4GiB regions: above every host VA (47 bits), inside the 48-bit guest VA
  * space, so nothing on the host needs reserving (gmm README R6) */
@@ -849,6 +848,15 @@ static void *prof_thread( void *arg )
                  atomic_load( &prof_vcpus_live ), atomic_load( &prof_vcpus_peak ),
                  (guest_t - last_ticks[NROWS]) / hz, (unsigned long long)(guest_c - last_count[NROWS]),
                  host / hz, wait / hz, (cpu - last_cpu) / 1e6, prof_interval );
+        {
+            /* gmm v10: tables are never freed, so "used" is also the peak; "full" counts GMM_ENOPT table allocations */
+            gmm_pt_pool_stats_t pt;
+
+            if (!gmm_pt_pool_stats( gmm, &pt ))
+                fprintf( stderr, "[VCPU-PROF] pid %d pt pool: used %.1f of %.0f MiB (%.1f%%) | full %llu\n",
+                         (int)getpid(), pt.used / 1048576.0, pt.size / 1048576.0,
+                         pt.size ? 100.0 * pt.used / pt.size : 0.0, (unsigned long long)pt.enopt );
+        }
         if (vcpu_mn)
         {
             char line[256];
@@ -2063,7 +2071,9 @@ void vcpu_init_process(void)
 
     /* PMW_VCPU_PT_POOL_MB: the guest page-table pool (lazy anonymous memory, touched as tables are used). 64 MiB ran
      * out (GMM_ENOPT) in Kingdom Come: Deliverance II's first world load (2026-09-26) and at ~2000 live 32-bit
-     * threads; allocations then fail with "out of memory" and the game waits forever. Capped at VCPU_PT_POOL_MAX. */
+     * threads; allocations then fail with "out of memory" and the game waits forever. Capped at VCPU_PT_POOL_MAX.
+     * ONE gmm_alloc_backing call for any size (gmm v10: every region must be gmm-tagged; never stitch mmaps). The
+     * PMW_VCPU_PROF "pt pool" line reports its use. */
     if ((pool_env = getenv( "PMW_VCPU_PT_POOL_MB" )) && atoi( pool_env ) > 0)
     {
         pool_size = (size_t)atoi( pool_env ) << 20;

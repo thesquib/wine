@@ -66,9 +66,18 @@ typedef struct {
 typedef struct {
   uint64_t alias_base;  // 0x4_0000_0000 in the proven designs; 0 disables the low-4GiB dual-alias rule entirely
   uint64_t ipa_lo, ipa_hi;      // data-chunk IPA allocation range (bump + free list), 16K-granular
-  uint64_t pt_pool_ipa;         // IPA base of the caller-owned, caller-s2-mapped page-table pool
-  void *pt_pool_host;           // host pointer to that pool (mmap'd PROT_READ|WRITE|MAP_ANON by the caller)
-  size_t pt_pool_sz;            // multiple of 4096
+  uint64_t pt_pool_ipa;         // IPA base of the page-table pool (gmm_init stage-2 maps it, R|W, see below)
+  void *pt_pool_host;           // host pointer to that pool: gmm_alloc_backing memory (tag 250, not executable)
+  size_t pt_pool_sz;            // multiple of 4096, >= 4096
+  // v10 (vel1-gmm-v10): the pool may span SEVERAL host VM map entries (XNU splits a large anonymous mmap into
+  // 128 MiB entries, so any gmm_alloc_backing pool > 128 MiB does). gmm_init walks [host, host+sz) entry by entry;
+  // every piece [va, min(entry end, host+sz)) must pass the backing guard on its own (no gap, not a submap, tag 250,
+  // not executable), all pieces are checked before any is mapped, and each piece gets its OWN backend->s2_map at
+  // pt_pool_ipa + (va - host), R|W, in address order. A pool inside one entry gets exactly v9's single s2_map.
+  // If an s2_map fails, the pieces already mapped are s2_unmap'ped (reverse order) and gmm_init returns -1; if one
+  // of those unmaps fails, gmm_init abort()s (as every exact rollback unmap in gmm does) rather than return with a
+  // piece the VM can still reach. The guard does not check inheritance: each piece should also be VM_INHERIT_NONE,
+  // which gmm_alloc_backing memory (one allocation of any size; do not stitch separate ones) is.
   unsigned t0sz;                // TCR_EL1.T0SZ for TTBR0 (16 or 25 in the proven tables; general in the walker)
   // G7/N11 API DEVIATION, appended at the end (designated initializers elsewhere in this tree are unaffected;
   // this also keeps any stray positional gmm_config_t initializer, if one existed, compiling). The dedicated IPA
@@ -217,6 +226,27 @@ void gmm_destroy(gmm_t *gmm);  // TEST SUPPORT: not in §1's listed API, but eve
                                 // the trace log, the IPA free list) between cases without leaking. The live harness
                                 // has no equivalent need (the process exits); gmm_vm.c is free to ignore it.
 uint64_t gmm_ttbr0(gmm_t *gmm);
+
+// v10 (vel1-gmm-v10, appended): page-table pool accounting, for a caller's PROF line.
+//   size:  cfg.pt_pool_sz, bytes.
+//   used:  bytes handed out to tables so far (4096 per table, the root included, so a fresh gmm_t reports 4096).
+//          Tables are never freed (a bump allocator), so `used` never decreases: it is also the high-water mark.
+//   enopt: how many times a table allocation failed because the pool was full (each one surfaced as GMM_ENOPT
+//          from the call that needed the table).
+// Returns 0, or GMM_EINVAL if gmm or out is NULL. Takes the gmm mutex (a consistent snapshot; do not call it with
+// the mutex held, i.e. from inside a backend callback).
+typedef struct {
+  uint64_t size, used, enopt;
+} gmm_pt_pool_stats_t;
+int gmm_pt_pool_stats(gmm_t *gmm, gmm_pt_pool_stats_t *out);
+
+#ifdef GMM_TEST_HOOKS
+// TEST ONLY (v10), compiled in only with -DGMM_TEST_HOOKS (gmm_test_*, gmm_vm; never Wine's copy, build.sh checks):
+// advance the pool's bump pointer by `bytes` (a multiple of 4096) without allocating a table, so later tables come
+// from deeper in the pool (G16 / N27 put them past the first 128 MiB host map entry). Returns 0, or GMM_EINVAL if
+// gmm is NULL, bytes is not a multiple of 4096, or the pool would pass its size. The skipped bytes count as `used`.
+int gmm_debug_pt_pool_skip(gmm_t *gmm, uint64_t bytes);
+#endif
 
 // ---------------------------------------------------------------------------------------------------------------
 // Page protection. Independent numeric encoding chosen to match the public Win32 PAGE_* values bit-for-bit (so a
