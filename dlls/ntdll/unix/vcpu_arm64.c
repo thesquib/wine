@@ -87,7 +87,10 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
 #define VCPU_PT_POOL_SIZE  (64ull << 20)             /* default; PMW_VCPU_PT_POOL_MB overrides */
-#define VCPU_PT_POOL_MAX   (VCPU_DATA_IPA_LO - VCPU_PT_POOL_IPA)  /* 768 MiB: the pool must end below the data IPAs */
+/* gmm's backing guard wants the pool in ONE host VM region, and XNU splits an anonymous mmap into 128 MiB regions
+ * (measured 2026-09-26: 192 and 256 MiB maps start with a 128 MiB region), so a bigger pool fails gmm_init. The IPA
+ * layout alone would allow 768 MiB (the pool must end below the data IPAs at 1 GiB). */
+#define VCPU_PT_POOL_MAX   (128ull << 20)
 #define VCPU_DATA_IPA_LO   (1ull << 30)             /* 1 GiB */
 #define VCPU_DATA_IPA_HI   (1ull << VCPU_IPA_BITS)
 /* the guest-only mirror window of gmm's low-4GiB regions: above every host VA (47 bits), inside the 48-bit guest VA
@@ -2060,7 +2063,7 @@ void vcpu_init_process(void)
 
     /* PMW_VCPU_PT_POOL_MB: the guest page-table pool (lazy anonymous memory, touched as tables are used). 64 MiB ran
      * out (GMM_ENOPT) in Kingdom Come: Deliverance II's first world load (2026-09-26) and at ~2000 live 32-bit
-     * threads; allocations then fail with "out of memory" and the game waits forever. */
+     * threads; allocations then fail with "out of memory" and the game waits forever. Capped at VCPU_PT_POOL_MAX. */
     if ((pool_env = getenv( "PMW_VCPU_PT_POOL_MB" )) && atoi( pool_env ) > 0)
     {
         pool_size = (size_t)atoi( pool_env ) << 20;
