@@ -174,6 +174,18 @@ static int proton_force_menubar_hide(void)
     return cached;
 }
 
+/* PROTON_ALLOW_BACKGROUND_WARP=1: let SetCursorPos warp the cursor while the app is not frontmost (the old behaviour;
+ * see setCursorPosition:). Cached single getenv. */
+static int proton_allow_background_warp(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("PROTON_ALLOW_BACKGROUND_WARP");
+        cached = (v && *v && *v != '0') ? 1 : 0;
+    }
+    return cached;
+}
+
 static int proton_menubar_hide_skip_appid(void)
 {
     static int cached = -1;
@@ -1559,6 +1571,14 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         if ([windowsBeingDragged count])
             ret = FALSE;
+        else if (![NSApp isActive] && !proton_allow_background_warp())
+        {
+            /* A background Mac app does not move the cursor: macOS still delivers mouse moves to our windows under
+             * the cursor while another app is frontmost, and an FPS title (DOOM Eternal, 2026-09-26) answers them by
+             * recentring with SetCursorPos, so hovering over the game from another app threw the cursor to the
+             * middle of the screen. Report success so the game does not retry. */
+            ret = TRUE;
+        }
         else if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
             ret = [clipCursorHandler setCursorPosition:pos];
         else
