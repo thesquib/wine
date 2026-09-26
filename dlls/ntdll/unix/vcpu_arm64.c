@@ -86,7 +86,8 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
 
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
-#define VCPU_PT_POOL_SIZE  (64ull << 20)
+#define VCPU_PT_POOL_SIZE  (64ull << 20)             /* default; PMW_VCPU_PT_POOL_MB overrides */
+#define VCPU_PT_POOL_MAX   (VCPU_DATA_IPA_LO - VCPU_PT_POOL_IPA)  /* 768 MiB: the pool must end below the data IPAs */
 #define VCPU_DATA_IPA_LO   (1ull << 30)             /* 1 GiB */
 #define VCPU_DATA_IPA_HI   (1ull << VCPU_IPA_BITS)
 /* the guest-only mirror window of gmm's low-4GiB regions: above every host VA (47 bits), inside the 48-bit guest VA
@@ -2041,6 +2042,8 @@ void vcpu_init_process(void)
     pthread_t thread;
     sigset_t old;
     void *pool;
+    size_t pool_size = VCPU_PT_POOL_SIZE;
+    const char *pool_env;
     uint64_t start = mach_absolute_time();
     int ret;
 
@@ -2055,17 +2058,25 @@ void vcpu_init_process(void)
     if (ret) vcpu_fatal( "vel1_vm_create(%u-bit IPA): %d (hv %#x, max %u)\n", VCPU_IPA_BITS, ret, info.hv_err,
                          info.max_ipa_bits );
 
-    pool = gmm_alloc_backing( VCPU_PT_POOL_SIZE );
+    /* PMW_VCPU_PT_POOL_MB: the guest page-table pool (lazy anonymous memory, touched as tables are used). 64 MiB ran
+     * out (GMM_ENOPT) in Kingdom Come: Deliverance II's first world load (2026-09-26) and at ~2000 live 32-bit
+     * threads; allocations then fail with "out of memory" and the game waits forever. */
+    if ((pool_env = getenv( "PMW_VCPU_PT_POOL_MB" )) && atoi( pool_env ) > 0)
+    {
+        pool_size = (size_t)atoi( pool_env ) << 20;
+        if (pool_size > VCPU_PT_POOL_MAX) pool_size = VCPU_PT_POOL_MAX;
+    }
+    pool = gmm_alloc_backing( pool_size );
     if (!pool) vcpu_fatal( "page-table pool allocation failed\n" );
     /* a fork() child sharing the page tables would leave the vCPUs walking copies gmm no longer writes */
-    if (minherit( pool, VCPU_PT_POOL_SIZE, VM_INHERIT_NONE )) vcpu_fatal( "page-table pool minherit failed\n" );
+    if (minherit( pool, pool_size, VM_INHERIT_NONE )) vcpu_fatal( "page-table pool minherit failed\n" );
     memset( &cfg, 0, sizeof(cfg) );
     cfg.alias_base = VCPU_ALIAS_BASE;
     cfg.ipa_lo = VCPU_DATA_IPA_LO;
     cfg.ipa_hi = VCPU_DATA_IPA_HI;
     cfg.pt_pool_ipa = VCPU_PT_POOL_IPA;
     cfg.pt_pool_host = pool;
-    cfg.pt_pool_sz = VCPU_PT_POOL_SIZE;
+    cfg.pt_pool_sz = pool_size;
     cfg.t0sz = 16;
     /* gmm's load cost (docs/macos/relay-to-openrosetta-gmm-cost-2026-09-24.md, answered in openrosetta
      * docs/relays/fex-side-reply-tso-gmm-qpc-2026-09-24.md): Slay the Spire 2's ~240 us per stage-1 sync was
@@ -2132,9 +2143,9 @@ void vcpu_init_process(void)
     }
     else TRACE( "M:N off (PMW_VCPU_MN=0)\n" );
 
-    TRACE( "VM up in %.1f us: IPA %u bits (max %u), hardware TSO %s, sys page %p, KUSER host %p\n",
+    TRACE( "VM up in %.1f us: IPA %u bits (max %u), hardware TSO %s, sys page %p, KUSER host %p, PT pool %zu MiB\n",
            ticks_to_us( mach_absolute_time() - start ), info.ipa_bits, info.max_ipa_bits,
-           atomic_load( &tso_state ) > 0 ? "yes" : "NO", sys_page, kuser_host );
+           atomic_load( &tso_state ) > 0 ? "yes" : "NO", sys_page, kuser_host, pool_size >> 20 );
     if (vcpu_mode == 2) vcpu_selftest();
 }
 
