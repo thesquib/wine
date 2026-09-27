@@ -661,6 +661,48 @@ void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks )
     prof_add( &prof_extra[id], ticks );
 }
 
+/* vcpu_sync_pages range sizes by the gmm path they take (0: one gmm_vm_range_set for a uniform range, 1:
+ * gmm_vm_range_set_pages for a mixed one), log2 buckets: bucket b is [4 KiB << b, 8 KiB << b), the last >= 1 GiB.
+ * gmm v11's no-change clip only shortens the uniform path, so this says where the big ranges go. */
+#define PROF_SYNC_BUCKETS 19
+static _Atomic uint64_t prof_sync_size[2][PROF_SYNC_BUCKETS];
+
+void vcpu_prof_sync_size( size_t bytes, int per_page )
+{
+    unsigned int b = 0;
+
+    while (b < PROF_SYNC_BUCKETS - 1 && ((size_t)8192 << b) <= bytes) b++;
+    atomic_fetch_add_explicit( &prof_sync_size[!!per_page][b], 1, memory_order_relaxed );
+}
+
+static void prof_sync_size_print(void)
+{
+    static const char * const paths[2] = { "uniform range_set", "per-page set_pages" };
+    static uint64_t last[2][PROF_SYNC_BUCKETS];
+    unsigned int p, b;
+
+    for (p = 0; p < 2; p++)
+    {
+        char line[512];
+        uint64_t total = 0;
+        int len = 0;
+
+        for (b = 0; b < PROF_SYNC_BUCKETS; b++)
+        {
+            uint64_t now = atomic_load_explicit( &prof_sync_size[p][b], memory_order_relaxed ), d = now - last[p][b];
+            uint64_t kib = (uint64_t)4 << b;
+
+            last[p][b] = now;
+            if (!d || len >= sizeof(line) - 32) continue;
+            total += d;
+            if (b == PROF_SYNC_BUCKETS - 1) len += snprintf( line + len, sizeof(line) - len, " >=1G %llu", (unsigned long long)d );
+            else if (kib >= 1024) len += snprintf( line + len, sizeof(line) - len, " %lluM %llu", (unsigned long long)(kib / 1024), (unsigned long long)d );
+            else len += snprintf( line + len, sizeof(line) - len, " %lluK %llu", (unsigned long long)kib, (unsigned long long)d );
+        }
+        if (total) fprintf( stderr, "[VCPU-PROF] pid %d   s1 sync ranges (%s) by size:%s\n", (int)getpid(), paths[p], line );
+    }
+}
+
 static struct prof_bucket *prof_unix_bucket( const void *table, uint64_t code )
 {
     unsigned int i, h0 = (unsigned int)((((uintptr_t)table >> 4) * 0x9e3779b1u) ^ (code * 0x85ebca6bu)) % PROF_UNIX_SLOTS;
@@ -907,6 +949,27 @@ static void *prof_thread( void *arg )
                          total / 1e6, line );
             }
             memcpy( last_gmm, now_gmm, sizeof(last_gmm) );
+        }
+        {
+            /* gmm v11 thin-mutator counters, as deltas: the no-change clip on uniform committed calls, and how many of
+             * the requested bytes reached the per-page loops. Read here, never inside a gmm backend callback (the call
+             * takes the gmm mutex). */
+            static gmm_debug_thin_t last_thin;
+            gmm_debug_thin_t t;
+
+            gmm_debug_thin_counts( gmm, &t );
+            if (memcmp( &t, &last_thin, sizeof(t) ))
+                fprintf( stderr, "[VCPU-PROF] pid %d   gmm thin: calls %llu (no-op %llu, clipped %llu) | requested %.1f MiB, "
+                         "applied %.1f MiB | NONE early-outs %llu, clips %llu\n", (int)getpid(),
+                         (unsigned long long)(t.commit_calls - last_thin.commit_calls),
+                         (unsigned long long)(t.commit_noops - last_thin.commit_noops),
+                         (unsigned long long)(t.commit_clips - last_thin.commit_clips),
+                         (t.bytes_requested - last_thin.bytes_requested) / 1048576.0,
+                         (t.bytes_applied - last_thin.bytes_applied) / 1048576.0,
+                         (unsigned long long)(t.none_early_outs - last_thin.none_early_outs),
+                         (unsigned long long)(t.none_clips - last_thin.none_clips) );
+            last_thin = t;
+            prof_sync_size_print();
         }
         last_count[NROWS] = guest_c;
         last_ticks[NROWS] = guest_t;
