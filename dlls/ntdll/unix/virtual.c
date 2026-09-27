@@ -2057,6 +2057,7 @@ static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base
     if (get_vprot_range_size( addr, npages << page_shift, ~0, &vprot ) == npages << page_shift)
     {
         unsigned char target = vcpu_vprot_to_s1( (vprot & ~clear) | set );
+        if (vcpu_prof_interval) vcpu_prof_sync_size( npages << page_shift, 0 );
         if (target & GMM_S1_X) vcpu_icache_sync( view, addr, npages, NULL, target );
         if ((ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, npages << page_shift, target )))
         {
@@ -2065,6 +2066,7 @@ static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base
         }
         return 0;
     }
+    if (vcpu_prof_interval) vcpu_prof_sync_size( npages << page_shift, 1 );
     while (npages)
     {
         n = min( npages, ARRAY_SIZE(s1) );

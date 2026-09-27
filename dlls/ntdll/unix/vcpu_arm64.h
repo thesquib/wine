@@ -69,6 +69,7 @@ enum vcpu_prof_id
 #if defined(__APPLE__) && defined(__aarch64__)
 extern unsigned int vcpu_prof_interval;
 extern void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks );
+extern void vcpu_prof_sync_size( size_t bytes, int per_page );
 static inline uint64_t vcpu_prof_now(void)
 {
     uint64_t v;
@@ -78,6 +79,7 @@ static inline uint64_t vcpu_prof_now(void)
 #else
 #define vcpu_prof_interval 0
 static inline void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks ) {}
+static inline void vcpu_prof_sync_size( size_t bytes, int per_page ) {}
 static inline uint64_t vcpu_prof_now(void) { return 0; }
 #endif
 

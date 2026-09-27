@@ -86,6 +86,11 @@ enum {
   // and the mutant proper, gmm_set_low_mirror without its contents check (gmm_debug_check must catch it)
   GMM_MUT_NO_CALLER_GUARD = 0x2000,
   GMM_MUT_LATE_NO_SCAN = 0x4000,
+  // v11 (N28m): bugs in the no-change clip that N24f's differential fuzz must catch
+  GMM_MUT_NOCHG_ANY_VALID = 0x8000,    // any valid descriptor matches a valid target (attribute bits not compared)
+  GMM_MUT_NOCHG_ANY_INVALID = 0x10000, // any invalid descriptor matches the NOACCESS target (RESERVED too)
+  GMM_MUT_NOCHG_TAIL_ONE = 0x20000,    // the trailing scan drops one page more than matched
+  GMM_MUT_NOCHG_ONE_LEAF = 0x40000,    // the scan keeps its first leaf table past a 2 MiB line
 };
 int gmm_debug_mutant;
 #define MUT(m) ((gmm_debug_mutant & (m)) != 0)
@@ -94,8 +99,8 @@ int gmm_debug_mutant;
 #endif
 
 // TEST ONLY (gmm_fuzz_ref, built by build.sh with -DGMM_REFERENCE): the thin mutator's pre-v6 algorithms -- no
-// uniform-NONE early-out or clip, a table walk and an encode per page -- so N24f (gmm_fuzz.c) can compare v6 against
-// them step by step. Every other build
+// uniform-NONE early-out or clip, no v11 no-change clip, a table walk and an encode per page -- so N24f (gmm_fuzz.c)
+// can compare v6/v11 against them step by step. Every other build
 // (the test binaries, gmm_vm, m1, Wine's copy) has V6 == 1, and no gmm_debug_reference symbol (build.sh checks).
 #ifdef GMM_REFERENCE
 #define V6 0
@@ -2721,6 +2726,45 @@ typedef struct {
   uint64_t key;       // v8: the canonical page va belongs to (== va, or va + low_mirror_base for a low twin)
 } tsaved_t;
 
+// v11: does leaf d already hold s1's encoding tm (s1_encode(s1, 0))? A valid tm: d is valid with exactly tm's attribute
+// bits, whatever its output address (thin_apply_locked's (ii): a valid thin leaf's OA is its chunk's IPA + offset, the
+// very value the descriptor loop would OR in). An invalid tm (the NOACCESS tag): d is that tag. Nothing else matches.
+static inline int nochg_match(uint64_t d, uint64_t tm) {
+  if (!(tm & 1ull)) return MUT(GMM_MUT_NOCHG_ANY_INVALID) ? !(d & 1ull) : d == tm;
+  return (d & 1ull) && (MUT(GMM_MUT_NOCHG_ANY_VALID) || (d & ~0x0000fffffffff000ull) == tm);
+}
+// v11: the no-change scan (thin_apply_locked). Moves *lo up past the leading pages, and *hi down past the trailing
+// pages, of [*lo, *hi) whose leaf already matches s1 (nochg_match). One leaf-table lookup per 2 MiB, walking forward
+// and then backward; a missing leaf table ends that direction (a page there never matches). *lo == *hi afterwards means
+// every page matched. Reads only; 4K-aligned in and out.
+static void nochg_clip(gmm_t *g, unsigned s1, uint64_t *plo, uint64_t *phi) {
+  const uint64_t tm = s1_encode(s1, 0);
+  uint64_t lo = *plo, hi = *phi, *leaf = NULL, leaf2m = ~0ull, span = 0;
+  for (; lo < hi; lo += 4096) {
+    if ((lo & ~0x1FFFFFull) != leaf2m && !(MUT(GMM_MUT_NOCHG_ONE_LEAF) && leaf))
+      leaf = pt_lookup_leaf(g, lo, &span), leaf2m = lo & ~0x1FFFFFull;
+    if (!leaf || !nochg_match(leaf[(lo >> 12) & 0x1FFull], tm)) break;
+  }
+  if (lo < hi) {  // the page at lo differs, so the backward walk stops at lo at the latest
+    leaf = NULL, leaf2m = ~0ull;
+    for (; hi > lo; hi -= 4096) {
+      const uint64_t p = hi - 4096;
+      if ((p & ~0x1FFFFFull) != leaf2m && !(MUT(GMM_MUT_NOCHG_ONE_LEAF) && leaf))
+        leaf = pt_lookup_leaf(g, p, &span), leaf2m = p & ~0x1FFFFFull;
+      if (!leaf || !nochg_match(leaf[(p >> 12) & 0x1FFull], tm)) break;
+    }
+    if (MUT(GMM_MUT_NOCHG_TAIL_ONE) && hi != *phi) hi -= 4096;
+  }
+  *plo = lo, *phi = hi;
+}
+// v11: the thin mutator keeps at most GMM_TLBI_BATCH_MAX + 1 shootdown VAs. Past GMM_TLBI_BATCH_MAX, do_tlbi asks the
+// backend for the whole-VMID flush and hands it no list (it reads va[0] only, for the trace), so only the count must
+// stay exact. v10 kept every VA: an 8-byte slot per page (x2 with the low mirror) malloc'd per call, O(range).
+static inline void tlbi_add(uint64_t *buf, size_t *n, uint64_t va) {
+  if (*n <= GMM_TLBI_BATCH_MAX) buf[*n] = va;
+  ++*n;
+}
+
 // The one mutator behind gmm_vm_range_set/_pages/gmm_view_map/gmm_view_unmap. Caller holds g->mtx.
 // s1arr (npages entries) or, if NULL, s1uni for every page.
 //
@@ -2751,6 +2795,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
   if (thin_overlap_forbidden(g, c0, (uint64_t)nchunks * 16384)) return GMM_EEXIST;
   // v8: nor may its low twin touch any of those (and, with the mirror on, nothing below 4 GiB is thin memory)
   if (lm_range_forbidden(g, c0, (uint64_t)nchunks * 16384)) return GMM_EEXIST;
+  g->thin_counts.bytes_requested += sz;  // v11
   // v6 (vel1-gmm-v6), the uniform-NONE early-out and clip (gmm/README.md "v6 memop"; relay openrosetta
   // docs/relays/fex-side-memop-cost-2026-09-25.md): Wine's reserve and release of a multi-GiB view is a NONE call over
   // the whole range, and every loop below is O(pages) -- ~5.5 ns per 4K page with nothing to do (16 GiB: 23.8 ms).
@@ -2785,7 +2830,53 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
       nchunks = (size_t)(((va + sz - 1) & ~16383ull) - c0) / 16384 + 1;
     }
   }
+  // v11 (candidate vel1-gmm-v11), the no-change clip (gmm/README.md "v11"; relay openrosetta
+  // docs/relays/fex-side-gmm-v11-noop-clip-2026-09-28.md): Wine re-syncs a whole committed range after a commit or
+  // protect inside it (virtual.c vcpu_sync_pages_nosig), and every phase below is O(range) even when nothing changes --
+  // KCD2 spent ~22.9 s in gmm over 25 min, 67% of it in `plan`. For a uniform COMMITTED target (not refuse_committed:
+  // gmm_view_map's EEXIST needs every page's mask), a page whose leaf already matches the target's encoding
+  // (nochg_match: valid with exactly its attribute bits, or the NOACCESS tag for GMM_S1_NOACCESS) is a page the rest of
+  // this call leaves exactly as it is. So the leading and trailing runs of such pages are dropped (nochg_clip: a
+  // sequential leaf scan, no chunk-hash lookup), and if that is every page the call returns 0 here.
+  // WHY a matching page needs nothing (gmm_debug_check verifies (i)-(iii); like the v6 early-out this is off for good
+  // once a legacy region was released, g->legacy_released, which is also when dcheck_leaves -- (i) -- stops checking):
+  //  (i) the range is thin memory -- thin_overlap_forbidden and lm_range_forbidden refused legacy regions, the alias
+  //      window, anchors and views above -- and there every non-zero leaf lies in a chunk a run record covers, so the
+  //      chunk has a chunk-table entry (dcheck_leaves, v6);
+  //  (ii) a valid leaf there points at its chunk's IPA + offset, with its page's committed bit set (the record check):
+  //      the descriptor loop below would build new_desc == old_desc (the same template, the same IPA) and skip it --
+  //      no store, no trace, no TLBI; and by the mirror invariant (dcheck_mirror) its low twin already equals it, which
+  //      is why that loop writes no twin for a skipped page either;
+  //  (iii) a NOACCESS leaf there belongs to a committed page (dcheck, v11), and new_desc is that same tag.
+  //  So the page's committed bit is set and stays set: no chunk's new mask gains or loses anything from it, a commit
+  //  target never empties a chunk, and need_map/need_unmap, the run guard, the IPA allocation, the PARANOID self-alias
+  //  check, the records, the remap survivors and every stage-2 call are exactly those of the remaining pages. A chunk
+  //  dropped in part stays in the plan through its remaining pages, with the same old mask.
+  // Conservative on purpose: RESERVED (0), a missing leaf table, any other tag, a valid leaf with other attribute bits
+  // never match, and from the first such page the call runs as in v10 (so a committed NOACCESS page with no leaf table,
+  // which v10 leaves alone too, is simply not clipped). Only the ends are clipped: changes scattered through a range
+  // still cost the pages between them, and per-page arrays are not scanned. The leaves cannot change under the scan:
+  // gmm writes them under g->mtx, and vcpu_el1's TCR_EL1 (VEL1_TCR_EL1) leaves HA/HD clear, so no hardware AF/DBM
+  // update either.
+  if (V6 && !s1arr && (s1uni & GMM_S1_COMMIT) && !refuse_committed && !g->legacy_released) {
+    PROF_LAP(ARGS);
+    uint64_t lo = va, hi = va + sz;
+    nochg_clip(g, s1uni, &lo, &hi);
+    g->thin_counts.commit_calls++;
+    PROF_LAP(PLAN);
+    if (lo == hi) {
+      g->thin_counts.commit_noops++;
+      return 0;
+    }
+    if (lo != va || hi != va + sz) {
+      g->thin_counts.commit_clips++;
+      va = lo, sz = hi - lo, npages = (size_t)(sz / 4096);
+      c0 = va & ~16383ull;
+      nchunks = (size_t)(((va + sz - 1) & ~16383ull) - c0) / 16384 + 1;
+    }
+  }
   g->thin_counts.pages_applied += npages;
+  g->thin_counts.bytes_applied += sz;  // v11
   const int remap_policy = (g->cfg.flags & GMM_CFG_S2_REMAP) != 0;
   const uint64_t cap = g->cfg.s2_run_chunks > 1 ? g->cfg.s2_run_chunks : 1;
   tplan_t *plan = calloc(nchunks, sizeof(tplan_t));
@@ -2975,9 +3066,9 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     }
   }
   PROF_LAP(URECS);
-  // v8: with the mirror on, every page and every saved survivor may also have its low twin shot down / saved
+  // v8: with the mirror on, every saved survivor may also have its low twin saved (v11: the shootdown list is capped)
   const size_t lmf = g->cfg.low_mirror_base ? 2 : 1;
-  tlbi_va = malloc((lmf * (npages + nsaved_cap) + 1) * sizeof(uint64_t));
+  tlbi_va = malloc((GMM_TLBI_BATCH_MAX + 1) * sizeof(uint64_t));  // v11: tlbi_add keeps at most this many
   saved = malloc((lmf * nsaved_cap + 1) * sizeof(tsaved_t));
   if (!tlbi_va || !saved || tchunk_reserve(&g->thin, need_map) != 0 ||
       rec_reserve(g, ngrp + 2 * nchunks + 2 * nurec + 2) != 0) {
@@ -3088,7 +3179,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
     __atomic_store_n(slot, new_desc, __ATOMIC_RELEASE);
     if (tracing)
       trace_append(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva, leaf_trace_ipa(new_desc), 0);
-    if (valid_change_needs_tlbi(g, old_desc, new_desc)) tlbi_va[ntlbi++] = pva;
+    if (valid_change_needs_tlbi(g, old_desc, new_desc)) tlbi_add(tlbi_va, &ntlbi, pva);
     // v8: the low twin mirrors every canonical write. The skips above (old == new, no canonical table, a missing
     // subtree) need no twin write: by the mirror invariant the twin already equals the canonical leaf there.
     if (lm_in_window(g, pva)) {
@@ -3105,7 +3196,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
           trace_append(g, (new_desc & 1ull) ? GMM_EV_PTE_VALID : GMM_EV_PTE_INVALID, pva - g->cfg.low_mirror_base,
                        leaf_trace_ipa(new_desc), 0);
       }
-      if (valid_change_needs_tlbi(g, lold, new_desc)) tlbi_va[ntlbi++] = pva - g->cfg.low_mirror_base;
+      if (valid_change_needs_tlbi(g, lold, new_desc)) tlbi_add(tlbi_va, &ntlbi, pva - g->cfg.low_mirror_base);
     }
   }
   for (size_t ci = 0; ci < nchunks; ci++)
@@ -3132,7 +3223,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
           const uint64_t inv = (uint64_t)GMM_TAG_NOACCESS << GMM_TAG_SHIFT;
           __atomic_store_n(slot, inv, __ATOMIC_RELEASE);
           trace_push(g, GMM_EV_PTE_INVALID, pva, GMM_TAG_NOACCESS);
-          tlbi_va[ntlbi++] = pva;
+          tlbi_add(tlbi_va, &ntlbi, pva);
           if (lm_in_window(g, pva)) {  // v8: the low twin the same way (restored with it in (E))
             const uint64_t lva = pva - g->cfg.low_mirror_base;
             uint64_t *ls = pt_lookup_slot(g, lva);
@@ -3140,7 +3231,7 @@ static int thin_apply_locked(gmm_t *g, uint64_t va, size_t npages, const uint8_t
             saved[nsaved++] = (tsaved_t){lva, *ls, pva};
             __atomic_store_n(ls, inv, __ATOMIC_RELEASE);
             trace_push(g, GMM_EV_PTE_INVALID, lva, GMM_TAG_NOACCESS);
-            tlbi_va[ntlbi++] = lva;
+            tlbi_add(tlbi_va, &ntlbi, lva);
           }
         }
       }
@@ -3539,6 +3630,9 @@ int gmm_debug_check(gmm_t *g) {
         const uint64_t pva = r->va + c * 16384 + (uint64_t)p * 4096;
         uint64_t *slot = pt_lookup_slot(g, pva);
         const uint64_t d = slot ? *slot : 0;
+        // v11: the no-change clip's (iii) -- a NOACCESS leaf belongs to a committed page
+        if (d == ((uint64_t)GMM_TAG_NOACCESS << GMM_TAG_SHIFT) && !(t->committed & (1u << p)))
+          DBAD("va 0x%llx has the NOACCESS tag but is not committed", (unsigned long long)pva);
         if (!(d & 1ull)) continue;
         if (!(t->committed & (1u << p))) DBAD("va 0x%llx valid but not committed", (unsigned long long)pva);
         if ((d & 0x0000fffffffff000ull) != t->ipa + (uint64_t)p * 4096)

@@ -466,12 +466,25 @@ uint64_t gmm_debug_ipa_available(gmm_t *gmm);
 // v8: with low_mirror_base set, the mirror invariant: for every 4K page of W, the low twin's leaf and the canonical
 // leaf are both invalid or the same valid descriptor (a missing leaf table reads as invalid); a low page inside a
 // legacy region is not a twin, and its W page must be invalid. Checked always (not skipped after gmm_release).
+// v11: inside a run record's chunk a leaf holding the NOACCESS tag belongs to a committed page (what the no-change clip
+// relies on for a GMM_S1_NOACCESS target, next to the valid-leaf check above).
 int gmm_debug_check(gmm_t *gmm);
 // TEST SUPPORT (v6): what the thin mutator did since gmm_init. none_early_outs: uniform GMM_S1_NONE calls that returned
 // at once because no run record touches their (16K-rounded) range; none_clips: uniform NONE calls whose range was cut
 // down to the run records it touches; pages_applied: 4K pages the thin mutator's per-page loops covered, after any clip.
+// v11 (APPENDED fields only: source-compatible with v10's three fields, which keep their offsets; an object built
+// against v10's gmm.h must be rebuilt, because gmm_debug_thin_counts copies the whole, larger struct). The no-change clip (gmm.c, thin_apply_locked;
+// gmm/README.md "v11"): a uniform committed target (s1 with GMM_S1_COMMIT through gmm_vm_range_set) drops the leading
+// and trailing pages whose descriptor already is the target's, and returns 0 at once if that is every page.
+// commit_calls: such calls that ran the scan (gmm_view_map's refuse_committed commits, per-page arrays and a gmm_t
+// that has released a legacy region do not); commit_noops: those the scan answered alone (nothing to do); commit_clips:
+// those it shortened at either end without answering. bytes_requested: every thin call's size as the caller asked,
+// counted once its argument and overlap checks passed (early-outs and no-ops included); bytes_applied: what entered
+// the plan after the NONE clip or the no-change clip, a call that then fails included (always 4096 x pages_applied, kept beside it so a
+// profile line reads both in bytes). Cheap to read: one mutex hold and a struct copy (Wine's PMW_VCPU_PROF line).
 typedef struct {
   uint64_t none_early_outs, none_clips, pages_applied;
+  uint64_t commit_calls, commit_noops, commit_clips, bytes_requested, bytes_applied;  // v11, appended
 } gmm_debug_thin_t;
 void gmm_debug_thin_counts(gmm_t *gmm, gmm_debug_thin_t *out);
 // Identity backing: returns (void *)va if the 4K page at va is committed through the thin API, else NULL.
