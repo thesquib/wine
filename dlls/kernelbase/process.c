@@ -642,8 +642,11 @@ static BOOL proton_launcher_redirect( const WCHAR *app_name, WCHAR *new_name, DW
  * ...\steamapps\common\<installDir>\ gets that file's variables in its environment, and their names in
  * PMW_TITLE_UNIX_KEYS, from which ntdll's spawn_process also exports them to the new process's unix environment
  * (the vCPU, KosmicKrisp and WINEDLLOVERRIDES settings are read there). So Steam's Play gets each title its recipe's
- * settings without putting them all in Steam's own environment. */
-static void apply_title_env( WCHAR **env, const WCHAR *app_name )
+ * settings without putting them all in Steam's own environment.
+ * 2026-09-29: two keys are not environment variables but launch arguments (the recipe's launchArgs, e.g. Slay the
+ * Spire 2's "--rendering-driver vulkan", which users should never have to put in Steam's Launch Options):
+ * PMW_TITLE_ARGS is returned in *args, PMW_TITLE_ARGS_EXE (optional: the program they belong to) in *args_exe. */
+static void apply_title_env( WCHAR **env, const WCHAR *app_name, WCHAR **args, WCHAR **args_exe )
 {
     static const WCHAR common[] = L"\\steamapps\\common\\";
     WCHAR dir[MAX_PATH], path[MAX_PATH * 2], keys[4096], *wline;
@@ -680,6 +683,14 @@ static void apply_title_env( WCHAR **env, const WCHAR *app_name )
         if (!(wline = HeapAlloc( GetProcessHeap(), 0, n * sizeof(WCHAR) ))) continue;
         MultiByteToWideChar( CP_UTF8, 0, line, -1, wline, n );
         wline[eq - line] = 0;
+        if (!wcscmp( wline, L"PMW_TITLE_ARGS" ) || !wcscmp( wline, L"PMW_TITLE_ARGS_EXE" ))
+        {
+            WCHAR **out = wcscmp( wline, L"PMW_TITLE_ARGS" ) ? args_exe : args;
+            HeapFree( GetProcessHeap(), 0, *out );
+            *out = wline;     /* "KEY\0value": the value starts after the name */
+            memmove( wline, wline + (eq - line) + 1, (wcslen( wline + (eq - line) + 1 ) + 1) * sizeof(WCHAR) );
+            continue;
+        }
         RtlInitUnicodeString( &name, wline );
         RtlInitUnicodeString( &value, wline + (eq - line) + 1 );
         RtlSetEnvironmentVariable( env, &name, &value );
@@ -695,6 +706,20 @@ static void apply_title_env( WCHAR **env, const WCHAR *app_name )
     RtlInitUnicodeString( &value, keys );
     RtlSetEnvironmentVariable( env, &name, klen ? &value : NULL );
     if (klen) ERR( "%s: title environment %s (%s)\n", debugstr_w(app_name), debugstr_w(path), debugstr_w(keys) );
+}
+
+/* Whether a title's launch arguments go to app_name: the program PMW_TITLE_ARGS_EXE names, or else the program
+ * steam.exe itself starts (the game Steam's Play launches), not what the game starts in turn (crash handlers). */
+static BOOL title_args_apply( const WCHAR *app_name, const WCHAR *args_exe )
+{
+    WCHAR self[MAX_PATH];
+    const WCHAR *base = wcsrchr( app_name, '\\' ), *sbase;
+
+    base = base ? base + 1 : app_name;
+    if (args_exe && *args_exe) return !wcsicmp( base, args_exe );
+    if (!GetModuleFileNameW( NULL, self, ARRAY_SIZE(self) )) return FALSE;
+    sbase = wcsrchr( self, '\\' );
+    return !wcsicmp( sbase ? sbase + 1 : self, L"steam.exe" );
 }
 
 /* the command line with its first token (the program) replaced by "new_name" */
@@ -891,7 +916,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
 {
     const struct proc_thread_attr *handle_list = NULL, *job_list = NULL;
     WCHAR name[MAX_PATH], redirect_name[MAX_PATH], redirect_dir[MAX_PATH];
-    WCHAR *p, *tidy_cmdline = cmd_line, *orig_app_name = NULL;
+    WCHAR *p, *tidy_cmdline = cmd_line, *orig_app_name = NULL, *title_args = NULL, *title_args_exe = NULL;
     RTL_USER_PROCESS_PARAMETERS *params = NULL;
     RTL_USER_PROCESS_INFORMATION rtl_info = { 0 };
     HANDLE parent = 0, debug = 0;
@@ -1038,7 +1063,22 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateProcessInternalW( HANDLE token, const WCHAR 
             RtlSetEnvironmentVariable( &new_env, &name, &value );
         }
 
-        apply_title_env( &new_env, app_name );
+        apply_title_env( &new_env, app_name, &title_args, &title_args_exe );
+        if (title_args && *title_args && title_args_apply( app_name, title_args_exe )
+            && !wcsstr( tidy_cmdline, title_args ))
+        {
+            size_t size = wcslen( tidy_cmdline ) + wcslen( title_args ) + 2;
+            WCHAR *with_args = RtlAllocateHeap( GetProcessHeap(), 0, size * sizeof(WCHAR) );
+            if (with_args)
+            {
+                swprintf( with_args, size, L"%s %s", tidy_cmdline, title_args );
+                ERR( "%s: title launch arguments %s\n", debugstr_w(app_name), debugstr_w(title_args) );
+                if (tidy_cmdline != cmd_line) HeapFree( GetProcessHeap(), 0, tidy_cmdline );
+                tidy_cmdline = with_args;
+            }
+        }
+        HeapFree( GetProcessHeap(), 0, title_args );
+        HeapFree( GetProcessHeap(), 0, title_args_exe );
 
         HeapFree( GetProcessHeap(), 0, orig_app_name );
         params = create_process_params( app_name, tidy_cmdline, cur_dir, new_env, flags | CREATE_UNICODE_ENVIRONMENT, startup_info );
