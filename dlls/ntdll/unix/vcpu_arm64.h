@@ -116,9 +116,10 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
  * when the context that was set came with it and with the V registers (flags as NtSetContextThread leaves them in
  * restore_flags, without CONTEXT_ARM64), and never otherwise, as V16-V31 would then replace live upper halves
  * with whatever the frame holds. */
-/* PMW_VCPU_YMM_ENTRY=0 leaves the flag out, as before: with Wine tracing on (+seh) Dune: Awakening and Steam hung
- * at start or showed an empty window in 4 of 11 runs with the flag, in none of about 25 without it and in none of 5
- * with the flag and tracing off (2026-09-29). The flag changes no register value there; the cause is not found. */
+/* Off unless PMW_VCPU_YMM_ENTRY=1: with the flag Dune: Awakening (and once Steam) hung at start, or the game drew
+ * into a window that showed nothing, in 6 of 13 runs with Wine tracing on and in 1 of 6 with it off; without the
+ * flag in none of about 25 (2026-09-29/30). The flag changes no register value there (V16-V31 of the one game thread
+ * that enters with it are zero before and after); the cause is not found. */
 static inline DWORD emulation_context_flags( DWORD flags )
 {
     const DWORD ymm = (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FEX_YMMSTATE) & ~CONTEXT_ARM64;
@@ -127,7 +128,7 @@ static inline DWORD emulation_context_flags( DWORD flags )
     if (enabled < 0)
     {
         const char *env = getenv( "PMW_VCPU_YMM_ENTRY" );
-        enabled = !(env && env[0] == '0');
+        enabled = env && env[0] == '1';
     }
     if (!enabled) return CONTEXT_FULL;
     return (flags & ymm) == ymm ? CONTEXT_FULL | CONTEXT_ARM64_FEX_YMMSTATE : CONTEXT_FULL;
