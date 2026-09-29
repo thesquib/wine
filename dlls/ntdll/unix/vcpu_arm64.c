@@ -1329,7 +1329,7 @@ static void vcpu_emulation_entry( const struct syscall_frame *frame, struct sysc
         abort_process( 1 );
     }
     NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
-    user_context->ContextFlags = CONTEXT_FULL;
+    user_context->ContextFlags = emulation_context_flags( frame->restore_flags );
     NtGetContextThread( GetCurrentThread(), user_context );
     *entry = *frame;
     entry->sp = (ULONG64)user_context;

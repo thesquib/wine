@@ -309,7 +309,7 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 
         NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
         *user_context = *context;
-        user_context->ContextFlags = CONTEXT_FULL;
+        user_context->ContextFlags = emulation_context_flags( context->ContextFlags );
         SP_sig(sigcontext) = (ULONG_PTR)user_context;
         PC_sig(sigcontext) = (ULONG_PTR)pKiUserEmulationDispatcher;
     }
@@ -1630,7 +1630,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
         CONTEXT *user_context = (CONTEXT *)((frame->sp - sizeof(CONTEXT)) & ~15);
 
         NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation = 1;
-        user_context->ContextFlags = CONTEXT_FULL;
+        user_context->ContextFlags = emulation_context_flags( frame->restore_flags );
         NtGetContextThread( GetCurrentThread(), user_context );
         SP_sig(sigcontext) = (ULONG_PTR)user_context;
         PC_sig(sigcontext) = (ULONG_PTR)pKiUserEmulationDispatcher;

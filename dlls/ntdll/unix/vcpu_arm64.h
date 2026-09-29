@@ -109,6 +109,18 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
 #define RESTORE_FLAGS_EMULATION  0x00010000
 
+/* ContextFlags of the context the emulator is entered with. The emulator takes the upper halves of the YMM
+ * registers from V16-V31 only when CONTEXT_ARM64_FEX_YMMSTATE is set, and keeps its own otherwise: the flag goes in
+ * when the context that was set came with it and with the V registers (flags as NtSetContextThread leaves them in
+ * restore_flags, without CONTEXT_ARM64), and never otherwise, as V16-V31 would then replace live upper halves
+ * with whatever the frame holds. */
+static inline DWORD emulation_context_flags( DWORD flags )
+{
+    const DWORD ymm = (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FEX_YMMSTATE) & ~CONTEXT_ARM64;
+
+    return (flags & ymm) == ymm ? CONTEXT_FULL | CONTEXT_ARM64_FEX_YMMSTATE : CONTEXT_FULL;
+}
+
 #if defined(__APPLE__)
 
 #include "vcpu/vcpu_el1.h"
