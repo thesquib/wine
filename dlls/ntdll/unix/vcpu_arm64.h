@@ -109,15 +109,27 @@ C_ASSERT( sizeof( struct syscall_frame ) == 0x330 );
 
 #define RESTORE_FLAGS_EMULATION  0x00010000
 
+#include <stdlib.h>
+
 /* ContextFlags of the context the emulator is entered with. The emulator takes the upper halves of the YMM
  * registers from V16-V31 only when CONTEXT_ARM64_FEX_YMMSTATE is set, and keeps its own otherwise: the flag goes in
  * when the context that was set came with it and with the V registers (flags as NtSetContextThread leaves them in
  * restore_flags, without CONTEXT_ARM64), and never otherwise, as V16-V31 would then replace live upper halves
  * with whatever the frame holds. */
+/* PMW_VCPU_YMM_ENTRY=0 leaves the flag out, as before: with Wine tracing on (+seh) Dune: Awakening and Steam hung
+ * at start or showed an empty window in 4 of 11 runs with the flag, in none of about 25 without it and in none of 5
+ * with the flag and tracing off (2026-09-29). The flag changes no register value there; the cause is not found. */
 static inline DWORD emulation_context_flags( DWORD flags )
 {
     const DWORD ymm = (CONTEXT_FLOATING_POINT | CONTEXT_ARM64_FEX_YMMSTATE) & ~CONTEXT_ARM64;
+    static int enabled = -1;
 
+    if (enabled < 0)
+    {
+        const char *env = getenv( "PMW_VCPU_YMM_ENTRY" );
+        enabled = !(env && env[0] == '0');
+    }
+    if (!enabled) return CONTEXT_FULL;
     return (flags & ymm) == ymm ? CONTEXT_FULL | CONTEXT_ARM64_FEX_YMMSTATE : CONTEXT_FULL;
 }
 
