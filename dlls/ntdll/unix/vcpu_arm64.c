@@ -1234,6 +1234,8 @@ static BOOL vcpu_release( struct vcpu_thread *vt )
     return TRUE;
 }
 
+extern int __ulock_wake( uint32_t operation, void *addr, uint64_t wake_value );
+
 /* the monitor's callbacks: under the pool lock, never block, never call the pool (R10) */
 static void vcpu_pool_kick( vel1_pool_member *m, void *arg )
 {
@@ -1262,6 +1264,15 @@ static void vcpu_pool_unblock( vel1_pool_member *m, void *arg )
     {
         const LONG *word = atomic_load( &vt->block_word );
         if (word) vcpu_futex_wake_word( word );
+        break;
+    }
+    case VCPU_BLOCK_ULOCK_SHARED:
+    {
+        /* an msync wait. Other threads may wait on the same word (an object's), and a wake of one could take any
+         * of them: all are woken. To each it is a wake with nothing to acquire: msync checks again and waits on */
+        const LONG *word = atomic_load( &vt->block_word );
+        if (word) __ulock_wake( 3 /* UL_COMPARE_AND_WAIT_SHARED */ | 0x00000100 /* ULF_WAKE_ALL */ |
+                                0x01000000 /* ULF_NO_ERRNO */, (void *)word, 0 );
         break;
     }
     default:

@@ -63,6 +63,7 @@
 
 #include "unix_private.h"
 #include "msync.h"
+#include "vcpu_arm64.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
@@ -375,7 +376,13 @@ static inline NTSTATUS msync_wait_single( int obj, void *obj_shm,
         }
         if (!end)
             proton_dtr_log_park( obj, ((struct event *)obj_shm)->msync_type, (unsigned)tid );
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
+        {
+            /* vCPU M:N: a block point. The pool's monitor wakes this word to unblock, which returns here as a
+             * wake with nothing to acquire: the caller checks the object and waits again */
+            BOOL tracked = vcpu_block_begin( VCPU_BLOCK_ULOCK_SHARED, obj_shm );
+            ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, obj_shm, val, ns_timeleft );
+            if (tracked) vcpu_block_end();
+        }
     } while (ret == -EINTR || ret == -EFAULT);
 
     if (ret == -ETIMEDOUT)
@@ -492,7 +499,12 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
                 return STATUS_TIMEOUT;
             }
         }
-        ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 1, ns_timeleft );
+        {
+            /* vCPU M:N: a block point, as in msync_wait_single */
+            BOOL tracked = vcpu_block_begin( VCPU_BLOCK_ULOCK_SHARED, (const LONG *)addr );
+            ret = ulock_wait( UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, addr, 1, ns_timeleft );
+            if (tracked) vcpu_block_end();
+        }
         val = __atomic_load_n( addr, __ATOMIC_ACQUIRE );
         if (!val)
             break;
