@@ -302,6 +302,15 @@ static inline mach_msg_return_t server_register_wait( unsigned int msgh_id, cons
     mr = mach_msg2( (mach_msg_header_t *)&message, MACH_SEND_MSG, message.header.msgh_size,
                      0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, 0 );
 
+    if (mr == MACH_SEND_INVALID_DEST)
+    {
+        /* the server's port is dead: the wineserver is gone. The socket path dies in wait_reply when the
+         * server closes the connection; do the same here instead of returning STATUS_PENDING, which the
+         * wait loop retries at once (2026-09-30: six orphaned processes wrote 81 million of these lines,
+         * 9 GB, after a session lost its server). */
+        ERR("wineserver's msync port is dead (%#x); the server is gone, ending this thread\n", mr);
+        abort_thread(0);
+    }
     if (mr != MACH_MSG_SUCCESS)
         ERR("Failed to send server register wait: %#x\n", mr);
 
