@@ -2488,7 +2488,11 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
  * a default configuration sees, which in the vCPU mode (PMW_VCPU) is exactly what the Windows code, including an
  * ARM64EC emulator reading "CP xxxx" under CentralProcessor, runs against (ntdll links the framework for that mode,
  * vcpu_el1_live_arm64.c). Without the hypervisor entitlement the config cannot be created and nothing is reported,
- * as before. MIDR_EL1 and ID_AA64ISAR2_EL1 are not feature registers there and stay unpopulated. */
+ * as before. MIDR_EL1 is not a feature register there and stays unpopulated. ID_AA64ISAR2_EL1 is not one either;
+ * it is built from the host's sysctl feature flags, RPRES only (FEAT_RPRES, bits [7:4]): without it an emulator
+ * lowers x86 rcp/rsqrt estimates to a divide and a square root (openrosetta 2026-09-30: rsqrt about 2x slower than
+ * with frecpe/frsqrte, and a different result from Rosetta 2's). WFxT is deliberately left out: it would advertise
+ * waitpkg, and WFET/WFIT are untested inside the vCPU. */
 static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
                                      WORD logical_thread_id )
 {
@@ -2525,6 +2529,8 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
             regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4025, value };
     }
     os_release( config );
+    if (has_feature( "FEAT_RPRES" ))
+        regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4032, 1ull << 4 }; /* ID_AA64ISAR2_EL1.RPRES */
     return regidx;
 }
 
