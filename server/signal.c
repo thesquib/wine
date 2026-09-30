@@ -171,6 +171,10 @@ static void handler_poll_event( struct fd *fd, int event )
     }
 }
 
+static volatile sig_atomic_t term_signal;
+static volatile pid_t term_sender_pid;
+static volatile uid_t term_sender_uid;
+
 /* SIGHUP callback */
 static void sighup_callback(void)
 {
@@ -182,6 +186,10 @@ static void sighup_callback(void)
 /* SIGTERM callback */
 static void sigterm_callback(void)
 {
+    /* an orderly exit that leaves the clients alive: say who asked for it (macOS, 2026-09-30: a session lost
+     * its server this way with no line in any log) */
+    fprintf( stderr, "wineserver: signal %d from pid %d (uid %d), exiting\n",
+             term_signal, (int)term_sender_pid, (int)term_sender_uid );
     flush_registry();
     exit(1);
 }
@@ -199,8 +207,11 @@ static void do_sighup( int signum )
 }
 
 /* SIGTERM handler */
-static void do_sigterm( int signum )
+static void do_sigterm( int signum, siginfo_t *si, void *x )
 {
+    term_signal = signum;
+    term_sender_pid = si ? si->si_pid : 0;
+    term_sender_uid = si ? si->si_uid : 0;
     do_signal( handler_sigterm );
 }
 
@@ -302,9 +313,11 @@ void init_signals(void)
     sigaction( SIGINT, &action, NULL );
     action.sa_handler = do_sigalrm;
     sigaction( SIGALRM, &action, NULL );
-    action.sa_handler = do_sigterm;
+    action.sa_sigaction = do_sigterm;
+    action.sa_flags = SA_SIGINFO;
     sigaction( SIGQUIT, &action, NULL );
     sigaction( SIGTERM, &action, NULL );
+    action.sa_flags = 0;
     if (core_dump_disabled())
     {
         action.sa_handler = do_sigsegv;
