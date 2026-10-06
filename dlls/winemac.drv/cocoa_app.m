@@ -176,6 +176,26 @@ static int proton_force_menubar_hide(void)
 
 /* PROTON_ALLOW_BACKGROUND_WARP=1: let SetCursorPos warp the cursor while the app is not frontmost (the old behaviour;
  * see setCursorPosition:). Cached single getenv. */
+/* Whether the next applicationDidBecomeActive: re-synchronises Wine's display list (sendDisplaysChanged:TRUE). macOS
+ * re-announces an application that is already active on every left click on its window, with no resign in between
+ * (measured by the Recall project, github.com/AsherJN/recall, MIT, wine-winemac-activation.patch: 83 of 83 left
+ * clicks in one Overwatch match), and each re-sync cost the game about 16 ms on the thread that owns its window. The
+ * re-sync exists to catch display changes made while another application was active, so it is needed only after a
+ * real resign or a screen-parameter change. PROTON_ALWAYS_ACTIVATION_RESYNC=1 restores the re-sync on every
+ * activation. Main thread only. */
+static BOOL activation_resync_needed = TRUE;
+
+static BOOL proton_always_activation_resync(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_ALWAYS_ACTIVATION_RESYNC");
+        cached = (v && v[0] && strcmp(v, "0")) ? 1 : 0;
+    }
+    return cached;
+}
+
 static int proton_allow_background_warp(void)
 {
     static int cached = -1;
@@ -3135,8 +3155,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
         //
         // To solve this, we synthesize a displays-changed event whenever we're
         // activated.  This will provoke a re-synchronization of Wine's notion of
-        // the desktop rect with the actual state.
-        [self sendDisplaysChanged:TRUE];
+        // the desktop rect with the actual state.  Only after a real resign or a
+        // screen-parameter change: see activation_resync_needed.
+        if (activation_resync_needed || proton_always_activation_resync())
+        {
+            activation_resync_needed = FALSE;
+            [self sendDisplaysChanged:TRUE];
+        }
 
         // The cursor probably moved while we were inactive.  Accumulated mouse
         // movement deltas are invalidated.  Make sure the next mouse move event
@@ -3147,6 +3172,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
     - (void)applicationDidChangeScreenParameters:(NSNotification *)notification
     {
         primaryScreenHeightValid = FALSE;
+        activation_resync_needed = TRUE;
         [self sendDisplaysChanged:FALSE];
         [self adjustWindowLevels];
 
@@ -3161,6 +3187,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         macdrv_event* event;
         WineEventQueue* queue;
 
+        activation_resync_needed = TRUE;
         [self invalidateGotFocusEvents];
 
         event = macdrv_create_event(APP_DEACTIVATED, nil);
