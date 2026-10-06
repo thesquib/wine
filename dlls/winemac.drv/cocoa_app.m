@@ -25,6 +25,10 @@
 
 #include <signal.h>   /* kill() - used by the PROTON_AUTO_EXIT_ON_LAST_WINDOW
                        * kAEQuit -> SIGTERM hook in applicationShouldTerminate */
+#include <dlfcn.h>
+#include <os/lock.h>
+#include <time.h>
+#import <GameController/GameController.h>
 
 #pragma GCC diagnostic ignored "-Wdeclaration-after-statement"
 
@@ -71,8 +75,203 @@ static BOOL cursor_diag(void)
     return cached;
 }
 
+/* ---------------------------------------------------------------------
+ * PROTON_GCMOUSE=1: raw mouse motion from the Game Controller framework's
+ * GCMouse while FPS mode has the pointer disassociated.
+ *
+ * In FPS mode the relative motion Wine receives comes from NSEvent deltas,
+ * which have macOS pointer acceleration applied and reach the app at most once
+ * per display refresh. GCMouse reports whole mouse counts at the mouse's own
+ * report rate, as Windows raw input does. While FPS mode is on for a window,
+ * the reports go on raw_mouse_queue straight to that window's event queue as
+ * MOUSE_MOVED_RELATIVE, without the Cocoa thread, at most once per
+ * raw_mouse_interval_ns (motion in between accumulates, nothing is dropped);
+ * handleMouseMove: then posts no NSEvent deltas of its own unless GCMouse has
+ * been silent for raw_mouse_silence_ns (a device GCMouse does not report).
+ * Trackpads are left to NSEvents: aiming with one relies on pointer
+ * acceleration. FPS mode itself (when the pointer is disassociated) is
+ * unchanged. The framework is dlopen()ed on first use, so the driver links as
+ * before and runs as before without the variable.
+ *
+ * Adapted from the Recall project's wine-mouselook.patch
+ * (github.com/AsherJN/recall, MIT; its Wine patches keep Wine's LGPL), whose
+ * own mouselook mode is not taken: our FPS mode already decides when motion
+ * is relative.
+ *
+ * PROTON_GCMOUSE_SCALE (default 1.0) multiplies the counts.
+ * PROTON_GCMOUSE_INTERVAL_US (default 1000) caps the delivery rate; 0 posts
+ * every report.
+ */
+static os_unfair_lock raw_mouse_lock = OS_UNFAIR_LOCK_INIT;
+static WineWindow* raw_mouse_window;            /* retained; under raw_mouse_lock */
+static int raw_mouse_on;                        /* raw_mouse_window is set; atomic */
+static unsigned long long raw_mouse_last_motion; /* CLOCK_UPTIME_RAW ns of the last report; atomic */
+static dispatch_queue_t raw_mouse_queue;        /* NULL until GCMouse is running */
+static const unsigned long long raw_mouse_silence_ns = 250000000;
+static unsigned long long raw_mouse_interval_ns = 1000000;
+static double raw_mouse_scale = 1.0;
+/* raw_mouse_queue only */
+static double raw_mouse_pending_x, raw_mouse_pending_y;
+static unsigned long long raw_mouse_last_post;
+static BOOL raw_mouse_flush_armed;
+
+static BOOL gcmouse_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PROTON_GCMOUSE");
+        cached = (v && v[0] && strcmp(v, "0")) ? 1 : 0;
+    }
+    return cached;
+}
+
+static unsigned long long raw_mouse_clock(void)
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
+
+/* raw_mouse_queue: posts the whole counts received so far; the fraction stays pending */
+static void raw_mouse_flush(void)
+{
+    int x = raw_mouse_pending_x, y = raw_mouse_pending_y;  /* truncation keeps the remainder */
+    unsigned long long now = raw_mouse_clock();
+
+    raw_mouse_flush_armed = FALSE;
+    if (!x && !y) return;
+
+    os_unfair_lock_lock(&raw_mouse_lock);
+    if (raw_mouse_window && __atomic_load_n(&raw_mouse_on, __ATOMIC_ACQUIRE))
+    {
+        macdrv_event* event = macdrv_create_event(MOUSE_MOVED_RELATIVE, raw_mouse_window);
+        event->mouse_moved.x = x;
+        event->mouse_moved.y = y;
+        event->mouse_moved.time_ms = [[WineApplicationController sharedController] ticksForEventTime:now / 1e9];
+        [raw_mouse_window.queue postEvent:event];
+        macdrv_release_event(event);
+        raw_mouse_pending_x -= x;
+        raw_mouse_pending_y -= y;
+        raw_mouse_last_post = now;
+    }
+    else
+        raw_mouse_pending_x = raw_mouse_pending_y = 0;
+    os_unfair_lock_unlock(&raw_mouse_lock);
+}
+
+/* raw_mouse_queue: one GCMouse report */
+static void raw_mouse_motion(float dx, float dy)
+{
+    unsigned long long now = raw_mouse_clock();
+
+    __atomic_store_n(&raw_mouse_last_motion, now, __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&raw_mouse_on, __ATOMIC_ACQUIRE))
+    {
+        raw_mouse_pending_x = raw_mouse_pending_y = 0;
+        return;
+    }
+
+    raw_mouse_pending_x += dx * raw_mouse_scale;
+    raw_mouse_pending_y -= dy * raw_mouse_scale;  /* GCMouse's Y axis points up, Windows' down */
+    if (!raw_mouse_interval_ns || now - raw_mouse_last_post >= raw_mouse_interval_ns)
+        raw_mouse_flush();
+    else if (!raw_mouse_flush_armed)
+    {
+        raw_mouse_flush_armed = TRUE;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(raw_mouse_last_post + raw_mouse_interval_ns - now)),
+                       raw_mouse_queue, ^{ raw_mouse_flush(); });
+    }
+}
+
+/* main thread */
+static void raw_mouse_attach(GCMouse* mouse)
+{
+    static NSMutableArray* attached;
+
+    // GCMouse has no public way to tell a trackpad from a mouse but its name
+    // ("Apple Internal Keyboard / Trackpad", "Magic Trackpad").
+    if ([mouse.vendorName rangeOfString:@"Trackpad" options:NSCaseInsensitiveSearch].location != NSNotFound)
+        return;
+    if (!attached) attached = [[NSMutableArray alloc] init];
+    if ([attached containsObject:mouse]) return;
+    [attached addObject:mouse];
+    mouse.handlerQueue = raw_mouse_queue;
+    mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput* input, float deltaX, float deltaY){
+        raw_mouse_motion(deltaX, deltaY);
+    };
+    fprintf(stderr, "winemac:mouse GCMouse raw input from \"%s\"\n", [mouse.vendorName UTF8String] ?: "?");
+}
+
+/* main thread: loads the Game Controller framework and starts GCMouse, once */
+static void raw_mouse_start(void)
+{
+    static BOOL started;
+    const char *v;
+    NSString* const* connected;
+    dispatch_queue_attr_t attributes;
+    Class mouseClass;
+    void* framework;
+
+    if (started || !gcmouse_enabled()) return;
+    started = TRUE;
+
+    framework = dlopen("/System/Library/Frameworks/GameController.framework/GameController", RTLD_LAZY | RTLD_LOCAL);
+    mouseClass = NSClassFromString(@"GCMouse");
+    connected = framework ? dlsym(framework, "GCMouseDidConnectNotification") : NULL;
+    if (!mouseClass || !connected)
+    {
+        fprintf(stderr, "winemac:mouse PROTON_GCMOUSE: GCMouse is not available; NSEvent deltas stay in use\n");
+        return;
+    }
+
+    if ((v = getenv("PROTON_GCMOUSE_INTERVAL_US")) && *v)
+        raw_mouse_interval_ns = strtoull(v, NULL, 10) * 1000;
+    if ((v = getenv("PROTON_GCMOUSE_SCALE")) && *v && atof(v) > 0)
+        raw_mouse_scale = atof(v);
+
+    attributes = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0);
+    attributes = dispatch_queue_attr_make_with_autorelease_frequency(attributes, DISPATCH_AUTORELEASE_FREQUENCY_WORK_ITEM);
+    raw_mouse_queue = dispatch_queue_create("org.winehq.wine.winemac.gcmouse", attributes);
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:*connected object:nil queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification* note){ raw_mouse_attach(note.object); }];
+    for (GCMouse* mouse in [mouseClass mice])
+        raw_mouse_attach(mouse);
+}
+
+/* main thread: the window raw motion goes to, or nil to stop it */
+static void raw_mouse_set_window(WineWindow* window)
+{
+    WineWindow* previous;
+
+    if (window && !raw_mouse_queue)
+    {
+        raw_mouse_start();
+        if (!raw_mouse_queue) window = nil;
+    }
+    /* only the main thread writes raw_mouse_window; raw_mouse_on can also be cleared by
+     * macdrv_restore_mouse_association, so re-arm when it was */
+    if (window == raw_mouse_window && (window != nil) == __atomic_load_n(&raw_mouse_on, __ATOMIC_ACQUIRE)) return;
+
+    os_unfair_lock_lock(&raw_mouse_lock);
+    previous = raw_mouse_window;
+    raw_mouse_window = [window retain];
+    __atomic_store_n(&raw_mouse_on, window != nil, __ATOMIC_RELEASE);
+    os_unfair_lock_unlock(&raw_mouse_lock);
+    [previous release];
+}
+
+/* main thread: whether raw input is carrying the motion to this window, so NSEvent deltas must not */
+static BOOL raw_mouse_carries(WineWindow* window)
+{
+    return window && window == raw_mouse_window && __atomic_load_n(&raw_mouse_on, __ATOMIC_ACQUIRE) &&
+           raw_mouse_clock() - __atomic_load_n(&raw_mouse_last_motion, __ATOMIC_RELAXED) < raw_mouse_silence_ns;
+}
+
 void macdrv_restore_mouse_association(void)
 {
+    /* any thread: stop raw motion; the main thread drops the window on its next update */
+    __atomic_store_n(&raw_mouse_on, 0, __ATOMIC_RELEASE);
+
     /* Safe to call from any thread / context, including atexit on a
      * non-main thread. CGAssociateMouseAndMouseCursorPosition is a
      * lightweight CG call - no Cocoa locking required. */
@@ -1906,6 +2105,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 macdrv_mouse_disassociated = fpsModeActive;
                 fprintf(stderr, "winemac:mouse FPS mode = %d (clippingCursor)\n", fpsModeActive);
             }
+            if (gcmouse_enabled())
+                raw_mouse_set_window(fpsModeActive ? targetWindow : nil);
 
             if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
             {
@@ -2020,6 +2221,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 /* Keep the remainder after integer truncation. */
                 mouseMoveDeltaX -= event->mouse_moved.x / scale;
                 mouseMoveDeltaY -= event->mouse_moved.y / scale;
+
+                /* PROTON_GCMOUSE: GCMouse already delivered this motion as raw counts */
+                if (raw_mouse_carries(targetWindow))
+                {
+                    event->mouse_moved.x = event->mouse_moved.y = 0;
+                    mouseMoveDeltaX = mouseMoveDeltaY = 0;
+                }
             }
 
             if (event->type == MOUSE_MOVED_ABSOLUTE || event->mouse_moved.x || event->mouse_moved.y)
@@ -2035,7 +2243,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
             lastTargetWindow = targetWindow;
         }
         else
+        {
             lastTargetWindow = nil;
+            if (gcmouse_enabled())
+                raw_mouse_set_window(nil);
+        }
 
         [self updateCursor:FALSE];
     }
@@ -2449,6 +2661,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [keyWindows removeObjectIdenticalTo:window];
             if (window == lastTargetWindow)
                 lastTargetWindow = nil;
+            if (window == raw_mouse_window)
+                raw_mouse_set_window(nil);
             if (window == self.mouseCaptureWindow)
             {
                 self.mouseCaptureWindow = nil;
@@ -3188,6 +3402,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
         WineEventQueue* queue;
 
         activation_resync_needed = TRUE;
+        if (gcmouse_enabled())
+            raw_mouse_set_window(nil);
         [self invalidateGotFocusEvents];
 
         event = macdrv_create_event(APP_DEACTIVATED, nil);
