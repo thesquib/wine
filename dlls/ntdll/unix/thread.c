@@ -2230,6 +2230,25 @@ static void set_native_thread_name( HANDLE handle, const UNICODE_STRING *name )
     len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA) - 1, FALSE );
     nameA[len] = '\0';
     pthread_setname_np( nameA );
+
+    /* PMW_THREAD_NAMES=1: one line per named thread, joining the Wine tid (FEX's JIT stats print "tid 61C") to the
+     * name and to the host thread id that `sample` prints as Thread_<id> (plus the mach port). */
+    {
+        static int enabled = -1;
+        if (enabled == -1)
+        {
+            const char *env = getenv( "PMW_THREAD_NAMES" );
+            enabled = env && atoi( env );
+        }
+        if (enabled)
+        {
+            uint64_t host_tid = 0;
+            pthread_threadid_np( NULL, &host_tid );
+            fprintf( stderr, "[THREAD-NAME] pid %d tid %X name \"%s\" host_tid %llu mach_port 0x%x\n", (int)getpid(),
+                     (unsigned int)GetCurrentThreadId(), nameA, (unsigned long long)host_tid,
+                     (unsigned int)pthread_mach_thread_np( pthread_self() ) );
+        }
+    }
 #elif defined(__FreeBSD__)
     unsigned int status;
     char nameA[64];
