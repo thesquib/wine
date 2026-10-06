@@ -63,6 +63,55 @@ unsigned char vcpu_vprot_to_s1( unsigned char vprot )
 
 
 /***********************************************************************
+ *           vcpu_acqrel_decode
+ *
+ * PMW_VCPU_ACQREL, step 1: the faulting instruction must be one vel1_acqrel emulates (LDAR / LDAPR / LDAPUR / STLR /
+ * STLUR of 2, 4 or 8 bytes), in the direction the fault reports (ESR WnR): a disagreement means the word is not what
+ * faulted, and nothing is emulated.
+ */
+enum vcpu_acqrel_result vcpu_acqrel_decode( uint32_t insn, BOOL is_write, vel1_acqrel *d )
+{
+    if (!vel1_acqrel_decode( insn, d )) return VCPU_AR_DECODE;
+    if ((d->kind == VEL1_AR_STLR) != !!is_write) return VCPU_AR_DECODE;
+    return VCPU_AR_DONE;
+}
+
+
+/***********************************************************************
+ *           vcpu_acqrel_address
+ *
+ * PMW_VCPU_ACQREL, step 2: the address the instruction used, Xn (SP for Rn = 31, read by the caller) + imm, must be
+ * the fault address as reported (raw, before any WoW64 canonicalisation), and the access must cross a 16-byte
+ * boundary (inside one granule it is single-copy atomic and cannot take this fault).
+ */
+enum vcpu_acqrel_result vcpu_acqrel_address( const vel1_acqrel *d, uint64_t xn, uint64_t far, uint64_t *addr )
+{
+    *addr = xn + (uint64_t)(int64_t)d->imm;
+    if (*addr != far) return VCPU_AR_MISMATCH;
+    if (!vel1_acqrel_crosses16( *addr, d->size )) return VCPU_AR_NOCROSS;
+    return VCPU_AR_DONE;
+}
+
+
+/***********************************************************************
+ *           vcpu_acqrel_page_ok
+ *
+ * PMW_VCPU_ACQREL, step 3, per 4K page: the host may do the access only where the guest's own stage 1 would allow
+ * it (vcpu_vprot_to_s1: committed, no guard, readable; writable for a store, which a write watch takes away). A
+ * store also declines on a write-copy page, so that Wine's own fault path sees the first write. Anything declined
+ * goes the normal way: FEX's handler retries the access and the page fault that follows is handled as before.
+ */
+BOOL vcpu_acqrel_page_ok( unsigned char vprot, BOOL is_write )
+{
+    unsigned char s1 = vcpu_vprot_to_s1( vprot );
+
+    if (!(s1 & GMM_S1_R)) return FALSE;
+    if (!is_write) return TRUE;
+    return (s1 & GMM_S1_W) && !(vprot & (VCPU_VPROT_WRITECOPY | VCPU_VPROT_WRITEWATCH));
+}
+
+
+/***********************************************************************
  *           fp_exception_code
  *
  * Trapped floating-point exception (EC 0x2c) -> status, from the ISS flag bits (IOF 0, DZF 1, OFF 2, UFF 3, IXF 4).
