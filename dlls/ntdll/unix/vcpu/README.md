@@ -4,8 +4,16 @@ Used only by the arm64 macOS vCPU mode (`PMW_VCPU`), where every Windows thread'
 Hypervisor.framework vCPU. Nothing here is built on any other platform: the `*_arm64.c` wrappers one level up compile to
 nothing unless `__APPLE__ && __aarch64__`.
 
-Source: fex_macos, branch `upstream-sync-20260921`, `openrosetta/hvf_proto/{vcpu_el1,gmm}/`, at two tags:
-- `gmm.[ch]`: tag `vel1-gmm-v10` (fex commit `c3ad23ef3`, code as of `339a2887f`). v10 lets the page-table pool span
+Source: fex_macos, `openrosetta/hvf_proto/{vcpu_el1,gmm}/`. Every library file here is byte-identical to tag `vel1-gmm-v12`
+(fex commit `b2765d25c`, branch `openrosetta-macos`); the tags below are where each file last changed:
+- `vel1_acqrel.[ch]`: new in `vel1-gmm-v12`. Host-side emulation of a misaligned (16-byte-crossing) LDAR / LDAPR /
+  LDAPUR / STLR / STLUR of 2, 4 or 8 bytes: `vel1_acqrel_decode`, `vel1_acqrel_crosses16`, `vel1_acqrel_perform` (the
+  access with the instruction's barriers). Pure C11, no `hv_*` call. Host-only and unit-tested on openrosetta's side
+  (`vel1_acqrel_test`, not vendored); its live proof is Wine's KCD2 run. Wine's hook is `PMW_VCPU_ACQREL`
+  (`vcpu_arm64.c`, `virtual.c`: `virtual_vcpu_acqrel`). Built by `vcpu_acqrel_arm64.c`.
+- `gmm.[ch]`: tag `vel1-gmm-v11` (fex commit `38d34b1ce`): the no-change clip of a uniform committed
+  `gmm_vm_range_set` and a capped shootdown list, plus `gmm_debug_thin_counts`. Before that, `vel1-gmm-v10` (fex commit
+  `c3ad23ef3`, code as of `339a2887f`). v10 lets the page-table pool span
   several host map entries (XNU splits an anonymous mmap into 128 MiB entries; v9 capped the pool there), mapping
   each piece with its own `s2_map`, and adds `gmm_pt_pool_stats` (`size`, `used` = the high-water mark, `enopt`),
   which the `PMW_VCPU_PROF` "pt pool" line prints. The pool must still be ONE `gmm_alloc_backing` allocation.
@@ -26,6 +34,8 @@ Source: fex_macos, branch `upstream-sync-20260921`, `openrosetta/hvf_proto/{vcpu
 Releases are tags, each with an entry in openrosetta's `hvf_proto/LIBS-CHANGES.md`; re-vendor only by moving to a
 tag. Files are byte-identical copies. Do not edit them here: changes go to openrosetta and are copied back.
 
+- `vel1_acqrel.[ch]`: the misaligned acquire/release helper (above); Wine owns the fault-loop hook, the page check
+  under `virtual_mutex` and the register access.
 - `vcpu_el1.[ch]`, `vcpu_el1_live.c`: vCPU creation at EL1, `vel1_run` and exit decoding, kicks (kicker thread),
   register access. Contracts D1-D20 are in `vcpu_el1.h`.
 - `vel1_pool.[ch]`: the vCPU slot pool (acquire/release, the release policy, the preempt/unblock monitor).
