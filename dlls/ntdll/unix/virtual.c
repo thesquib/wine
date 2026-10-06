@@ -6778,6 +6778,80 @@ NTSTATUS virtual_uninterrupted_write_memory( void *addr, const void *buffer, SIZ
 }
 
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/***********************************************************************
+ *           virtual_vcpu_acqrel
+ *
+ * PMW_VCPU_ACQREL (vcpu_arm64.c's fault loop): emulate on the host a misaligned (16-byte-crossing) acquire/release
+ * access that took an alignment fault in a vCPU (openrosetta vel1_acqrel). Like the uninterrupted read/write above,
+ * everything happens under virtual_mutex, the check of every page before the access, so a concurrent
+ * NtProtectVirtualMemory or decommit cannot slip in between: a host fault here (outside a dispatched syscall) would
+ * kill the process. In vCPU mode a guest view is host RW from reservation and a decommit leaves zero pages, so only
+ * a missing view could fault; guard, NOACCESS, write watch and write copy are semantics and decline.
+ *
+ * pc is ELR (always a 64-bit code address), far the raw fault address, is_write the fault's WnR. get_reg reads Xn
+ * (and Xt for a store) from the vCPU. On VCPU_AR_DONE *d is the access and *value a load's zero-extended result;
+ * on anything else nothing was touched.
+ */
+enum vcpu_acqrel_result virtual_vcpu_acqrel( uint64_t pc, uint64_t far, BOOL is_write, vcpu_acqrel_get_reg get_reg,
+                                             void *arg, vel1_acqrel *d, uint64_t *value )
+{
+    enum vcpu_acqrel_result ret;
+    struct file_view *view;
+    uint64_t xn, addr, src = 0;
+    char *host, *page;
+    sigset_t sigset;
+
+    virtual_mutex_enter( &sigset );
+    /* the gate: only native code mapped from an image (an ARM64EC module, ntdll). FEX's JIT code is anonymous memory
+     * and backpatches its own faulting sites; it keeps today's path */
+    view = (pc & 3) ? NULL : find_view( (const void *)pc, sizeof(uint32_t) );
+    if (!view || !(view->protect & SEC_IMAGE) || !is_guest_view( view ))
+    {
+        ret = VCPU_AR_GATE;
+        goto done;
+    }
+    /* a guest view's pages are host readable, committed or not */
+    if ((ret = vcpu_acqrel_decode( *(const uint32_t *)pc, is_write, d ))) goto done;
+    if (!get_reg( arg, d->rn, &xn ))
+    {
+        ret = VCPU_AR_REGS;
+        goto done;
+    }
+    if ((ret = vcpu_acqrel_address( d, xn, far, &addr ))) goto done;
+
+    /* WoW64: 32-bit data is reached through gmm's low mirror, and the views live at BASE + p (as W5 in
+     * vcpu_handle_fault) */
+    host = (char *)addr;
+    if (is_wow64() && addr < ((uint64_t)1 << 32)) host = (char *)gmm_vm_canon( vcpu_gmm(), addr );
+    /* both pages in one guest view (an access across two views declines) */
+    if (!(view = find_view( host, d->size )) || !is_guest_view( view ))
+    {
+        ret = VCPU_AR_PROT;
+        goto done;
+    }
+    for (page = ROUND_ADDR( host, page_mask ); page < host + d->size; page += page_size)
+    {
+        if (!vcpu_acqrel_page_ok( get_page_vprot( page ), is_write ))
+        {
+            ret = VCPU_AR_PROT;
+            goto done;
+        }
+    }
+    if (is_write && d->rt != 31 && !get_reg( arg, d->rt, &src ))  /* Rt = 31 is XZR here, not SP */
+    {
+        ret = VCPU_AR_REGS;
+        goto done;
+    }
+    *value = vel1_acqrel_perform( d, host, src );
+    ret = VCPU_AR_DONE;
+done:
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return ret;
+}
+#endif
+
+
 /***********************************************************************
  *           virtual_set_force_exec
  *

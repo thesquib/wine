@@ -64,6 +64,7 @@ enum vcpu_prof_id
     VCPU_PROF_S2_MAP,        /* in:hv_vm_map     gmm's stage-2 map backend */
     VCPU_PROF_S2_UNMAP,      /* in:hv_vm_unmap   gmm's stage-2 unmap backend */
     VCPU_PROF_WOW_ARG_CANON, /* w6:arg canon     a 32-bit syscall address that missed widening (count only) */
+    VCPU_PROF_FAULT_ACQREL,  /* fault:acqrel     PMW_VCPU_ACQREL: a misaligned ldar/ldapr/stlr emulated on the host */
     VCPU_PROF_IDS
 };
 
@@ -138,6 +139,7 @@ static inline DWORD emulation_context_flags( DWORD flags )
 #if defined(__APPLE__)
 
 #include "vcpu/vcpu_el1.h"
+#include "vcpu/vel1_acqrel.h"
 #define GMM_PROFILE 1  /* as vcpu_gmm_arm64.c builds gmm: PMW_VCPU_PROF reports its phases */
 #include "vcpu/gmm.h"
 
@@ -201,7 +203,32 @@ struct vcpu_syscall_shim { const void *func, *shim; };
 extern const struct vcpu_syscall_shim vcpu_syscall_shims[];
 extern const unsigned int vcpu_syscall_shim_count;
 
+/* PMW_VCPU_ACQREL (vcpu_arm64.c, virtual.c): what became of a misaligned (16-byte-crossing) LDAR / LDAPR / LDAPUR /
+ * STLR / STLUR alignment fault offered to the host-side emulation (openrosetta vel1_acqrel, vel1-gmm-v12). Only
+ * VCPU_AR_DONE resumes the guest at ELR + 4; every other result takes the normal fault path, nothing changed. */
+enum vcpu_acqrel_result
+{
+    VCPU_AR_DONE,      /* emulated */
+    VCPU_AR_GATE,      /* ELR is not in a guest image view: FEX's JIT code (anonymous memory) keeps its own path */
+    VCPU_AR_DECODE,    /* not a 2/4/8-byte acquire/release vel1_acqrel decodes, or not in the fault's direction */
+    VCPU_AR_MISMATCH,  /* Xn + imm != FAR */
+    VCPU_AR_NOCROSS,   /* the access does not cross a 16-byte boundary */
+    VCPU_AR_PROT,      /* a page of the access: no guest view, not committed, guard, not readable (loads) or not
+                          writable / write-copy / write-watched (stores) */
+    VCPU_AR_REGS,      /* a register read failed */
+    VCPU_AR_COUNT
+};
+/* reads guest register n for virtual_vcpu_acqrel: x0-x30, or SP_EL1 for n == 31 */
+typedef BOOL (*vcpu_acqrel_get_reg)( void *arg, unsigned int n, uint64_t *value );
+/* virtual.c: the gate, the page check and the access, all under virtual_mutex */
+extern enum vcpu_acqrel_result virtual_vcpu_acqrel( uint64_t pc, uint64_t far, BOOL is_write,
+                                                    vcpu_acqrel_get_reg get_reg, void *arg, vel1_acqrel *d,
+                                                    uint64_t *value );
+
 /* pure translation helpers (vcpu_pure_arm64.c) */
+extern enum vcpu_acqrel_result vcpu_acqrel_decode( uint32_t insn, BOOL is_write, vel1_acqrel *d );
+extern enum vcpu_acqrel_result vcpu_acqrel_address( const vel1_acqrel *d, uint64_t xn, uint64_t far, uint64_t *addr );
+extern BOOL vcpu_acqrel_page_ok( unsigned char vprot, BOOL is_write );
 extern unsigned char vcpu_vprot_to_s1( unsigned char vprot );
 extern BOOL vcpu_exit_to_exception( const vel1_exit *e, const struct syscall_frame *frame, EXCEPTION_RECORD *rec,
                                     ULONG64 *pc_adjust );

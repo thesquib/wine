@@ -83,6 +83,13 @@ static void vcpu_pool_line( char *buf, size_t size );  /* prof_thread, above its
 int vcpu_check_s2;
 int vcpu_sect_alias;
 int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm-backed sections alias one object across processes */
+/* PMW_VCPU_ACQREL=1 (default off; read once in vcpu_init_process): a misaligned LDAR / LDAPR / LDAPUR / STLR / STLUR
+ * alignment fault in native image code is emulated on the host right at the exit (vcpu_try_acqrel) instead of being
+ * raised to FEX's handler. Wants FEX's hardware-TSO (EL1) DLL; the image gate keeps FEX's JIT faults on their path */
+static int vcpu_acqrel;
+/* what the hook did with each data-abort alignment fault, by vcpu_acqrel_result, plus the faults it saw and the
+ * ones without a valid FAR (FnV), as running totals; PMW_VCPU_PROF prints their deltas */
+static _Atomic uint64_t acqrel_result[VCPU_AR_COUNT], acqrel_seen, acqrel_fnv;
 
 #define VCPU_IPA_BITS      40
 #define VCPU_PT_POOL_IPA   0x10000000ull            /* 256 MiB */
@@ -632,6 +639,7 @@ static const char * const prof_extra_names[VCPU_PROF_IDS] =
 {
     "in:s1 sync", "in:s1 revoke", "in:icache sync", "in:tlbi", "in:gmm_vm_fault", "lock:virtual_mutex",
     "fault:retry", "fault:handled", "fault:raised", "in:hv_vm_map", "in:hv_vm_unmap", "w6:arg canon",
+    "fault:acqrel",
 };
 
 /* unix calls by (function table, index): a slot is filled once under prof_unix_mutex, then published by ready */
@@ -970,6 +978,29 @@ static void *prof_thread( void *arg )
                          (unsigned long long)(t.none_clips - last_thin.none_clips) );
             last_thin = t;
             prof_sync_size_print();
+        }
+        if (vcpu_acqrel)
+        {
+            /* PMW_VCPU_ACQREL: alignment faults offered to the host emulation, and what became of them (deltas) */
+            static uint64_t last_r[VCPU_AR_COUNT], last_seen, last_fnv;
+            uint64_t r[VCPU_AR_COUNT], seen = atomic_load( &acqrel_seen ), fnv = atomic_load( &acqrel_fnv );
+
+            for (i = 0; i < VCPU_AR_COUNT; i++) r[i] = atomic_load( &acqrel_result[i] );
+            if (seen != last_seen || fnv != last_fnv)
+                fprintf( stderr, "[VCPU-PROF] pid %d   acqrel: alignment faults %llu (no FAR %llu) | taken %llu | "
+                         "declined: not image %llu, decode %llu, addr!=FAR %llu, no 16B cross %llu, protection %llu, "
+                         "regs %llu\n", (int)getpid(), (unsigned long long)(seen - last_seen),
+                         (unsigned long long)(fnv - last_fnv),
+                         (unsigned long long)(r[VCPU_AR_DONE] - last_r[VCPU_AR_DONE]),
+                         (unsigned long long)(r[VCPU_AR_GATE] - last_r[VCPU_AR_GATE]),
+                         (unsigned long long)(r[VCPU_AR_DECODE] - last_r[VCPU_AR_DECODE]),
+                         (unsigned long long)(r[VCPU_AR_MISMATCH] - last_r[VCPU_AR_MISMATCH]),
+                         (unsigned long long)(r[VCPU_AR_NOCROSS] - last_r[VCPU_AR_NOCROSS]),
+                         (unsigned long long)(r[VCPU_AR_PROT] - last_r[VCPU_AR_PROT]),
+                         (unsigned long long)(r[VCPU_AR_REGS] - last_r[VCPU_AR_REGS]) );
+            memcpy( last_r, r, sizeof(r) );
+            last_seen = seen;
+            last_fnv = fnv;
         }
         last_count[NROWS] = guest_c;
         last_ticks[NROWS] = guest_t;
@@ -1765,6 +1796,81 @@ static BOOL vcpu_spurious_unknown( struct vcpu_thread *vt, const vel1_exit *e )
     return TRUE;
 }
 
+/* virtual_vcpu_acqrel's register reader: one register per call, inside the vel1 depth mark */
+static BOOL acqrel_get_reg( void *arg, unsigned int n, uint64_t *value )
+{
+    struct vcpu_thread *vt = arg;
+    vel1_regs regs;
+    int err;
+
+    vt->hv_depth++;
+    err = vel1_regs_get( &vt->vcpu, &regs, n == 31 ? VEL1_R_SP_EL1 : VEL1_R_X(n), 0 );
+    vt->hv_depth--;
+    if (err) return FALSE;
+    *value = n == 31 ? regs.sp_el1 : regs.x[n];
+    return TRUE;
+}
+
+/***********************************************************************
+ *           vcpu_try_acqrel
+ *
+ * PMW_VCPU_ACQREL (openrosetta docs/relays/fex-side-acqrel-host-helper-2026-10-07.md, with its addendum a-h): a
+ * misaligned acquire/release that crosses a 16-byte boundary takes an alignment fault (DFSC 0x21). KCD2 takes ~529k a
+ * load on five `ldar w` sites in WHGameArm.dll, each a full register fetch, an exception into FEX's handler and an
+ * NtContinue (~10-15 us). Here the access is emulated on the host straight from the exit (~0.5 us) and the guest
+ * resumes at ELR + 4; no exception is raised.
+ *
+ * Runs before the loop sets in_syscall: a signal now kicks the vCPU (vcpu_signal_kick, FLAG_ONLY) and the next
+ * vel1_run reports the kick (vel1 D15), because the frame is not filled on this path and the frame path would edit
+ * a stale one. TRUE: done, re-enter. FALSE: nothing changed, take the normal fault path.
+ */
+static BOOL vcpu_try_acqrel( struct vcpu_thread *vt, const vel1_exit *e )
+{
+    enum vcpu_acqrel_result res;
+    vel1_acqrel d;
+    uint64_t value = 0;
+    sigset_t old;
+    BOOL mn_point;
+    int err;
+
+    if (e->fclass != VEL1_FC_DATA_ABORT || e->fsc != 0x21) return FALSE;
+    atomic_fetch_add_explicit( &acqrel_seen, 1, memory_order_relaxed );
+    if (!e->far_valid)
+    {
+        atomic_fetch_add_explicit( &acqrel_fnv, 1, memory_order_relaxed );
+        return FALSE;
+    }
+    res = virtual_vcpu_acqrel( e->elr, e->far, e->is_write, acqrel_get_reg, vt, &d, &value );
+    atomic_fetch_add_explicit( &acqrel_result[res], 1, memory_order_relaxed );
+    if (res != VCPU_AR_DONE) return FALSE;
+
+    /* M:N: this path skips vcpu_store_full, so it keeps the pool's latency promise itself (addendum g). Every signal
+     * stays blocked from the release to the resume: with in_syscall clear a kick landing between them would find no
+     * live vCPU (VEL1_KICK_NOT_LIVE) and be lost; held back, it arrives after the resume and kicks the new vCPU */
+    if ((mn_point = vcpu_mn && vt->preempt))
+    {
+        block_all_signals( &old );
+        vcpu_preempt_point( vt );
+        vcpu_ensure( vt );
+    }
+    err = 0;
+    vt->hv_depth++;
+    if (d.kind != VEL1_AR_STLR && d.rt != 31)  /* a load into XZR discards */
+    {
+        vel1_regs regs;
+        regs.x[d.rt] = value;
+        err = vel1_regs_set( &vt->vcpu, &regs, VEL1_R_X(d.rt), 0 );
+    }
+    if (!err) err = vel1_resume_at( &vt->vcpu, e->elr + 4, e->spsr );
+    vt->hv_depth--;
+    if (mn_point) pthread_sigmask( SIG_SETMASK, &old, NULL );
+    /* the access is done and cannot be replayed through the normal path: a failure here is fatal */
+    if (err) vcpu_fatal( "PMW_VCPU_ACQREL: resume after an emulated access failed %d (pc %#llx)\n", err,
+                         (unsigned long long)e->elr );
+    if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_ACQREL];
+    return TRUE;
+}
+
 /***********************************************************************
  *           vcpu_loop
  *
@@ -1796,6 +1902,8 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         frame = get_syscall_frame();
         if (kind == VEL1_EXIT_UNKNOWN && vcpu_spurious_unknown( vt, &e )) kind = VEL1_EXIT_KICK;
         else vt->unknown_run = 0;
+        /* PMW_VCPU_ACQREL: before the register fetch and with in_syscall clear (vcpu_try_acqrel) */
+        if (kind == VEL1_EXIT_FAULT_SYNC && vcpu_acqrel && vcpu_try_acqrel( vt, &e )) continue;
         switch (kind)
         {
         case VEL1_EXIT_SYSCALL:
@@ -2193,6 +2301,9 @@ void vcpu_init_process(void)
     /* wineserver backs anonymous sections with POSIX shm under the same variable (server/mapping.c). Default on since
      * 2026-09-25 (G14 live PASS on the FEX side, shmtest, STS2 on screen); PMW_VCPU_SHARED_SECTIONS=0 turns it off */
     vcpu_shared_sections = vcpu_sect_alias && !((env = getenv( "PMW_VCPU_SHARED_SECTIONS" )) && atoi( env ) <= 0);
+    vcpu_acqrel = vcpu_mode == 1 && (env = getenv( "PMW_VCPU_ACQREL" )) && atoi( env ) > 0;
+    fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_ACQREL=%d (host emulation of misaligned ldar/ldapr/stlr in "
+             "image code %s)\n", (int)getpid(), vcpu_acqrel, vcpu_acqrel ? "on" : "off" );
 
     init_sys_page();
     init_kuser();
