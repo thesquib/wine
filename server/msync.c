@@ -281,8 +281,14 @@ typedef struct
     mach_msg_port_descriptor_t descriptor;
 } mach_map_message_reply_t;
 
+/* Page table of the msync shm, one slot per page. It is allocated once at its full size and never moves: the main
+ * thread maps pages and publishes them here while the message pump thread reads slots, and a realloc of a growing
+ * array (as before) could free the array the pump was reading. Shm indexes are at most 28 bits (bits 28 and 29 of a
+ * message's shm_idx are flags), so the table covers MSYNC_SHM_MAX_IDX slots of 16 bytes: 2 MB of address space with
+ * 16 KB pages, of which only the touched lines become resident. Slots go from NULL to a page once, by CAS. */
+#define MSYNC_SHM_MAX_IDX (1u << 28)
 static void **shm_addrs;
-static int shm_addrs_size;  /* length of the allocated shm_addrs array */
+static unsigned int shm_addrs_size;  /* number of slots in shm_addrs, fixed at init */
 
 static void send_shm_to_client( mach_map_message_t *message )
 {
@@ -298,9 +304,9 @@ static void send_shm_to_client( mach_map_message_t *message )
         offset = (memory_object_offset_t)shm_tid_map;
         entry_size = shm_tid_size;
     }
-    else if (message->entry < shm_addrs_size)
+    else if (message->entry >= 0 && (unsigned int)message->entry < shm_addrs_size)
     {
-        offset = (memory_object_offset_t)shm_addrs[message->entry];
+        offset = (memory_object_offset_t)__atomic_load_n( &shm_addrs[message->entry], __ATOMIC_ACQUIRE );
         entry_size = pagesize;
     }
     else
@@ -584,8 +590,9 @@ void msync_init_shm(void)
 
     pagesize = (long)vm_kernel_page_size;
 
-    shm_addrs = calloc( 128, sizeof(shm_addrs[0]) );
-    shm_addrs_size = 128;
+    shm_addrs_size = (unsigned int)(((unsigned long long)MSYNC_SHM_MAX_IDX * 16) / pagesize);
+    if (!(shm_addrs = calloc( shm_addrs_size, sizeof(shm_addrs[0]) )))
+        fatal_error( "msync: could not allocate the shm page table (%u slots)\n", shm_addrs_size );
 
     kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&shm_tid_map, shm_tid_size, 0, VM_FLAGS_ANYWHERE,
                       MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
@@ -668,22 +675,14 @@ void msync_destroy( struct msync *msync )
     free( msync );
 }
 
+/* returns the object at idx, mapping its page on first use */
 static void *get_shm( unsigned int idx )
 {
-    int entry  = (idx * 16) / pagesize;
-    int offset = (idx * 16) % pagesize;
+    unsigned int entry  = ((unsigned long long)idx * 16) / pagesize;
+    unsigned int offset = ((unsigned long long)idx * 16) % pagesize;
 
-    if (entry >= shm_addrs_size)
-    {
-        int new_size = max(shm_addrs_size * 2, entry + 1);
-
-        if (!(shm_addrs = realloc( shm_addrs, new_size * sizeof(shm_addrs[0]) )))
-            fprintf( stderr, "msync: couldn't expand shm_addrs array to size %d\n", entry + 1 );
-
-        memset( shm_addrs + shm_addrs_size, 0, (new_size - shm_addrs_size) * sizeof(shm_addrs[0]) );
-
-        shm_addrs_size = new_size;
-    }
+    if (idx >= MSYNC_SHM_MAX_IDX)
+        fatal_error( "msync: shm index %u is past the %u-object limit\n", idx, MSYNC_SHM_MAX_IDX );
 
     if (!shm_addrs[entry])
     {
@@ -706,7 +705,7 @@ static void *get_shm( unsigned int idx )
             mach_vm_deallocate( mach_task_self(), address, pagesize ); /* someone beat us to it */
     }
 
-    return (void *)((unsigned long)shm_addrs[entry] + offset);
+    return (void *)((unsigned long)__atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE ) + offset);
 }
 
 static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
