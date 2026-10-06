@@ -662,6 +662,8 @@ struct inproc_sync
     unsigned short closed;    /* fd has been closed but sync is still referenced */
 };
 
+static void iocp_local_detach_idx( int idx, HANDLE handle );
+
 #define INPROC_SYNC_CACHE_BLOCK_SIZE  (65536 / sizeof(struct inproc_sync))
 #define INPROC_SYNC_CACHE_ENTRIES     128
 
@@ -916,6 +918,9 @@ void close_inproc_sync( HANDLE handle )
     if (inproc_device_fd < 0) return;
     if ((cache = get_cached_inproc_sync( handle )))
     {
+        /* WINEMSYNC_IOCP: a local completion port leaves local mode on a handle close; the handle is
+         * still valid here, so its local packets can still move to the server queue */
+        if (cache->type == INPROC_SYNC_INTERNAL) iocp_local_detach_idx( cache->fd, handle );
         cache->closed = 1;
         /* once for the reference we just grabbed, and once for the handle */
         release_inproc_sync( cache );
@@ -1090,6 +1095,8 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
             return ret;
         }
         objs[i] = syncs[i]->fd;
+        /* WINEMSYNC_IOCP: a direct wait on a local completion port must see its local packets */
+        if (syncs[i]->type == INPROC_SYNC_INTERNAL) iocp_local_detach_idx( objs[i], handles[i] );
     }
 
     if (alertable) alert_fd = get_inproc_alert_fd();
@@ -1114,6 +1121,7 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
     if ((ret = check_signal_access( signal_sync ))) goto done;
 
     if ((ret = get_inproc_sync( wait, INPROC_SYNC_UNKNOWN, SYNCHRONIZE, &stack_wait, &wait_sync ))) goto done;
+    if (wait_sync->type == INPROC_SYNC_INTERNAL) iocp_local_detach_idx( wait_sync->fd, wait );
 
     switch (signal_sync->type)
     {
@@ -2992,6 +3000,331 @@ NTSTATUS WINAPI NtReleaseKeyedEvent( HANDLE handle, const void *key,
 }
 
 
+#ifdef __APPLE__
+
+/***********************************************************************
+ * Process-local completion queues (WINEMSYNC_IOCP=1; msync only, off by default)
+ *
+ * Every NtSetIoCompletion and every non-empty NtRemoveIoCompletion is a wineserver round trip.
+ * A KCD2 load makes ~0.8 M of each and almost never blocks (proton-darwin
+ * docs/macos/iocp-server-round-trips-2026-10-07.md). With the knob set, a port this process
+ * creates unnamed and non-inheritable gets a process-local FIFO: NtSetIoCompletion from this
+ * process appends to it, and NtRemoveIoCompletion[Ex] pops from it, without the server. The
+ * server's queue is unchanged and still fed by everything else (async I/O, file completions, job
+ * objects, other processes); a dequeue takes local packets first, then server ones, and an empty
+ * poll checks the server's queue through the port's msync sync, in process.
+ *
+ * Blocking stays on the server. A dequeue that finds both queues empty and has to wait marks
+ * itself blocked and takes the ordinary server path; while any thread is blocked on the port,
+ * posts from this process go to the server too, so they reach it. Waiting, hand-off to a waiting
+ * thread (LIFO), close-while-waiting and APCs therefore behave exactly as without the knob.
+ * A post also goes to the server while the server's queue is non-empty, so every local packet is
+ * older than every server packet and taking local packets first keeps FIFO order.
+ *
+ * A port leaves local mode for good ("retires") the first time it is used in a way the local
+ * queue cannot honour: a cached handle to it is closed, a handle to it is duplicated to another
+ * process or made inheritable, it is waited on directly (in-process wait), or it is dequeued with
+ * an alertable NtRemoveIoCompletionEx (APC-versus-packet priority depends on the thread's
+ * association with the port, which only the server tracks). Retiring moves the queued local
+ * packets to the server queue, in order, while holding the lock every later local post or lookup
+ * needs, so nothing posted afterwards can overtake them.
+ *
+ * Not covered: another process duplicating our handle out of us (DuplicateHandle with our process
+ * as the source, run by them) does not retire the port; a wait on the port that falls back to a
+ * server wait (not in-process) does not see local packets; NtSetIoCompletionEx (reserve objects)
+ * always posts to the server, so a later local post can overtake it if the server's queue was empty
+ * in between. The Windows concurrency value is ignored, as it is by the server.
+ */
+
+struct iocp_packet
+{
+    ULONG_PTR key;
+    ULONG_PTR value;
+    ULONG_PTR information;
+    NTSTATUS  status;
+};
+
+struct iocp_local
+{
+    struct iocp_local  *next;         /* hash chain; read without the lock, so kept intact on unlink */
+    struct iocp_local  *zombie_next;
+    int                 idx;          /* msync index of the port's sync; the lookup key */
+    LONG                refs;         /* one for the table, one per caller in flight; iocp_mutex */
+    BOOL                retired;
+    struct iocp_packet *ring;
+    unsigned int        size, head, count;
+    unsigned int        blocked;      /* threads in a server wait on the port: posts go to the server */
+    struct inproc_sync *pin, pin_store; /* the creating handle's cached sync: keeps idx from reuse */
+};
+
+#define IOCP_HASH_SIZE 64
+static struct iocp_local *iocp_hash[IOCP_HASH_SIZE];
+static struct iocp_local *iocp_zombies;
+static LONG iocp_live, iocp_zombie_count;
+static int iocp_env = -1;
+static pthread_mutex_t iocp_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static inline int iocp_local_enabled(void)
+{
+    if (iocp_env == -1)
+    {
+        const char *env = getenv( "WINEMSYNC_IOCP" );
+        iocp_env = env && atoi( env );
+    }
+    return iocp_env && do_msync() && inproc_device_fd >= 0;
+}
+
+/* Also called without iocp_mutex (the empty-poll fast path and the detach hint): chains change only
+ * under the lock with release stores, an unlinked port keeps its next pointer, and port structures
+ * are never freed, so a lock-free reader always walks valid memory. A lock-free result is a hint. */
+static struct iocp_local *iocp_find( int idx )
+{
+    struct iocp_local *port;
+    for (port = __atomic_load_n( &iocp_hash[idx % IOCP_HASH_SIZE], __ATOMIC_ACQUIRE ); port;
+         port = __atomic_load_n( &port->next, __ATOMIC_ACQUIRE ))
+        if (port->idx == idx && !__atomic_load_n( &port->retired, __ATOMIC_ACQUIRE )) return port;
+    return NULL;
+}
+
+static void iocp_unlink( struct iocp_local *port )  /* iocp_mutex held */
+{
+    struct iocp_local **p;
+    for (p = &iocp_hash[port->idx % IOCP_HASH_SIZE]; *p; p = &(*p)->next)
+        if (*p == port) { __atomic_store_n( p, port->next, __ATOMIC_RELEASE ); break; }
+    __atomic_sub_fetch( &iocp_live, 1, __ATOMIC_SEQ_CST );
+}
+
+/* iocp_mutex held. The last reference only queues the port: releasing the pin can close an msync
+ * object, and some callers (NtClose) hold fd_cache_mutex. */
+static void iocp_put_locked( struct iocp_local *port )
+{
+    if (--port->refs) return;
+    port->zombie_next = iocp_zombies;
+    iocp_zombies = port;
+    __atomic_add_fetch( &iocp_zombie_count, 1, __ATOMIC_SEQ_CST );
+}
+
+/* releases what retired ports nobody uses any more hold; never called with iocp_mutex held */
+static void iocp_reap(void)
+{
+    struct iocp_local *list, *next;
+    sigset_t sigset;
+
+    if (!__atomic_load_n( &iocp_zombie_count, __ATOMIC_RELAXED )) return;
+    server_enter_uninterrupted_section( &iocp_mutex, &sigset );
+    list = iocp_zombies;
+    iocp_zombies = NULL;
+    __atomic_store_n( &iocp_zombie_count, 0, __ATOMIC_SEQ_CST );
+    server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+
+    for (; list; list = next)
+    {
+        next = list->zombie_next;
+        release_inproc_sync( list->pin );
+        free( list->ring );
+        list->ring = NULL;
+        /* the structure itself stays allocated (~0.1 KB per port closed), see iocp_find */
+    }
+}
+
+static NTSTATUS iocp_server_add( HANDLE handle, const struct iocp_packet *p )
+{
+    NTSTATUS status;
+
+    SERVER_START_REQ( add_completion )
+    {
+        req->handle      = wine_server_obj_handle( handle );
+        req->ckey        = p->key;
+        req->cvalue      = p->value;
+        req->status      = p->status;
+        req->information = p->information;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return status;
+}
+
+/* iocp_mutex held. handle must be a valid handle to the port: the local packets go to the server
+ * queue through it. */
+static void iocp_retire_locked( struct iocp_local *port, HANDLE handle )
+{
+    if (port->retired) return;
+    __atomic_store_n( &port->retired, TRUE, __ATOMIC_RELEASE );
+    iocp_unlink( port );
+    while (port->count)
+    {
+        /* fails only for a handle without IO_COMPLETION_MODIFY_STATE (a restricted duplicate
+         * waited on directly); the packet is lost then */
+        if (iocp_server_add( handle, &port->ring[port->head] ))
+            ERR( "port %p: could not move a local completion to the server\n", handle );
+        port->head = (port->head + 1) % port->size;
+        port->count--;
+    }
+    iocp_put_locked( port );  /* the table's reference */
+}
+
+/* a hook for everything that makes a port unfit for local mode, given its msync index */
+static void iocp_local_detach_idx( int idx, HANDLE handle )
+{
+    struct iocp_local *port;
+    sigset_t sigset;
+
+    if (!iocp_local_enabled() || !__atomic_load_n( &iocp_live, __ATOMIC_SEQ_CST )) return;
+    if (!iocp_find( idx )) return;  /* lock-free hint: every in-process wait on an internal sync comes here */
+    server_enter_uninterrupted_section( &iocp_mutex, &sigset );
+    if ((port = iocp_find( idx )))
+    {
+        TRACE( "port %p (idx %d) leaves local mode\n", handle, idx );
+        iocp_retire_locked( port, handle );
+    }
+    server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+}
+
+/* the same, given only a handle; must not be called with fd_cache_mutex held */
+void iocp_local_detach_handle( HANDLE handle )
+{
+    struct inproc_sync stack, *sync;
+
+    if (!iocp_local_enabled() || !__atomic_load_n( &iocp_live, __ATOMIC_SEQ_CST )) return;
+    if (get_inproc_sync( handle, INPROC_SYNC_INTERNAL, 0, &stack, &sync )) return;
+    iocp_local_detach_idx( sync->fd, handle );
+    release_inproc_sync( sync );
+}
+
+static void iocp_local_register( HANDLE handle )
+{
+    static int logged;
+    struct iocp_local *port;
+    sigset_t sigset;
+
+    if (!(port = calloc( 1, sizeof(*port) ))) return;
+    if (get_inproc_sync( handle, INPROC_SYNC_INTERNAL, 0, &port->pin_store, &port->pin ))
+    {
+        free( port );
+        return;
+    }
+    if (port->pin == &port->pin_store)
+    {
+        /* not cached: a close of this handle would go unseen, so stay on the server */
+        release_inproc_sync( port->pin );
+        free( port );
+        return;
+    }
+    port->idx  = port->pin->fd;
+    port->refs = 1;
+
+    server_enter_uninterrupted_section( &iocp_mutex, &sigset );
+    port->next = iocp_hash[port->idx % IOCP_HASH_SIZE];
+    __atomic_store_n( &iocp_hash[port->idx % IOCP_HASH_SIZE], port, __ATOMIC_RELEASE );
+    __atomic_add_fetch( &iocp_live, 1, __ATOMIC_SEQ_CST );
+    server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+
+    if (!__atomic_exchange_n( &logged, 1, __ATOMIC_SEQ_CST ))
+        fprintf( stderr, "msync: process-local completion queues on (WINEMSYNC_IOCP), first port %p idx %d\n",
+                 handle, port->idx );
+}
+
+/* The local port behind handle, returned with iocp_mutex held (leave it with sigset) and with a
+ * reference on the handle's sync; NULL, with nothing held, if handle is not a local port. One lock
+ * section per call: each one costs two sigprocmask calls. */
+static struct iocp_local *iocp_lock_port( HANDLE handle, ACCESS_MASK access, struct inproc_sync *stack,
+                                          struct inproc_sync **sync, sigset_t *sigset )
+{
+    struct iocp_local *port = NULL;
+
+    if (!__atomic_load_n( &iocp_live, __ATOMIC_SEQ_CST )) return NULL;
+    if (get_inproc_sync( handle, INPROC_SYNC_INTERNAL, 0, stack, sync )) return NULL;
+    if (((*sync)->access & access) == access)
+    {
+        server_enter_uninterrupted_section( &iocp_mutex, sigset );
+        if (!(port = iocp_find( (*sync)->fd ))) server_leave_uninterrupted_section( &iocp_mutex, sigset );
+    }
+    if (!port) release_inproc_sync( *sync );
+    return port;
+}
+
+static NTSTATUS iocp_push_locked( struct iocp_local *port, const struct iocp_packet *p )
+{
+    if (port->count == port->size)
+    {
+        unsigned int size = port->size ? port->size * 2 : 64, i;
+        struct iocp_packet *ring;
+
+        if (!(ring = malloc( size * sizeof(*ring) ))) return STATUS_NO_MEMORY;
+        for (i = 0; i < port->count; i++) ring[i] = port->ring[(port->head + i) % port->size];
+        free( port->ring );
+        port->ring = ring;
+        port->size = size;
+        port->head = 0;
+    }
+    port->ring[(port->head + port->count) % port->size] = *p;
+    __atomic_store_n( &port->count, port->count + 1, __ATOMIC_RELEASE );
+    return STATUS_SUCCESS;
+}
+
+static BOOL iocp_pop_locked( struct iocp_local *port, struct iocp_packet *p )
+{
+    if (!port->count) return FALSE;
+    *p = port->ring[port->head];
+    port->head = (port->head + 1) % port->size;
+    __atomic_store_n( &port->count, port->count - 1, __ATOMIC_RELEASE );
+    return TRUE;
+}
+
+/* the server's queue is non-empty (or the port was closed): its sync says so, in process */
+static BOOL iocp_server_signaled( int idx )
+{
+    static const LARGE_INTEGER zero;
+    return linux_wait_objs( inproc_device_fd, 1, &idx, WaitAny, 0, &zero ) == STATUS_SUCCESS;
+}
+
+/* What a local port does on NtRemoveIoCompletion[Ex] (up to count packets into info). Returns
+ * STATUS_SUCCESS with *n packets, STATUS_TIMEOUT for an empty poll, or STATUS_PENDING when the
+ * caller must take the server path: then *blocked is set if the port counts the caller as blocked
+ * (the caller decrements it with iocp_unblock afterwards). Called and returns with iocp_mutex held. */
+static NTSTATUS iocp_local_remove_locked( struct iocp_local *port, int port_idx, FILE_IO_COMPLETION_INFORMATION *info,
+                                          ULONG count, ULONG *n, const LARGE_INTEGER *timeout, BOOL *blocked )
+{
+    struct iocp_packet p;
+
+    *n = 0;
+    *blocked = FALSE;
+    while (*n < count && iocp_pop_locked( port, &p ))
+    {
+        info[*n].CompletionKey             = p.key;
+        info[*n].CompletionValue           = p.value;
+        info[*n].IoStatusBlock.Information = p.information;
+        info[*n].IoStatusBlock.Status      = p.status;
+        ++*n;
+    }
+    if (*n) return STATUS_SUCCESS;
+    if (timeout && !timeout->QuadPart)
+        return iocp_server_signaled( port_idx ) ? STATUS_PENDING : STATUS_TIMEOUT;
+    /* about to wait on the server: from now on posts must reach it */
+    port->blocked++;
+    port->refs++;
+    *blocked = TRUE;
+    return STATUS_PENDING;
+}
+
+static void iocp_unblock( struct iocp_local *port )
+{
+    sigset_t sigset;
+    server_enter_uninterrupted_section( &iocp_mutex, &sigset );
+    port->blocked--;
+    iocp_put_locked( port );
+    server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+}
+
+#else  /* __APPLE__ */
+
+static inline int iocp_local_enabled(void) { return 0; }
+static void iocp_local_detach_idx( int idx, HANDLE handle ) { }
+void iocp_local_detach_handle( HANDLE handle ) { }
+
+#endif  /* __APPLE__ */
+
+
 /***********************************************************************
  *             NtCreateIoCompletion (NTDLL.@)
  */
@@ -3016,6 +3349,16 @@ NTSTATUS WINAPI NtCreateIoCompletion( HANDLE *handle, ACCESS_MASK access, OBJECT
         *handle = wine_server_ptr_handle( reply->handle );
     }
     SERVER_END_REQ;
+
+#ifdef __APPLE__
+    /* WINEMSYNC_IOCP: only a port nobody else can reach yet: unnamed and not inheritable */
+    if (!status && iocp_local_enabled() &&
+        !(attr && ((attr->ObjectName && attr->ObjectName->Length) || (attr->Attributes & OBJ_INHERIT))))
+    {
+        iocp_reap();
+        iocp_local_register( *handle );
+    }
+#endif
 
     /* Detroit ring-freeze probe cycle 2: identify whether the orphan internal
      * sync (obj 456) is a completion port. Log the port handle at create so it
@@ -3074,6 +3417,34 @@ NTSTATUS WINAPI NtSetIoCompletion( HANDLE handle, ULONG_PTR key, ULONG_PTR value
     if (dtr_trace_on())
         fprintf( stderr, "msync: [DTR-SIOC] tid=%04x handle=%p\n", (unsigned)GetCurrentThreadId(), handle );
 
+#ifdef __APPLE__
+    if (iocp_local_enabled())
+    {
+        struct inproc_sync stack, *sync;
+        struct iocp_local *port;
+        sigset_t sigset;
+
+        iocp_reap();
+        if ((port = iocp_lock_port( handle, IO_COMPLETION_MODIFY_STATE, &stack, &sync, &sigset )))
+        {
+            struct iocp_packet p = { key, value, count, status };
+
+            BOOL to_server;
+
+            /* Local packets are dequeued before server ones, so a packet may only stay local while
+             * the server's queue is empty; and while a thread waits on the server the packet must
+             * reach it there (the server hands it to the most recent waiter, as Windows does). The
+             * round trip is made outside the lock: posts from different threads are concurrent
+             * and have no order to keep, and a thread's own posts are sequential. */
+            to_server = port->blocked || iocp_server_signaled( sync->fd );
+            ret = to_server ? STATUS_SUCCESS : iocp_push_locked( port, &p );
+            server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+            release_inproc_sync( sync );
+            return to_server ? iocp_server_add( handle, &p ) : ret;
+        }
+    }
+#endif
+
     SERVER_START_REQ( add_completion )
     {
         req->handle      = wine_server_obj_handle( handle );
@@ -3123,27 +3494,12 @@ NTSTATUS WINAPI NtSetIoCompletionEx( HANDLE completion_handle, HANDLE completion
 /***********************************************************************
  *             NtRemoveIoCompletion (NTDLL.@)
  */
-NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *value,
-                                      IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout )
+/* the server's part of NtRemoveIoCompletion, without the in-process empty check */
+static NTSTATUS server_remove_completion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *value,
+                                          IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout )
 {
     HANDLE wait_handle = NULL;
     unsigned int status;
-
-    TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
-    WAIT_TRACE("RemoveIOC handle=%p timeout=%s", handle,
-               timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
-    /* Detroit ring-freeze probe cycle 2: the WAITER side. If coordinator tid
-     * 0914 logs this for handle 0x5a4 (obj 456), the orphan IS a completion port. */
-    if (dtr_trace_on())
-        fprintf( stderr, "msync: [DTR-RIOC] tid=%04x handle=%p to=%s\n",
-                 (unsigned)GetCurrentThreadId(), handle,
-                 timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF" );
-
-    if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
-    {
-        status = NtWaitForSingleObject( handle, FALSE, timeout );
-        if (status != WAIT_OBJECT_0) return status;
-    }
 
     SERVER_START_REQ( remove_completion )
     {
@@ -3179,6 +3535,82 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
     return status;
 }
 
+NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *value,
+                                      IO_STATUS_BLOCK *io, LARGE_INTEGER *timeout )
+{
+    BOOL server_checked = FALSE;
+    unsigned int status;
+#ifdef __APPLE__
+    struct iocp_local *blocked_port = NULL;
+#endif
+
+    TRACE( "(%p, %p, %p, %p, %p)\n", handle, key, value, io, timeout );
+    WAIT_TRACE("RemoveIOC handle=%p timeout=%s", handle,
+               timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF");
+    /* Detroit ring-freeze probe cycle 2: the WAITER side. If coordinator tid
+     * 0914 logs this for handle 0x5a4 (obj 456), the orphan IS a completion port. */
+    if (dtr_trace_on())
+        fprintf( stderr, "msync: [DTR-RIOC] tid=%04x handle=%p to=%s\n",
+                 (unsigned)GetCurrentThreadId(), handle,
+                 timeout ? (timeout->QuadPart == 0 ? "0" : "T") : "INF" );
+
+#ifdef __APPLE__
+    if (iocp_local_enabled())
+    {
+        struct inproc_sync stack, *sync;
+        struct iocp_local *port;
+        sigset_t sigset;
+
+        iocp_reap();
+        if (timeout && !timeout->QuadPart && __atomic_load_n( &iocp_live, __ATOMIC_SEQ_CST ) &&
+            !get_inproc_sync( handle, INPROC_SYNC_INTERNAL, IO_COMPLETION_MODIFY_STATE, &stack, &sync ))
+        {
+            /* an empty poll, the commonest call, without the lock (two sigprocmask calls): no local
+             * packet now and the server's queue empty is a valid answer at this instant */
+            status = STATUS_PENDING;
+            if ((port = iocp_find( sync->fd )) && !__atomic_load_n( &port->count, __ATOMIC_ACQUIRE ) &&
+                !iocp_server_signaled( sync->fd ))
+                status = STATUS_TIMEOUT;
+            release_inproc_sync( sync );
+            if (status == STATUS_TIMEOUT) return status;
+        }
+        if ((port = iocp_lock_port( handle, IO_COMPLETION_MODIFY_STATE, &stack, &sync, &sigset )))
+        {
+            FILE_IO_COMPLETION_INFORMATION info;
+            BOOL blocked;
+            ULONG n;
+
+            status = iocp_local_remove_locked( port, sync->fd, &info, 1, &n, timeout, &blocked );
+            server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+            release_inproc_sync( sync );
+            if (status == STATUS_SUCCESS)
+            {
+                *key            = info.CompletionKey;
+                *value          = info.CompletionValue;
+                io->Information = info.IoStatusBlock.Information;
+                io->Status      = info.IoStatusBlock.Status;
+            }
+            if (status != STATUS_PENDING) return status;
+            /* both queues empty with a timeout, or a poll with server packets: the server path */
+            if (blocked) blocked_port = port;
+            server_checked = TRUE;
+        }
+    }
+#endif
+
+    if (!server_checked && timeout && !timeout->QuadPart && inproc_device_fd >= 0)
+    {
+        status = NtWaitForSingleObject( handle, FALSE, timeout );
+        if (status != WAIT_OBJECT_0) return status;
+    }
+
+    status = server_remove_completion( handle, key, value, io, timeout );
+#ifdef __APPLE__
+    if (blocked_port) iocp_unblock( blocked_port );
+#endif
+    return status;
+}
+
 
 /***********************************************************************
  *             NtRemoveIoCompletionEx (NTDLL.@)
@@ -3186,9 +3618,13 @@ NTSTATUS WINAPI NtRemoveIoCompletion( HANDLE handle, ULONG_PTR *key, ULONG_PTR *
 NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORMATION *info, ULONG count,
                                         ULONG *written, LARGE_INTEGER *timeout, BOOLEAN alertable )
 {
+    BOOL server_checked = FALSE;
     HANDLE wait_handle = NULL;
     unsigned int status;
     ULONG i = 0;
+#ifdef __APPLE__
+    struct iocp_local *blocked_port = NULL;
+#endif
 
     TRACE( "%p %p %u %p %p %u\n", handle, info, count, written, timeout, alertable );
     if (dtr_trace_on())
@@ -3198,7 +3634,39 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
 
     if (!count) return STATUS_INVALID_PARAMETER;
 
-    if (timeout && !timeout->QuadPart && inproc_device_fd >= 0)
+#ifdef __APPLE__
+    if (iocp_local_enabled())
+    {
+        struct inproc_sync stack, *sync;
+        struct iocp_local *port;
+        sigset_t sigset;
+
+        iocp_reap();
+        if ((port = iocp_lock_port( handle, IO_COMPLETION_MODIFY_STATE, &stack, &sync, &sigset )))
+        {
+            BOOL blocked = FALSE;
+
+            if (alertable)
+            {
+                /* whether a pending user APC beats a queued packet depends on the thread's association
+                 * with the port, which only the server tracks: leave local mode for good */
+                iocp_retire_locked( port, handle );
+                status = STATUS_PENDING;
+            }
+            else
+            {
+                status = iocp_local_remove_locked( port, sync->fd, info, count, &i, timeout, &blocked );
+                server_checked = TRUE;
+            }
+            server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+            release_inproc_sync( sync );
+            if (status != STATUS_PENDING) goto done;
+            if (blocked) blocked_port = port;
+        }
+    }
+#endif
+
+    if (!server_checked && timeout && !timeout->QuadPart && inproc_device_fd >= 0)
     {
         status = NtWaitForSingleObject( handle, alertable, timeout );
         if (status != WAIT_OBJECT_0) goto done;
@@ -3252,6 +3720,9 @@ NTSTATUS WINAPI NtRemoveIoCompletionEx( HANDLE handle, FILE_IO_COMPLETION_INFORM
     SERVER_END_REQ;
 
 done:
+#ifdef __APPLE__
+    if (blocked_port) iocp_unblock( blocked_port );
+#endif
     *written = i ? i : 1;
     return status;
 }
@@ -3283,6 +3754,21 @@ NTSTATUS WINAPI NtQueryIoCompletion( HANDLE handle, IO_COMPLETION_INFORMATION_CL
                 if (!(status = wine_server_call( req ))) *info = reply->depth;
             }
             SERVER_END_REQ;
+#ifdef __APPLE__
+            if (!status && iocp_local_enabled())
+            {
+                struct inproc_sync stack, *sync;
+                struct iocp_local *port;
+                sigset_t sigset;
+
+                if ((port = iocp_lock_port( handle, 0, &stack, &sync, &sigset )))
+                {
+                    *info += port->count;
+                    server_leave_uninterrupted_section( &iocp_mutex, &sigset );
+                    release_inproc_sync( sync );
+                }
+            }
+#endif
         }
         else status = STATUS_INFO_LENGTH_MISMATCH;
         break;

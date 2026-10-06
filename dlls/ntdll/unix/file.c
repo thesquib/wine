@@ -8398,6 +8398,9 @@ NTSTATUS WINAPI NtSetInformationObject( HANDLE handle, OBJECT_INFORMATION_CLASS 
 
         if (len < sizeof(*p)) return STATUS_INVALID_BUFFER_SIZE;
 
+        /* WINEMSYNC_IOCP: an inheritable completion port leaves local mode */
+        if (p->Inherit) iocp_local_detach_handle( handle );
+
         SERVER_START_REQ( set_handle_info )
         {
             req->handle = wine_server_obj_handle( handle );
