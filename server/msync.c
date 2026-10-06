@@ -688,11 +688,15 @@ static void *get_shm( unsigned int idx )
     if (!shm_addrs[entry])
     {
         kern_return_t kr;
-        mach_vm_address_t address;
+        /* VM_FLAGS_ANYWHERE still takes *address as the search hint: XNU looks upward from
+         * it and returns KERN_NO_SPACE when the hint is past the map's end, so a stale stack
+         * value here made the map fail and the memset below crash the server. */
+        mach_vm_address_t address = 0;
 
         kr = mach_vm_map( mach_task_self(), (mach_vm_address_t *)&address, (mach_vm_size_t)pagesize, 0, VM_FLAGS_ANYWHERE,
                           MACH_PORT_NULL, 0, FALSE, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_SHARE );
-        MACH_CHECK_ERROR( kr, "mach_vm_map" );
+        if (kr != KERN_SUCCESS)
+            fatal_error( "msync: mach_vm_map of shm page %d failed: %d (%s)\n", entry, kr, mach_error_string( kr ) );
         memset( (void *)address, 0, pagesize );
 
         if (debug_level)
