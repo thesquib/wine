@@ -1427,6 +1427,282 @@ static void test_barrier(void)
     }
 }
 
+/* Completion port semantics that a process-local queue (Proton macOS WINEMSYNC_IOCP=1) must keep:
+ * FIFO order, exactly-once delivery under concurrency, hand-off to a waiting thread, timeouts,
+ * queue depth, batch dequeue, direct waits on the port, duplicated handles, file I/O completions
+ * mixed with posted ones, and close while waiting. All of it holds on Windows. */
+
+struct local_port_consumer
+{
+    HANDLE        port;
+    LONG         *received;
+    unsigned int  per_producer;
+    DWORD         timeout;
+    unsigned int  order_errors, bad_packets, got;
+};
+
+#define LOCAL_PORT_PRODUCERS 4
+#define LOCAL_PORT_CONSUMERS 4
+
+struct local_port_producer
+{
+    HANDLE       port;
+    ULONG_PTR    id;
+    unsigned int count;
+};
+
+static DWORD WINAPI local_port_producer_thread( void *arg )
+{
+    struct local_port_producer *p = arg;
+    unsigned int i;
+
+    for (i = 0; i < p->count; ++i)
+        PostQueuedCompletionStatus( p->port, i, p->id, (OVERLAPPED *)(ULONG_PTR)(i + 1) );
+    return 0;
+}
+
+static DWORD WINAPI local_port_consumer_thread( void *arg )
+{
+    struct local_port_consumer *c = arg;
+    ULONG last[LOCAL_PORT_PRODUCERS];
+    OVERLAPPED *ov;
+    ULONG_PTR key;
+    DWORD bytes;
+    unsigned int i;
+
+    for (i = 0; i < LOCAL_PORT_PRODUCERS; ++i) last[i] = ~0u;
+    for (;;)
+    {
+        if (!GetQueuedCompletionStatus( c->port, &bytes, &key, &ov, c->timeout ))
+        {
+            if (!ov && GetLastError() == WAIT_TIMEOUT) continue;
+            c->bad_packets++;
+            break;
+        }
+        if (key == ~(ULONG_PTR)0) break;
+        if (key >= LOCAL_PORT_PRODUCERS || bytes >= c->per_producer || (ULONG_PTR)ov != bytes + 1)
+        {
+            c->bad_packets++;
+            continue;
+        }
+        /* one consumer sees each producer's packets in the order they were posted */
+        if (last[key] != ~0u && bytes <= last[key]) c->order_errors++;
+        last[key] = bytes;
+        InterlockedIncrement( &c->received[key * c->per_producer + bytes] );
+        c->got++;
+    }
+    return 0;
+}
+
+static DWORD WINAPI local_port_wait_thread( void *arg )
+{
+    HANDLE port = arg;
+    OVERLAPPED *ov;
+    ULONG_PTR key;
+    DWORD bytes;
+
+    if (GetQueuedCompletionStatus( port, &bytes, &key, &ov, 5000 )) return key;
+    return GetLastError() | 0x80000000;
+}
+
+static void test_completion_port_local(void)
+{
+    static const unsigned int per_producer = 50000;
+    NTSTATUS (WINAPI *pNtQueryIoCompletion)( HANDLE, IO_COMPLETION_INFORMATION_CLASS, void *, ULONG, ULONG * );
+    struct local_port_producer producers[LOCAL_PORT_PRODUCERS];
+    struct local_port_consumer consumers[LOCAL_PORT_CONSUMERS];
+    static const DWORD consumer_timeouts[LOCAL_PORT_CONSUMERS] = { 0, 10, INFINITE, INFINITE };
+    HANDLE threads[LOCAL_PORT_PRODUCERS + LOCAL_PORT_CONSUMERS], port, dup, file, thread;
+    OVERLAPPED_ENTRY entries[16];
+    char path[MAX_PATH], buffer[16];
+    unsigned int i, missing, twice, got;
+    OVERLAPPED overlapped, *ov;
+    DWORD bytes, ret, start;
+    ULONG_PTR key, keys;
+    LONG *received;
+    ULONG depth;
+    BOOL bret;
+
+    pNtQueryIoCompletion = (void *)GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "NtQueryIoCompletion" );
+
+    /* FIFO, and an empty poll times out */
+    port = CreateIoCompletionPort( INVALID_HANDLE_VALUE, NULL, 0, 0 );
+    ok( !!port, "got error %lu.\n", GetLastError() );
+    for (i = 0; i < 100; ++i) PostQueuedCompletionStatus( port, i, i + 1000, (OVERLAPPED *)(ULONG_PTR)(i + 1) );
+    if (pNtQueryIoCompletion)
+    {
+        depth = 0;
+        ret = pNtQueryIoCompletion( port, IoCompletionBasicInformation, &depth, sizeof(depth), NULL );
+        ok( !ret, "got %#lx.\n", ret );
+        ok( depth == 100, "got depth %lu.\n", depth );
+    }
+    for (i = 0; i < 100; ++i)
+    {
+        bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+        ok( bret, "%u: got error %lu.\n", i, GetLastError() );
+        ok( bytes == i && key == i + 1000 && (ULONG_PTR)ov == i + 1, "%u: got %lu %Iu %p.\n", i, bytes, key, ov );
+    }
+    SetLastError( 0xdeadbeef );
+    ov = (OVERLAPPED *)0xdeadbeef;
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+    ok( !bret && !ov && GetLastError() == WAIT_TIMEOUT, "got %d %p %lu.\n", bret, ov, GetLastError() );
+
+    /* a finite timeout on an empty port */
+    start = GetTickCount();
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 100 );
+    ok( !bret && GetLastError() == WAIT_TIMEOUT, "got %d %lu.\n", bret, GetLastError() );
+    ok( GetTickCount() - start >= 80, "returned after %lu ms.\n", GetTickCount() - start );
+
+    /* a packet posted while a thread waits goes to that thread */
+    thread = CreateThread( NULL, 0, local_port_wait_thread, port, 0, NULL );
+    Sleep( 100 );
+    PostQueuedCompletionStatus( port, 0, 7, NULL );
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+    ok( !bret && GetLastError() == WAIT_TIMEOUT, "got %d %Iu %lu, the waiting thread should have it.\n",
+        bret, key, GetLastError() );
+    WaitForSingleObject( thread, INFINITE );
+    GetExitCodeThread( thread, &ret );
+    ok( ret == 7, "waiting thread got %#lx.\n", ret );
+    CloseHandle( thread );
+
+    /* batch dequeue */
+    for (i = 0; i < 10; ++i) PostQueuedCompletionStatus( port, i, i, NULL );
+    got = 0;
+    bret = GetQueuedCompletionStatusEx( port, entries, ARRAY_SIZE(entries), (ULONG *)&got, 0, FALSE );
+    ok( bret && got == 10, "got %d %u.\n", bret, got );
+    for (i = 0; i < got; ++i)
+        ok( entries[i].lpCompletionKey == i && entries[i].dwNumberOfBytesTransferred == i,
+            "%u: got %Iu %lu.\n", i, entries[i].lpCompletionKey, entries[i].dwNumberOfBytesTransferred );
+
+    /* a duplicated handle reaches the same queue, and closing it leaves the port working */
+    bret = DuplicateHandle( GetCurrentProcess(), port, GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS );
+    ok( bret, "got error %lu.\n", GetLastError() );
+    PostQueuedCompletionStatus( dup, 1, 21, NULL );
+    PostQueuedCompletionStatus( port, 2, 22, NULL );
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+    ok( bret && key == 21, "got %d %Iu.\n", bret, key );
+    PostQueuedCompletionStatus( dup, 3, 23, NULL );
+    CloseHandle( dup );
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+    ok( bret && key == 22, "got %d %Iu.\n", bret, key );
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+    ok( bret && key == 23, "got %d %Iu.\n", bret, key );
+
+    /* waiting on the port itself sees a posted packet */
+    PostQueuedCompletionStatus( port, 0, 31, NULL );
+    ret = WaitForSingleObject( port, 0 );
+    ok( ret == WAIT_OBJECT_0, "got %#lx.\n", ret );
+    bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+    ok( bret && key == 31, "got %d %Iu.\n", bret, key );
+    CloseHandle( port );
+
+    /* file I/O completions and posted packets on one port */
+    port = CreateIoCompletionPort( INVALID_HANDLE_VALUE, NULL, 0, 0 );
+    GetTempPathA( MAX_PATH, path );
+    GetTempFileNameA( path, "iocp", 0, path );
+    file = CreateFileA( path, GENERIC_READ | GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                        FILE_FLAG_OVERLAPPED | FILE_FLAG_DELETE_ON_CLOSE, NULL );
+    ok( file != INVALID_HANDLE_VALUE, "got error %lu.\n", GetLastError() );
+    ok( CreateIoCompletionPort( file, port, 0x1234, 0 ) == port, "got error %lu.\n", GetLastError() );
+    PostQueuedCompletionStatus( port, 0, 1, NULL );
+    memset( &overlapped, 0, sizeof(overlapped) );
+    memset( buffer, 'x', sizeof(buffer) );
+    bret = WriteFile( file, buffer, sizeof(buffer), NULL, &overlapped );
+    ok( bret || GetLastError() == ERROR_IO_PENDING, "got error %lu.\n", GetLastError() );
+    PostQueuedCompletionStatus( port, 0, 2, NULL );
+    keys = 0;
+    for (i = 0; i < 3; ++i)
+    {
+        bret = GetQueuedCompletionStatus( port, &bytes, &key, &ov, 5000 );
+        ok( bret, "%u: got error %lu.\n", i, GetLastError() );
+        if (key == 0x1234) ok( ov == &overlapped && bytes == sizeof(buffer), "got %p %lu.\n", ov, bytes );
+        keys |= key == 0x1234 ? 4 : key;
+    }
+    ok( keys == 7, "got keys %#Ix.\n", keys );
+    CloseHandle( file );
+    CloseHandle( port );
+
+    /* exactly once, and per-producer order per consumer, with polling, timed and blocking consumers */
+    port = CreateIoCompletionPort( INVALID_HANDLE_VALUE, NULL, 0, 0 );
+    received = calloc( LOCAL_PORT_PRODUCERS * per_producer, sizeof(*received) );
+    for (i = 0; i < LOCAL_PORT_CONSUMERS; ++i)
+    {
+        memset( &consumers[i], 0, sizeof(consumers[i]) );
+        consumers[i].port = port;
+        consumers[i].received = received;
+        consumers[i].per_producer = per_producer;
+        consumers[i].timeout = consumer_timeouts[i];
+        threads[LOCAL_PORT_PRODUCERS + i] = CreateThread( NULL, 0, local_port_consumer_thread, &consumers[i], 0, NULL );
+    }
+    start = GetTickCount();
+    for (i = 0; i < LOCAL_PORT_PRODUCERS; ++i)
+    {
+        producers[i].port = port;
+        producers[i].id = i;
+        producers[i].count = per_producer;
+        threads[i] = CreateThread( NULL, 0, local_port_producer_thread, &producers[i], 0, NULL );
+    }
+    WaitForMultipleObjects( LOCAL_PORT_PRODUCERS, threads, TRUE, INFINITE );
+    for (i = 0; i < LOCAL_PORT_CONSUMERS; ++i) PostQueuedCompletionStatus( port, 0, ~(ULONG_PTR)0, NULL );
+    WaitForMultipleObjects( LOCAL_PORT_CONSUMERS, threads + LOCAL_PORT_PRODUCERS, TRUE, INFINITE );
+    trace( "%u packets through %u producers and %u consumers in %lu ms.\n",
+           LOCAL_PORT_PRODUCERS * per_producer, LOCAL_PORT_PRODUCERS, LOCAL_PORT_CONSUMERS, GetTickCount() - start );
+    missing = twice = 0;
+    for (i = 0; i < LOCAL_PORT_PRODUCERS * per_producer; ++i)
+    {
+        if (!received[i]) missing++;
+        else if (received[i] > 1) twice++;
+    }
+    ok( !missing && !twice, "%u packets missing, %u delivered more than once.\n", missing, twice );
+    for (i = 0; i < LOCAL_PORT_CONSUMERS; ++i)
+    {
+        ok( !consumers[i].order_errors && !consumers[i].bad_packets, "consumer %u: %u order errors, %u bad packets.\n",
+            i, consumers[i].order_errors, consumers[i].bad_packets );
+        trace( "consumer %u (timeout %ld) got %u.\n", i, (LONG)consumers[i].timeout, consumers[i].got );
+    }
+    for (i = 0; i < LOCAL_PORT_PRODUCERS + LOCAL_PORT_CONSUMERS; ++i) CloseHandle( threads[i] );
+    free( received );
+
+    /* the cost of a post and a dequeue, and of an empty poll */
+    if (GetEnvironmentVariableA( "WINETEST_IOCP_BENCH", buffer, sizeof(buffer) ))
+    {
+        LARGE_INTEGER freq, t0, t1;
+        static const unsigned int n = 200000;
+
+        QueryPerformanceFrequency( &freq );
+        QueryPerformanceCounter( &t0 );
+        for (i = 0; i < n; ++i)
+        {
+            PostQueuedCompletionStatus( port, i, 1, NULL );
+            GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+        }
+        QueryPerformanceCounter( &t1 );
+        trace( "bench: post + dequeue %.3f us per pair\n", (t1.QuadPart - t0.QuadPart) * 1e6 / freq.QuadPart / n );
+        QueryPerformanceCounter( &t0 );
+        for (i = 0; i < n; ++i) GetQueuedCompletionStatus( port, &bytes, &key, &ov, 0 );
+        QueryPerformanceCounter( &t1 );
+        trace( "bench: empty poll %.3f us\n", (t1.QuadPart - t0.QuadPart) * 1e6 / freq.QuadPart / n );
+        QueryPerformanceCounter( &t0 );
+        for (i = 0; i < n; ++i) PostQueuedCompletionStatus( port, i, 1, NULL );
+        for (i = 0; i < n; ++i) GetQueuedCompletionStatus( port, &bytes, &key, &ov, 10 );
+        QueryPerformanceCounter( &t1 );
+        trace( "bench: %u posts then %u finite-timeout dequeues %.3f us per pair\n", n, n,
+               (t1.QuadPart - t0.QuadPart) * 1e6 / freq.QuadPart / n );
+    }
+    CloseHandle( port );
+
+    /* closing the port wakes a waiting thread */
+    port = CreateIoCompletionPort( INVALID_HANDLE_VALUE, NULL, 0, 0 );
+    thread = CreateThread( NULL, 0, local_port_wait_thread, port, 0, NULL );
+    Sleep( 100 );
+    CloseHandle( port );
+    ret = WaitForSingleObject( thread, 2000 );
+    ok( ret == WAIT_OBJECT_0, "waiting thread did not return: %#lx.\n", ret );
+    GetExitCodeThread( thread, &ret );
+    ok( ret == (ERROR_ABANDONED_WAIT_0 | 0x80000000), "waiting thread got %#lx.\n", ret );
+    CloseHandle( thread );
+}
+
 START_TEST(sync)
 {
     HMODULE module = GetModuleHandleA("ntdll.dll");
@@ -1481,6 +1757,7 @@ START_TEST(sync)
     test_resource();
     test_tid_alert( argv );
     test_completion_port_scheduling();
+    test_completion_port_local();
     test_delayexecution();
     test_barrier();
 }
