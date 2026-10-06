@@ -1898,6 +1898,11 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         return result.dup_handle.status;
     }
 
+    /* WINEMSYNC_IOCP: a completion port that another process can reach leaves local mode */
+    if (source_process == NtCurrentProcess() &&
+        (dest_process != NtCurrentProcess() || (attributes & OBJ_INHERIT)))
+        iocp_local_detach_handle( source );
+
     /* hold fd_cache_mutex to prevent the fd from being added again between the
      * call to remove_fd_from_cache and close_handle */
     server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
