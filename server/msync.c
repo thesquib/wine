@@ -238,7 +238,11 @@ static inline void add_tid( unsigned int shm_idx, int tid )
 static inline void remove_tid( unsigned int shm_idx, int tid )
 {
     struct tid_node *current, *prev = NULL;
-    struct tid_list *list = get_tid_list( shm_idx );
+    struct tid_list *list;
+
+    /* nothing was ever added past the end of the map; do not grow it for a removal */
+    if (shm_idx >= tid_map_size) return;
+    list = tid_map + shm_idx;
 
     current = list->head;
     while (current != NULL)
@@ -259,6 +263,19 @@ static inline void remove_tid( unsigned int shm_idx, int tid )
 
 static long pagesize;
 static void *get_shm( unsigned int idx );
+static void *lookup_shm( unsigned int idx );
+
+/* A message from a client named an object the server never allocated, or was malformed. Clients are not trusted:
+ * the pump drops or fails such a message instead of mapping, growing or indexing past what the server owns. Rate
+ * limited, as a looping client would repeat it on every wait. */
+static void report_bad_message( const char *what, unsigned int msgh_id, unsigned int value )
+{
+    static unsigned int reported;
+
+    if (reported >= 32) return;
+    fprintf( stderr, "msync: error: %s (msgh_id %#x, value %#x)%s\n", what, msgh_id, value,
+             ++reported == 32 ? "; not reporting further bad messages" : "" );
+}
 
 typedef struct
 {
@@ -385,8 +402,15 @@ static unsigned int last_destroyed_idx = UINT32_MAX;
 
 static inline void destroy_all_internal( unsigned int shm_idx )
 {
-    struct msync_shm *obj = get_shm( shm_idx );
-    unsigned short refcount = __atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST );
+    struct msync_shm *obj = lookup_shm( shm_idx );
+    unsigned short refcount;
+
+    if (!obj)
+    {
+        report_bad_message( "destroy_all on an index the server never allocated", shm_idx | (1 << 28), shm_idx );
+        return;
+    }
+    refcount = __atomic_load_n( &obj->refcount, __ATOMIC_SEQ_CST );
 
     if (!refcount)
     {
@@ -396,7 +420,8 @@ static inline void destroy_all_internal( unsigned int shm_idx )
 
     refcount = __atomic_sub_fetch( &obj->refcount, 1, __ATOMIC_SEQ_CST );
 
-    if (!refcount) last_destroyed_idx = shm_idx;
+    /* read by msync_alloc_shm on the main thread */
+    if (!refcount) __atomic_store_n( &last_destroyed_idx, shm_idx, __ATOMIC_RELAXED );
 }
 
 /*
@@ -493,15 +518,29 @@ static void *mach_message_pump( void *args )
         {
             if (check_bit( 28, (unsigned int *)&receive_message.header.msgh_id ))
                 destroy_all_internal( receive_message.header.msgh_id );
-            else
+            else if (lookup_shm( receive_message.header.msgh_id ))
                 signal_all_internal( receive_message.header.msgh_id );
+            else
+                report_bad_message( "signal_all on an index the server never allocated",
+                                    receive_message.header.msgh_id, receive_message.header.msgh_id );
             continue;
         }
 
         /*
          * Finally server_register_wait and server_unregister_wait
+         *
+         * The tid is the top 24 bits of msgh_id, so it always indexes inside shm_tid_map (64 MB of ints, 1 << 24).
+         * The count is the low 8 bits and must match the message's size and fit shm_idx[]; a message that does
+         * not is dropped whole, as none of its fields can be trusted. A legitimate client never sends one.
          */
         decode_msgh_id( receive_message.header.msgh_id, &tid, &count );
+        if (!count || count > ARRAY_SIZE(receive_message.shm_idx) ||
+            receive_message.header.msgh_size != sizeof(mach_msg_header_t) + count * sizeof(unsigned int))
+        {
+            report_bad_message( "wait registration with a count that does not match its size",
+                                receive_message.header.msgh_id, receive_message.header.msgh_size );
+            continue;
+        }
         for (i = 0; i < count; i++)
         {
             if (i == 0 && check_bit( 29, receive_message.shm_idx + i ))
@@ -510,7 +549,17 @@ static void *mach_message_pump( void *args )
                 break;
             }
             is_mutex = check_bit( 28, receive_message.shm_idx + i );
-            obj = get_shm( receive_message.shm_idx[i] );
+            if (!(obj = lookup_shm( receive_message.shm_idx[i] )))
+            {
+                /* Fail the wait: take back what this message registered and wake the thread, which re-checks
+                 * its objects as after any wake. Leaving it parked could hang it; mapping or growing for the
+                 * index would let a client size the server's tables. */
+                report_bad_message( "wait registration on an index the server never allocated",
+                                    receive_message.header.msgh_id, receive_message.shm_idx[i] );
+                unregister_wait( &receive_message, tid, i );
+                wake_tid( tid );
+                break;
+            }
             val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
             if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
             {
@@ -675,7 +724,8 @@ void msync_destroy( struct msync *msync )
     free( msync );
 }
 
-/* returns the object at idx, mapping its page on first use */
+/* Returns the object at idx, mapping its page on first use. Main thread only, for indexes the server allocates or
+ * holds; the pump thread, which handles indexes that clients send, uses lookup_shm. */
 static void *get_shm( unsigned int idx )
 {
     unsigned int entry  = ((unsigned long long)idx * 16) / pagesize;
@@ -708,12 +758,27 @@ static void *get_shm( unsigned int idx )
     return (void *)((unsigned long)__atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE ) + offset);
 }
 
+/* Returns the object at idx if the server has mapped its page, else NULL. Never maps, grows or fails hard, so the
+ * pump thread can use it on client-supplied indexes. An index on a mapped page that is not a live object reads as a
+ * zeroed or stale slot, as it always could; only the page bounds are a memory-safety matter. */
+static void *lookup_shm( unsigned int idx )
+{
+    unsigned int entry, offset;
+    void *page;
+
+    if (idx >= MSYNC_SHM_MAX_IDX) return NULL;
+    entry  = ((unsigned long long)idx * 16) / pagesize;
+    offset = ((unsigned long long)idx * 16) % pagesize;
+    if (!(page = __atomic_load_n( &shm_addrs[entry], __ATOMIC_ACQUIRE ))) return NULL;
+    return (void *)((unsigned long)page + offset);
+}
+
 static unsigned int msync_alloc_shm( int low, int high, enum msync_type type )
 {
     unsigned int shm_idx;
     struct msync_shm *shm;
 
-    shm_idx = min( last_destroyed_idx, last_allocated_idx + 1 );
+    shm_idx = min( __atomic_load_n( &last_destroyed_idx, __ATOMIC_RELAXED ), last_allocated_idx + 1 );
 
     for(;;)
     {
