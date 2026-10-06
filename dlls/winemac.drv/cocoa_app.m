@@ -2577,7 +2577,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
     /* Strategy E.1 handler - see setupObservations for design notes. */
     - (void) handleDXMTRemoteLayerHostRequest:(NSNotification *)note
     {
-        extern void *macdrv_resolve_hwnd_for_hosting(void *hwnd, void **out_hwnd, int *out_is_window);
+        extern void *macdrv_resolve_hwnd_for_hosting(void *hwnd, void **out_hwnd, int *out_is_window,
+                                                     int allow_heuristic);
 
         NSDictionary *info = [note userInfo];
         void *hwnd = (void *)(uintptr_t)[(NSNumber *)info[@"hwnd"] unsignedLongLongValue];
@@ -2586,7 +2587,6 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         fprintf(stderr, "winemac:E.1 - pid=%d received DXMTRemoteLayerHostRequest hwnd=%p ctxId=%u senderPid=%d\n",
                 getpid(), hwnd, contextId, senderPid);
-        (void)senderPid; /* same-process is fine: game and DXMT live together */
 
         /* Queued 0052 [E1-DIAG]: discriminate failure-mode (A) "broadcast not received". */
         if (proton_e1_diag_enabled()) {
@@ -2597,7 +2597,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         void *outHwnd = NULL;
         int isWindow = 0;
-        void *target = macdrv_resolve_hwnd_for_hosting(hwnd, &outHwnd, &isWindow);
+        /* Largest-window heuristic only for same-process requests; a
+         * cross-process request for an hwnd we do not own is declined by the
+         * resolver (see window.c). */
+        void *target = macdrv_resolve_hwnd_for_hosting(hwnd, &outHwnd, &isWindow,
+                                                       senderPid == getpid());
         fprintf(stderr, "winemac:E.1 - pid=%d resolver returned hwnd=%p target=%p isWindow=%d\n",
                 getpid(), outHwnd, target, isWindow);
         /* Queued 0052 [E1-DIAG]: discriminate failure-mode (B) "owner also empty win_data". */
@@ -2783,12 +2787,21 @@ static NSString* WineLocalizedString(unsigned int stringID)
             child.contentsGravity = kCAGravityResize;
 
             /* Remove any prior CALayerHost / CAMetalLayer we already attached
-             * for this view (from earlier broadcast retries). */
+             * for this view (from earlier broadcast retries).
+             *
+             * Bug (Proton macOS) 2026-10-06: a CAMetalLayer sublayer is always
+             * a same-process layer (cross-process content arrives as a
+             * CALayerHost), i.e. this process's own live swapchain layer. A
+             * CROSS-process attach must never remove it -- doing so left the
+             * game presenting into a detached layer (black window). So:
+             *   same-process attach:  remove other CAMetalLayers and CALayerHosts;
+             *   cross-process attach: remove only stale CALayerHosts. */
             NSArray *existing = [parentLayer.sublayers copy];
             for (CALayer *sib in existing) {
-                if ([sib isKindOfClass:NSClassFromString(@"CAMetalLayer")] ||
-                    [sib isKindOfClass:NSClassFromString(@"CALayerHost")]) {
-                    if (sib != child) [sib removeFromSuperlayer];
+                if (sib == child) continue;
+                if ([sib isKindOfClass:NSClassFromString(@"CALayerHost")] ||
+                    (sameProcess && [sib isKindOfClass:NSClassFromString(@"CAMetalLayer")])) {
+                    [sib removeFromSuperlayer];
                 }
             }
             /* Bug (Proton macOS) 2026-09-22 -- DETECTOR ONLY, no behaviour
