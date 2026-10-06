@@ -290,13 +290,16 @@ void *macdrv_lookup_client_view(void *hwnd)
  * Strategy:
  *   1. Try direct HWND lookup - if its client_view is set, return it as a view.
  *   2. Else if its cocoa_window is set, return cocoa_window with *out_is_window=1.
- *   3. Else iterate win_datas for largest on_screen window meeting same criteria.
+ *   3. Else, only if allow_heuristic (same-process request), iterate
+ *      win_datas for largest on_screen window meeting same criteria.
+ *      Cross-process requests that miss step 1/2 are declined.
  *
  * out_is_window: set to 1 if returned pointer is an NSWindow*, 0 if NSView*.
  * Pure CF/pthread, safe from any thread (no Wine NT syscalls).
  */
 __attribute__((visibility("default")))
-void *macdrv_resolve_hwnd_for_hosting(void *target_hwnd, void **out_hwnd, int *out_is_window)
+void *macdrv_resolve_hwnd_for_hosting(void *target_hwnd, void **out_hwnd, int *out_is_window,
+                                      int allow_heuristic)
 {
     if (out_hwnd) *out_hwnd = NULL;
     if (out_is_window) *out_is_window = 0;
@@ -336,6 +339,21 @@ void *macdrv_resolve_hwnd_for_hosting(void *target_hwnd, void **out_hwnd, int *o
                 return w;
             }
         }
+    }
+
+    /* Bug (Proton macOS) 2026-10-06: the heuristic below is only safe for a
+     * SAME-PROCESS request. Every winemac process receives every broadcast,
+     * so a game process also sees steamwebhelper's requests for hwnds it does
+     * not own; the heuristic then picked the game's own window and the attach
+     * stripped the game's live swapchain CAMetalLayer -> permanent black
+     * (KCD2, Dune). A cross-process request whose hwnd is not ours is for
+     * another process; decline it. Cross-process hosting onto an hwnd this
+     * process does own (the direct hit above) is unaffected. */
+    if (!allow_heuristic) {
+        pthread_mutex_unlock(&win_data_mutex);
+        fprintf(stderr, "winemac:E.1 - pid=%d declining cross-process host for hwnd=%p (not ours)\n",
+                getpid(), target_hwnd);
+        return NULL;
     }
 
     /* (2) Heuristic - iterate win_datas, pick largest on_screen window. */
