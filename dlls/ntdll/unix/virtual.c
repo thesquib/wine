@@ -1084,6 +1084,55 @@ static void load_steam_overlay(const char *unix_lib_path)
 }
 
 /***********************************************************************
+ *           dlopen_builtin_unixlib
+ *
+ * Called with virtual_mutex held for a builtin that has a unix_path and no unix_handle.
+ * The dlopen can take hundreds of ms on macOS (dyld, the first-load XProtect scan), so
+ * the mutex is dropped around it. The builtin can be released while the mutex is not
+ * held (NtUnmapViewOfSection frees it at refcount 1), so it is looked up again by module
+ * afterwards. Returns with the mutex held: the builtin, or NULL if it went away or its
+ * path changed. A handle that was not stored (another thread stored one first, or the
+ * builtin is gone) is returned in close_handle, for dlclose once the mutex is released.
+ */
+static struct builtin_module *dlopen_builtin_unixlib( void *module, struct builtin_module *builtin,
+                                                      sigset_t *sigset, void **close_handle )
+{
+    char *path;
+    void *handle;
+
+    *close_handle = NULL;
+    if (!(path = strdup( builtin->unix_path ))) return builtin;
+
+    server_leave_uninterrupted_section( &virtual_mutex, sigset );
+    load_steam_overlay( path );
+    /* macOS: RTLD_GLOBAL so other unixlibs (e.g. DXMT's winemetal.so)
+     * can dlsym(RTLD_DEFAULT, ...) macdrv_* exports from winemac.so.
+     * Without this, RTLD_LOCAL hides our symbols even though they
+     * have visibility("default"). See docs/macos/experiments/dxmt-build-from-source.md */
+    handle = dlopen( path, RTLD_NOW | RTLD_GLOBAL );
+    if (!handle) WARN_(module)( "failed to load %s: %s\n", debugstr_a(path), dlerror() );
+    virtual_mutex_enter( sigset );
+
+    LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+    {
+        if (builtin->module != module) continue;
+        if (!builtin->unix_path || strcmp( builtin->unix_path, path )) break;
+        if (!builtin->unix_handle)
+        {
+            builtin->unix_handle = handle;
+            handle = NULL;
+        }
+        *close_handle = handle;
+        free( path );
+        return builtin;
+    }
+    *close_handle = handle;
+    free( path );
+    return NULL;
+}
+
+
+/***********************************************************************
  *           get_builtin_unix_funcs
  */
 static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **funcs )
@@ -1092,6 +1141,7 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
     sigset_t sigset;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     struct builtin_module *builtin;
+    void *close_handle = NULL;
 
     virtual_mutex_enter( &sigset );
     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
@@ -1099,14 +1149,7 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
         if (builtin->module != module) continue;
         if (builtin->unix_path && !builtin->unix_handle)
         {
-            load_steam_overlay(builtin->unix_path);
-            /* macOS: RTLD_GLOBAL so other unixlibs (e.g. DXMT's winemetal.so)
-             * can dlsym(RTLD_DEFAULT, ...) macdrv_* exports from winemac.so.
-             * Without this, RTLD_LOCAL hides our symbols even though they
-             * have visibility("default"). See docs/macos/experiments/dxmt-build-from-source.md */
-            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW | RTLD_GLOBAL );
-            if (!builtin->unix_handle)
-                WARN_(module)( "failed to load %s: %s\n", debugstr_a(builtin->unix_path), dlerror() );
+            if (!(builtin = dlopen_builtin_unixlib( module, builtin, &sigset, &close_handle ))) break;
         }
         if (builtin->unix_handle)
         {
@@ -1116,6 +1159,7 @@ static NTSTATUS get_builtin_unix_funcs( void *module, BOOL wow, const void **fun
         break;
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (close_handle) dlclose( close_handle );
     return status;
 }
 
@@ -1128,6 +1172,7 @@ NTSTATUS load_builtin_unixlib( void *module, const char *name )
     sigset_t sigset;
     NTSTATUS status = STATUS_SUCCESS;
     struct builtin_module *builtin;
+    void *close_handle = NULL;
 
     virtual_mutex_enter( &sigset );
     LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
@@ -1135,16 +1180,12 @@ NTSTATUS load_builtin_unixlib( void *module, const char *name )
         if (builtin->module != module) continue;
         if (!builtin->unix_path) builtin->unix_path = strdup( name );
         else status = STATUS_IMAGE_ALREADY_LOADED;
-        if (!builtin->unix_handle)
-        {
-            load_steam_overlay(builtin->unix_path);
-            /* macOS: RTLD_GLOBAL so DXMT's winemetal.so etc. can dlsym
-             * macdrv_* exports via RTLD_DEFAULT. See above. */
-            builtin->unix_handle = dlopen( builtin->unix_path, RTLD_NOW | RTLD_GLOBAL );
-        }
+        if (builtin->unix_path && !builtin->unix_handle)
+            dlopen_builtin_unixlib( module, builtin, &sigset, &close_handle );
         break;
     }
     server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    if (close_handle) dlclose( close_handle );
     return status;
 }
 
