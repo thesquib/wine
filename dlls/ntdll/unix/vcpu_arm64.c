@@ -1092,6 +1092,102 @@ static pthread_mutex_t stall_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct stall_dump_spec { unsigned int reg; long long off; unsigned int len; } stall_dumps[8];
 static unsigned int stall_dump_count;
 
+/* one line: up to 64 bytes as hex, longer ranges as a byte-value histogram and the first entries above 1 */
+static void print_guest_bytes( const char *label, ULONG64 addr, const unsigned char *buf, unsigned int len )
+{
+    unsigned int j;
+
+    if (len <= 64)
+    {
+        fprintf( stderr, "%s = %#llx:", label, (unsigned long long)addr );
+        for (j = 0; j < len; j++) fprintf( stderr, "%s%02x", (j % 8) ? "" : " ", buf[j] );
+        fprintf( stderr, "\n" );
+    }
+    else
+    {
+        unsigned int hist[256] = {0}, shown = 0;
+
+        for (j = 0; j < len; j++) hist[buf[j]]++;
+        fprintf( stderr, "%s = %#llx len %#x: byte values", label, (unsigned long long)addr, len );
+        for (j = 0; j < 256; j++) if (hist[j]) fprintf( stderr, " %02x:%u", j, hist[j] );
+        fprintf( stderr, " | first > 1:" );
+        for (j = 0; j < len && shown < 24; j++)
+            if (buf[j] > 1) { fprintf( stderr, " [%#x]=%u", j, buf[j] ); shown++; }
+        fprintf( stderr, "\n" );
+    }
+}
+
+/* PMW_VCPU_WATCH="exe+<offset>[+<offset>...]:<len>[,...]" (up to 8; diagnostic, default off): a host thread polls
+ * these ranges of the main image (PEB ImageBaseAddress, so ASLR does not matter) every PMW_VCPU_WATCH_MS (default 10)
+ * and logs [VCPU-WATCH] with the time since process start whenever one changes, at most 20000 lines. For data that
+ * goes wrong before anything stalls (a lock-free ring's cursors and slots). */
+static struct watch_spec { ULONG64 off; unsigned int len; unsigned char *last; BOOL seen; } watches[8];
+static unsigned int watch_count;
+
+static void *watch_thread( void *arg )
+{
+    static unsigned char buf[65536];
+    unsigned int ms = (unsigned int)(ULONG_PTR)arg, lines = 0, i;
+    struct timespec t0, t;
+
+    clock_gettime( CLOCK_MONOTONIC, &t0 );
+    while (lines < 20000)
+    {
+        ULONG64 base;
+
+        usleep( ms * 1000 );
+        if (!peb || !(base = (ULONG64)(ULONG_PTR)peb->ImageBaseAddress)) continue;
+        clock_gettime( CLOCK_MONOTONIC, &t );
+        for (i = 0; i < watch_count; i++)
+        {
+            struct watch_spec *w = &watches[i];
+            ULONG64 addr = base + w->off;
+            vm_size_t got = 0;
+            char label[96];
+
+            if (vm_read_overwrite( mach_task_self(), (vm_address_t)addr, w->len, (vm_address_t)buf, &got ) != KERN_SUCCESS ||
+                got != w->len)
+                continue;
+            if (w->seen && !memcmp( buf, w->last, w->len )) continue;
+            memcpy( w->last, buf, w->len );
+            w->seen = TRUE;
+            snprintf( label, sizeof(label), "[VCPU-WATCH] pid %d t=%.3f exe+%#llx", (int)getpid(),
+                      (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9, (unsigned long long)w->off );
+            print_guest_bytes( label, addr, buf, w->len );
+            lines++;
+        }
+    }
+    return NULL;
+}
+
+static void watch_start(void)
+{
+    const char *env = getenv( "PMW_VCPU_WATCH" ), *ms_env = getenv( "PMW_VCPU_WATCH_MS" );
+    unsigned int ms = ms_env && atoi( ms_env ) > 0 ? atoi( ms_env ) : 10;
+    pthread_t thread;
+    sigset_t old;
+
+    while (env && !strncmp( env, "exe", 3 ) && watch_count < ARRAY_SIZE(watches))
+    {
+        struct watch_spec *w = &watches[watch_count];
+        char *end = (char *)env + 3;
+
+        w->off = 0;
+        while (*end == '+' || *end == '-') w->off += strtoll( end, &end, 0 );
+        if (*end != ':') break;
+        w->len = strtoul( end + 1, &end, 0 );
+        if (!w->len || w->len > 65536 || !(w->last = malloc( w->len ))) break;
+        watch_count++;
+        if (*end != ',') break;
+        env = end + 1;
+    }
+    if (!watch_count) return;
+    fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_WATCH: %u range(s) every %u ms\n", (int)getpid(), watch_count, ms );
+    block_all_signals( &old );
+    if (!pthread_create( &thread, NULL, watch_thread, (void *)(ULONG_PTR)ms )) pthread_detach( thread );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
 static void stall_parse_dumps( const char *env )
 {
     while (env && *env && stall_dump_count < ARRAY_SIZE(stall_dumps))
@@ -1115,7 +1211,7 @@ static void stall_parse_dumps( const char *env )
 static void stall_dump_memory( const struct syscall_frame *frame )
 {
     static unsigned char buf[65536];
-    unsigned int i, j;
+    unsigned int i;
 
     for (i = 0; i < stall_dump_count; i++)
     {
@@ -1131,24 +1227,10 @@ static void stall_dump_memory( const struct syscall_frame *frame )
                      (unsigned long long)addr, d->len, kr );
             continue;
         }
-        if (d->len <= 64)
         {
-            fprintf( stderr, "[VCPU-STALL]   mem x%u%+lld = %#llx:", d->reg, d->off, (unsigned long long)addr );
-            for (j = 0; j < d->len; j++) fprintf( stderr, "%s%02x", (j % 8) ? "" : " ", buf[j] );
-            fprintf( stderr, "\n" );
-        }
-        else
-        {
-            unsigned int hist[256] = {0}, shown = 0;
-
-            for (j = 0; j < d->len; j++) hist[buf[j]]++;
-            fprintf( stderr, "[VCPU-STALL]   mem x%u%+lld = %#llx len %#x: byte values", d->reg, d->off,
-                     (unsigned long long)addr, d->len );
-            for (j = 0; j < 256; j++) if (hist[j]) fprintf( stderr, " %02x:%u", j, hist[j] );
-            fprintf( stderr, " | first > 1:" );
-            for (j = 0; j < d->len && shown < 24; j++)
-                if (buf[j] > 1) { fprintf( stderr, " [%#x]=%u", j, buf[j] ); shown++; }
-            fprintf( stderr, "\n" );
+            char label[64];
+            snprintf( label, sizeof(label), "[VCPU-STALL]   mem x%u%+lld", d->reg, d->off );
+            print_guest_bytes( label, addr, buf, d->len );
         }
     }
 }
@@ -2467,6 +2549,7 @@ void vcpu_init_process(void)
     init_sys_page();
     init_kuser();
     prof_start();
+    watch_start();
 
     block_all_signals( &old );
     ret = pthread_create( &thread, NULL, tlbi_thread, NULL );
