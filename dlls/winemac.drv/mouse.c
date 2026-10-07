@@ -959,17 +959,20 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
  */
 void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event)
 {
+    /* FPS mode: no absolute move to the frozen macOS pointer, as in macdrv_mouse_button */
+    UINT move = event->mouse_scroll.disassociated ? 0 : MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+
     TRACE("win %p/%p scroll (%d,%d) at (%d,%d) time %lu (%lu ticks ago)\n", hwnd,
           event->window, event->mouse_scroll.x_scroll, event->mouse_scroll.y_scroll,
           event->mouse_scroll.x, event->mouse_scroll.y,
           event->mouse_scroll.time_ms, (NtGetTickCount() - event->mouse_scroll.time_ms));
 
     if (event->mouse_scroll.y_scroll)
-        send_mouse_input(hwnd, event->window, MOUSEEVENTF_WHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+        send_mouse_input(hwnd, event->window, MOUSEEVENTF_WHEEL | move,
                          event->mouse_scroll.x, event->mouse_scroll.y,
                          event->mouse_scroll.y_scroll, FALSE, event->mouse_scroll.time_ms);
     if (event->mouse_scroll.x_scroll)
-        send_mouse_input(hwnd, event->window, MOUSEEVENTF_HWHEEL | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+        send_mouse_input(hwnd, event->window, MOUSEEVENTF_HWHEEL | move,
                          event->mouse_scroll.x, event->mouse_scroll.y,
                          event->mouse_scroll.x_scroll, FALSE, event->mouse_scroll.time_ms);
 }
