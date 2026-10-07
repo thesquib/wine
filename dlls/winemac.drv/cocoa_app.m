@@ -2108,17 +2108,23 @@ static NSString* WineLocalizedString(unsigned int stringID)
             if (gcmouse_enabled())
                 raw_mouse_set_window(fpsModeActive ? targetWindow : nil);
 
-            if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
-            {
-                absolute = TRUE;
-                forceNextMouseMoveAbsolute = FALSE;
-            }
-            else if (fpsModeActive)
+            if (fpsModeActive)
             {
                 /* FPS-mode override: app is recentering cursor every frame,
                  * so it wants relative motion deltas. Skip the
-                 * "in interior of range = send absolute" heuristic. */
+                 * "in interior of range = send absolute" heuristic, and drop a
+                 * pending absolute baseline (set after every click and wheel
+                 * event, or on a target window change): with the pointer
+                 * disassociated the absolute position is where the macOS pointer
+                 * froze, and moving Wine's cursor there turns a mouse-look camera
+                 * to face that spot on the first motion after a click (Dune). */
                 absolute = FALSE;
+                forceNextMouseMoveAbsolute = FALSE;
+            }
+            else if (forceNextMouseMoveAbsolute || targetWindow != lastTargetWindow)
+            {
+                absolute = TRUE;
+                forceNextMouseMoveAbsolute = FALSE;
             }
             else if (force_cached)
             {
