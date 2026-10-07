@@ -750,9 +750,21 @@ signal_op_complete:
 
 #define SIGNALLER_INITIAL_WAIT_COUNT 256
 
+static int signaller_unix_tid(void)
+{
+#ifdef __APPLE__
+    uint64_t tid = 0;
+
+    pthread_threadid_np( NULL, &tid );
+    return (int)tid;
+#else
+    return gettid();
+#endif
+}
+
 static void *signaller_worker( void *arg )
 {
-    int unix_tid = gettid();
+    int unix_tid = signaller_unix_tid();
     struct vulkan_device *device = arg;
     struct semaphore *sem;
     VkSemaphoreWaitInfo wait_info = { 0 };
