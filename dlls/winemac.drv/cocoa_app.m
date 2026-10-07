@@ -3458,6 +3458,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
             bg_cursor_valid = FALSE;
             [self setCursorPosition:bg_cursor_mac];
             drop_next_relative = TRUE;
+            /* a move over another app on the way out unhid the cursor and no
+             * move may come to hide it again: it stayed visible, frozen at
+             * the warp point ("the cursor is stuck visible in the middle") */
+            [self updateCursor:TRUE];
         }
 
         // The cursor probably moved while we were inactive.  Accumulated mouse
