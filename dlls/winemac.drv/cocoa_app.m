@@ -406,6 +406,9 @@ static NSTimeInterval fps_resume_deadline;
  * real pointer is warped to it before any input. Main thread only. */
 static BOOL bg_cursor_valid;
 static CGPoint bg_cursor_mac;
+/* The first relative delta after the reactivation warp can carry the warp's
+ * distance (SDL drops it for the same reason) */
+static BOOL drop_next_relative;
 
 static BOOL proton_always_activation_resync(void)
 {
@@ -2040,6 +2043,15 @@ static NSString* WineLocalizedString(unsigned int stringID)
             macdrv_event* event;
             BOOL absolute;
 
+            /* Inactive after leaving mouse-look: macOS still sends moves over the
+             * (kept-foreground) game window while another app is frontmost, and
+             * with the cursor hidden they counted as mouse-look, so the camera
+             * followed the pointer around other apps ("it's following where I
+             * put the mouse cursor while it wasn't in front", DOOM: The Dark
+             * Ages, 2026-10-08). Deliver nothing until we are active again. */
+            if (bg_cursor_valid && ![NSApp isActive])
+                return;
+
             // If we recently warped the cursor (other than in our cursor-clipping
             // event tap), discard mouse move events until we see an event which is
             // later than that time.
@@ -2245,6 +2257,11 @@ static NSString* WineLocalizedString(unsigned int stringID)
                    clamps per-axis magnitude in post-scale pixels (0 = disabled). */
                 double dx = [anEvent deltaX] * mouse_relative_motion_scale;
                 double dy = [anEvent deltaY] * mouse_relative_motion_scale;
+                if (drop_next_relative)
+                {
+                    drop_next_relative = FALSE;
+                    dx = dy = 0;
+                }
                 if (mouse_relative_motion_cap > 0.0)
                 {
                     if (dx >  mouse_relative_motion_cap) dx =  mouse_relative_motion_cap;
@@ -3440,6 +3457,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
         {
             bg_cursor_valid = FALSE;
             [self setCursorPosition:bg_cursor_mac];
+            drop_next_relative = TRUE;
         }
 
         // The cursor probably moved while we were inactive.  Accumulated mouse
