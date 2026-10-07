@@ -1267,8 +1267,27 @@ static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
 
         if (!resume)
         {
+            Dl_info info;
+            void *pc = (void *)PC_sig(context);
+            ULONG_PTR sp = SP_sig(context), fp = FP_sig(context);
+            int n;
+
             ERR( "vCPU mode: host fault outside a syscall, code %#x addr %p pc %p\n", (UINT)rec->ExceptionCode,
-                 rec->ExceptionAddress, (void *)PC_sig(context) );
+                 rec->ExceptionAddress, pc );
+            /* name the host code that faulted (the abort leaves no crash report): pc, lr, then the frame-pointer
+             * chain, followed only while it stays 16-byte aligned and within 8 MiB above the faulting sp */
+            for (n = 0; n < 18 && pc; n++)
+            {
+                if (dladdr( pc, &info ) && info.dli_fname)
+                    ERR( "  #%d %p %s+%#lx (%s+%#lx)\n", n, pc, info.dli_fname,
+                         (unsigned long)((char *)pc - (char *)info.dli_fbase), info.dli_sname ? info.dli_sname : "?",
+                         info.dli_saddr ? (unsigned long)((char *)pc - (char *)info.dli_saddr) : 0ul );
+                else ERR( "  #%d %p ?\n", n, pc );
+                if (!n) { pc = (void *)LR_sig(context); continue; }
+                if (!fp || (fp & 15) || fp < sp || fp - sp > (8 << 20)) break;
+                pc = ((void **)fp)[1];
+                fp = ((ULONG_PTR *)fp)[0];
+            }
             abort_process( 1 );
         }
         TRACE( "returning to the vCPU loop ret=%08x\n", (UINT)rec->ExceptionCode );
