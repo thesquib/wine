@@ -396,6 +396,16 @@ static BOOL activation_resync_needed = TRUE;
 static BOOL fps_active_at_resign;
 static NSTimeInterval fps_resume_deadline;
 #define FPS_RESUME_GRACE_S 0.5
+/* The pointer a mouse-look game believes in while we are inactive (CG global
+ * coordinates). Deactivated from mouse-look, a game still polling
+ * GetCursorPos and recentring with SetCursorPos (the warp is skipped while
+ * inactive, see setCursorPosition:) read the live macOS pointer, so every move
+ * made in other apps became a look delta: "alt tabbing out, moving the mouse
+ * and alt tabbing back still jerks" (DOOM: The Dark Ages, 2026-10-08). While
+ * valid, GetCursorPos reports it and SetCursorPos moves it; on reactivation the
+ * real pointer is warped to it before any input. Main thread only. */
+static BOOL bg_cursor_valid;
+static CGPoint bg_cursor_mac;
 
 static BOOL proton_always_activation_resync(void)
 {
@@ -1809,6 +1819,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
              * the cursor while another app is frontmost, and an FPS title (DOOM Eternal, 2026-09-26) answers them by
              * recentring with SetCursorPos, so hovering over the game from another app threw the cursor to the
              * middle of the screen. Report success so the game does not retry. */
+            if (bg_cursor_valid)
+                bg_cursor_mac = pos;
             ret = TRUE;
         }
         else if (self.clippingCursor && [clipCursorHandler respondsToSelector:@selector(setCursorPosition:)])
@@ -3421,6 +3433,15 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [self sendDisplaysChanged:TRUE];
         }
 
+        /* back from Alt-Tab out of mouse-look: put the real pointer where the
+         * game left its cursor, so neither GetCursorPos nor an absolute move
+         * sees the travel made in other apps */
+        if (bg_cursor_valid)
+        {
+            bg_cursor_valid = FALSE;
+            [self setCursorPosition:bg_cursor_mac];
+        }
+
         // The cursor probably moved while we were inactive.  Accumulated mouse
         // movement deltas are invalidated.  Make sure the next mouse move event
         // starts over from an absolute baseline.
@@ -3470,6 +3491,13 @@ static NSString* WineLocalizedString(unsigned int stringID)
          * mouse-look re-associates it, so the next fpsModeActive transition
          * re-disassociates it instead of being skipped as unchanged */
         fps_active_at_resign = macdrv_mouse_disassociated;
+        if (fps_active_at_resign)
+        {
+            /* disassociated, the macOS pointer is still where the game's
+             * cursor is: freeze that for GetCursorPos while we are away */
+            bg_cursor_mac = NSPointToCGPoint([self flippedMouseLocation:[NSEvent mouseLocation]]);
+            bg_cursor_valid = TRUE;
+        }
         macdrv_restore_mouse_association();
     }
 
@@ -3822,9 +3850,14 @@ void macdrv_set_cursor(CFStringRef name, CFArrayRef frames)
 int macdrv_get_cursor_position(CGPoint *pos)
 {
     OnMainThread(^{
-        NSPoint location = [NSEvent mouseLocation];
-        location = [[WineApplicationController sharedController] flippedMouseLocation:location];
-        *pos = cgpoint_win_from_mac(NSPointToCGPoint(location));
+        if (bg_cursor_valid && ![NSApp isActive])
+            *pos = cgpoint_win_from_mac(bg_cursor_mac);
+        else
+        {
+            NSPoint location = [NSEvent mouseLocation];
+            location = [[WineApplicationController sharedController] flippedMouseLocation:location];
+            *pos = cgpoint_win_from_mac(NSPointToCGPoint(location));
+        }
     });
 
     return TRUE;
