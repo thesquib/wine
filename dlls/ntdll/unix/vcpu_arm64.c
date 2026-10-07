@@ -2840,7 +2840,7 @@ static void publish_ksystem_time( volatile KSYSTEM_TIME *dst, const volatile KSY
     dst->High1Time = high1;
 }
 
-/* PMW_VCPU_FAST_QPC=1: the guest's RtlQueryPerformanceCounter reads CNTVCT_EL0 (== mach_absolute_time() on every
+/* PMW_VCPU_FAST_QPC (default on, =0 off): the guest's RtlQueryPerformanceCounter reads CNTVCT_EL0 (== mach_absolute_time() on every
  * vCPU, vcpu_el1 [D19]) plus QpcBias instead of making a syscall, while QpcFrequency is TICKSPERSEC. The bias is
  * mach_continuous_time() - mach_absolute_time(): the time the Mac slept since boot. It is only moved forward, and
  * only by more than 0.5 ms (so the reader's clock stays monotonic); after a wake the guest runs behind the host by
@@ -2910,7 +2910,9 @@ void vcpu_start_kuser_publisher( const void *src )
     sigset_t old;
     int ret;
 
-    fast_qpc = env && !strcmp( env, "1" );
+    /* default on since 2026-10-07 (openrosetta: vel1-gmm-v4 pins every vCPU's vtimer offset to 0 and reads it back);
+     * PMW_VCPU_FAST_QPC=0 turns it off */
+    fast_qpc = !(env && !strcmp( env, "0" ));
     TRACE( "fast QPC %s\n", fast_qpc ? "on" : "off" );
 
     publish_kuser( kuser_host, src );
