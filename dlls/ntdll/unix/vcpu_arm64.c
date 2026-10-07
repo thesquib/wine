@@ -1324,7 +1324,7 @@ static void stall_scan(void)
  * ([VCPU-SAMPLE]); map them with the +loaddll bases in the log. Threads parked in host waits are not sampled (they
  * are not burning CPU). */
 #define SAMPLE_BUCKETS 4096
-static struct { ULONG64 page; unsigned int count, sim; } sample_table[SAMPLE_BUCKETS];
+static struct { ULONG64 page; unsigned int count, sim; ULONG64 last_pc; } sample_table[SAMPLE_BUCKETS];
 static unsigned int sample_total, sample_sim, sample_dropped;
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1343,6 +1343,7 @@ static void sample_record( const struct syscall_frame *frame )
         if (sample_table[h].count && sample_table[h].page != page) continue;
         sample_table[h].page = page;
         sample_table[h].count++;
+        sample_table[h].last_pc = frame->pc;
         if (sim) sample_table[h].sim++;
         break;
     }
@@ -1385,6 +1386,22 @@ static void sample_report(void)
             fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
             len = 0;
         }
+    }
+    /* the code at a sampled pc in each of the 3 hottest pages (within the page, read safely) */
+    for (i = 0; i < n && i < 3; i++)
+    {
+        UINT code[16];
+        ULONG64 pc = copy[i].last_pc & ~3ull, page = pc & ~0xfffull;
+        ULONG64 start = pc - 32 < page ? page : pc - 32;
+        vm_size_t got = 0;
+        unsigned int j, words = (unsigned int)min( 16, (page + 0x1000 - start) / 4 );
+
+        if (vm_read_overwrite( mach_task_self(), (vm_address_t)start, words * 4, (vm_address_t)code, &got ) != KERN_SUCCESS)
+            continue;
+        len = snprintf( line, sizeof(line), "code at %#llx (pc %#llx):", (unsigned long long)start,
+                        (unsigned long long)pc );
+        for (j = 0; j < got / 4; j++) len += snprintf( line + len, sizeof(line) - len, " %08x", code[j] );
+        fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
     }
 }
 
