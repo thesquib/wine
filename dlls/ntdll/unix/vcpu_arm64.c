@@ -613,6 +613,7 @@ struct prof_bucket
 unsigned int vcpu_prof_interval;
 static int vcpu_stallpc;  /* PMW_VCPU_STALLPC, see stall_scan */
 static void stall_scan(void);
+static void stall_parse_dumps( const char *env );
 #define prof_interval vcpu_prof_interval
 static struct prof_bucket prof_guest;
 static struct prof_bucket prof_kind[PROF_KINDS];
@@ -1024,6 +1025,7 @@ static void prof_start(void)
         return;
     }
     vcpu_stallpc = (env = getenv( "PMW_VCPU_STALLPC" )) && atoi( env ) > 0;
+    if (vcpu_stallpc) stall_parse_dumps( getenv( "PMW_VCPU_STALLPC_DUMP" ));
     if (vcpu_stallpc) fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_STALLPC on\n", (int)getpid() );
     {
         uint64_t freq;
@@ -1083,6 +1085,73 @@ static pthread_key_t vcpu_key;
  * context it last saved (ChpeV2CpuAreaInfo->ContextAmd64) is logged too. A Wine suspend (SIGUSR1) landing in the same
  * KICK would be absorbed: diagnostic use only. */
 static pthread_mutex_t stall_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* PMW_VCPU_STALLPC_DUMP="x<reg>+<offset>:<len>[,...]" (up to 8): memory to show with each report, at a guest register
+ * plus an offset, read with vm_read_overwrite so a bad address is an error line, not a fault. Up to 64 bytes are
+ * printed as hex; longer ranges as a histogram of byte values and the first entries above 1 (job/slot state tables) */
+static struct stall_dump_spec { unsigned int reg; long long off; unsigned int len; } stall_dumps[8];
+static unsigned int stall_dump_count;
+
+static void stall_parse_dumps( const char *env )
+{
+    while (env && *env && stall_dump_count < ARRAY_SIZE(stall_dumps))
+    {
+        struct stall_dump_spec *d = &stall_dumps[stall_dump_count];
+        char *end;
+
+        if (*env != 'x') break;
+        d->reg = strtoul( env + 1, &end, 10 );
+        if (d->reg > 30 || (*end != '+' && *end != '-')) break;
+        d->off = strtoll( end, &end, 0 );
+        if (*end != ':') break;
+        d->len = strtoul( end + 1, &end, 0 );
+        if (!d->len || d->len > 65536) break;
+        stall_dump_count++;
+        if (*end != ',') break;
+        env = end + 1;
+    }
+}
+
+static void stall_dump_memory( const struct syscall_frame *frame )
+{
+    static unsigned char buf[65536];
+    unsigned int i, j;
+
+    for (i = 0; i < stall_dump_count; i++)
+    {
+        const struct stall_dump_spec *d = &stall_dumps[i];
+        ULONG64 base = d->reg == 29 ? frame->fp : d->reg == 30 ? frame->lr : frame->x[d->reg];
+        ULONG64 addr = base + d->off;
+        vm_size_t got = 0;
+        kern_return_t kr = vm_read_overwrite( mach_task_self(), (vm_address_t)addr, d->len, (vm_address_t)buf, &got );
+
+        if (kr != KERN_SUCCESS || got != d->len)
+        {
+            fprintf( stderr, "[VCPU-STALL]   mem x%u%+lld = %#llx len %#x: unreadable (kr %d)\n", d->reg, d->off,
+                     (unsigned long long)addr, d->len, kr );
+            continue;
+        }
+        if (d->len <= 64)
+        {
+            fprintf( stderr, "[VCPU-STALL]   mem x%u%+lld = %#llx:", d->reg, d->off, (unsigned long long)addr );
+            for (j = 0; j < d->len; j++) fprintf( stderr, "%s%02x", (j % 8) ? "" : " ", buf[j] );
+            fprintf( stderr, "\n" );
+        }
+        else
+        {
+            unsigned int hist[256] = {0}, shown = 0;
+
+            for (j = 0; j < d->len; j++) hist[buf[j]]++;
+            fprintf( stderr, "[VCPU-STALL]   mem x%u%+lld = %#llx len %#x: byte values", d->reg, d->off,
+                     (unsigned long long)addr, d->len );
+            for (j = 0; j < 256; j++) if (hist[j]) fprintf( stderr, " %02x:%u", j, hist[j] );
+            fprintf( stderr, " | first > 1:" );
+            for (j = 0; j < d->len && shown < 24; j++)
+                if (buf[j] > 1) { fprintf( stderr, " [%#x]=%u", j, buf[j] ); shown++; }
+            fprintf( stderr, "\n" );
+        }
+    }
+}
 static struct list stall_threads = LIST_INIT( stall_threads );
 
 static void stall_scan(void)
@@ -1128,6 +1197,7 @@ static void stall_report( struct vcpu_thread *vt, const vel1_exit *e, const stru
     fprintf( stderr, "[VCPU-STALL]   code at %#llx:", (unsigned long long)(ULONG_PTR)code );
     for (i = 0; i < 16 && i < n; i++) fprintf( stderr, " %08x", code[i] );
     fprintf( stderr, "\n" );
+    stall_dump_memory( frame );
     if (chpe)
         fprintf( stderr, "[VCPU-STALL]   emulator: in simulation %u, in syscall callback %u; x64 context last saved: "
                  "rip %#llx rsp %#llx\n", chpe->InSimulation, chpe->InSyscallCallback,
