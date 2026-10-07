@@ -383,6 +383,19 @@ static int proton_force_menubar_hide(void)
  * real resign or a screen-parameter change. PROTON_ALWAYS_ACTIVATION_RESYNC=1 restores the re-sync on every
  * activation. Main thread only. */
 static BOOL activation_resync_needed = TRUE;
+/* Alt-Tab out of mouse-look and back (DOOM: The Dark Ages "the mouse jumps
+ * when I alt-tab back in", 2026-10-08). Deactivation re-associates the pointer
+ * (the game's ClipCursor(NULL) -> stopClippingCursor) but left
+ * macdrv_mouse_disassociated set, and reactivation armed an absolute
+ * baseline: the first move back, before the game re-clips, went out as
+ * MOUSEEVENTF_ABSOLUTE to wherever the macOS pointer sat while away, which a
+ * raw-input camera reads as a jump. Now the association is restored at
+ * deactivation, and for a short grace period after reactivating from
+ * mouse-look absolute moves are dropped until the game is back in it.
+ * Event timestamps and systemUptime share the same clock. */
+static BOOL fps_active_at_resign;
+static NSTimeInterval fps_resume_deadline;
+#define FPS_RESUME_GRACE_S 0.5
 
 static BOOL proton_always_activation_resync(void)
 {
@@ -2183,6 +2196,19 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 }
             }
 
+            if (fps_resume_deadline != 0)
+            {
+                if (fpsModeActive || [anEvent timestamp] >= fps_resume_deadline)
+                    fps_resume_deadline = 0;
+                else if (absolute)
+                {
+                    /* back from Alt-Tab, the game not yet in mouse-look again */
+                    lastTargetWindow = targetWindow;
+                    [self updateCursor:FALSE];
+                    return;
+                }
+            }
+
             if (absolute)
             {
                 if (self.clippingCursor)
@@ -3027,6 +3053,16 @@ static NSString* WineLocalizedString(unsigned int stringID)
              * point-bounds (typical at fullscreen on Retina). */
             child.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
             child.contentsGravity = kCAGravityResize;
+            /* The window behind the game's layer shows black, not the window
+             * background colour, wherever the layer falls short of the window
+             * (a white line along the bottom and right in DOOM: The Dark Ages) */
+            if ([view.window isKindOfClass:[WineWindow class]])
+            {
+                WineWindow *hostWindow = (WineWindow *)view.window;
+                hostWindow.hostsGameLayer = YES;
+                if ([hostWindow isOpaque])
+                    [hostWindow setBackgroundColor:[NSColor blackColor]];
+            }
 
             /* Remove any prior CALayerHost / CAMetalLayer we already attached
              * for this view (from earlier broadcast retries).
@@ -3389,6 +3425,10 @@ static NSString* WineLocalizedString(unsigned int stringID)
         // movement deltas are invalidated.  Make sure the next mouse move event
         // starts over from an absolute baseline.
         forceNextMouseMoveAbsolute = TRUE;
+        mouseMoveDeltaX = mouseMoveDeltaY = 0;
+        fps_resume_deadline = fps_active_at_resign
+            ? [[NSProcessInfo processInfo] systemUptime] + FPS_RESUME_GRACE_S : 0;
+        fps_active_at_resign = FALSE;
     }
 
     - (void)applicationDidChangeScreenParameters:(NSNotification *)notification
@@ -3425,6 +3465,12 @@ static NSString* WineLocalizedString(unsigned int stringID)
 
         [self releaseMouseCapture];
         [self updateMenuBarHiding];
+
+        /* Keep macdrv_mouse_disassociated true to the pointer state: leaving
+         * mouse-look re-associates it, so the next fpsModeActive transition
+         * re-disassociates it instead of being skipped as unchanged */
+        fps_active_at_resign = macdrv_mouse_disassociated;
+        macdrv_restore_mouse_association();
     }
 
     - (void) applicationDidUnhide:(NSNotification*)aNotification

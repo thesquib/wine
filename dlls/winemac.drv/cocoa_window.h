@@ -99,6 +99,10 @@
    the user on-screen. That means it has a non-zero size and is not empty-
    shaped, or has a child window that meets those criteria. */
 @property (readonly, nonatomic) BOOL presentsVisibleContent;
+/* A game's own Metal layer (E.1 attach) fills this window: when opaque, its
+ * background is black, so any sliver the layer does not cover reads as the
+ * letterbox instead of a white line (DOOM: The Dark Ages, 2026-10-08). */
+@property (nonatomic) BOOL hostsGameLayer;
 
     - (NSInteger) minimumLevelForActive:(BOOL)active;
     - (void) updateFullscreen;

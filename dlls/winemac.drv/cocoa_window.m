@@ -2434,7 +2434,8 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
         {
             self.shapeChangedSinceLastDraw = TRUE;
             [[self contentView] setNeedsDisplay:YES];
-            [self setBackgroundColor:[NSColor windowBackgroundColor]];
+            [self setBackgroundColor:self.hostsGameLayer ? [NSColor blackColor]
+                                                         : [NSColor windowBackgroundColor]];
             [self setOpaque:YES];
         }
         else if ([self isOpaque] && self.needsTransparency)
