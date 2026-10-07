@@ -614,6 +614,7 @@ unsigned int vcpu_prof_interval;
 static int vcpu_stallpc;  /* PMW_VCPU_STALLPC, see stall_scan */
 static void stall_scan(void);
 static void stall_parse_dumps( const char *env );
+static unsigned int stall_stack_bytes;  /* PMW_VCPU_STALLPC_STACK, see stall_scan_stack */
 #define prof_interval vcpu_prof_interval
 static struct prof_bucket prof_guest;
 static struct prof_bucket prof_kind[PROF_KINDS];
@@ -1026,6 +1027,8 @@ static void prof_start(void)
     }
     vcpu_stallpc = (env = getenv( "PMW_VCPU_STALLPC" )) && atoi( env ) > 0;
     if (vcpu_stallpc) stall_parse_dumps( getenv( "PMW_VCPU_STALLPC_DUMP" ));
+    if (vcpu_stallpc && (env = getenv( "PMW_VCPU_STALLPC_STACK" )))
+        stall_stack_bytes = min( (unsigned int)strtoul( env, NULL, 0 ), 65536u ) & ~7u;
     if (vcpu_stallpc) fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_STALLPC on\n", (int)getpid() );
     {
         uint64_t freq;
@@ -1188,6 +1191,43 @@ static void watch_start(void)
     pthread_sigmask( SIG_SETMASK, &old, NULL );
 }
 
+/* PMW_VCPU_STALLPC_STACK=<bytes> (with PMW_VCPU_STALLPC): scan that much of the x64 stack upward from the rsp the
+ * emulator last saved and list the qwords that point into the main image: a backtrace without unwind data */
+static void stall_scan_stack( ULONG64 sp )
+{
+    static ULONG64 buf[65536 / 8];
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS64 *nt;
+    ULONG64 base, size;
+    vm_size_t got = 0;
+    unsigned int i, shown = 0;
+
+    if (!stall_stack_bytes || !sp || !peb || !(dos = (const IMAGE_DOS_HEADER *)peb->ImageBaseAddress)) return;
+    base = (ULONG64)(ULONG_PTR)dos;
+    nt = (const IMAGE_NT_HEADERS64 *)((const char *)dos + dos->e_lfanew);
+    size = nt->OptionalHeader.SizeOfImage;
+    if (vm_read_overwrite( mach_task_self(), (vm_address_t)sp, stall_stack_bytes, (vm_address_t)buf, &got ) != KERN_SUCCESS)
+    {
+        /* the range may run past the stack top: take what there is, a page at a time */
+        for (got = 0; got < stall_stack_bytes; got += 0x1000)
+        {
+            vm_size_t n = 0;
+            if (vm_read_overwrite( mach_task_self(), (vm_address_t)(sp + got), 0x1000, (vm_address_t)((char *)buf + got),
+                                   &n ) != KERN_SUCCESS)
+                break;
+        }
+    }
+    fprintf( stderr, "[VCPU-STALL]   x64 stack from %#llx (%#lx bytes), qwords into the image (base %#llx):",
+             (unsigned long long)sp, (unsigned long)got, (unsigned long long)base );
+    for (i = 0; i < got / 8 && shown < 64; i++)
+        if (buf[i] >= base && buf[i] < base + size)
+        {
+            fprintf( stderr, " [+%#x]=exe+%#llx", i * 8, (unsigned long long)(buf[i] - base) );
+            shown++;
+        }
+    fprintf( stderr, "\n" );
+}
+
 static void stall_parse_dumps( const char *env )
 {
     while (env && *env && stall_dump_count < ARRAY_SIZE(stall_dumps))
@@ -1280,6 +1320,7 @@ static void stall_report( struct vcpu_thread *vt, const vel1_exit *e, const stru
     for (i = 0; i < 16 && i < n; i++) fprintf( stderr, " %08x", code[i] );
     fprintf( stderr, "\n" );
     stall_dump_memory( frame );
+    if (chpe && chpe->ContextAmd64) stall_scan_stack( chpe->ContextAmd64->Sp );
     if (chpe)
         fprintf( stderr, "[VCPU-STALL]   emulator: in simulation %u, in syscall callback %u; x64 context last saved: "
                  "rip %#llx rsp %#llx\n", chpe->InSimulation, chpe->InSyscallCallback,
