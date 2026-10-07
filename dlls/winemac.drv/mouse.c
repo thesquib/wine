@@ -959,8 +959,11 @@ void macdrv_mouse_moved(HWND hwnd, const macdrv_event *event)
  */
 void macdrv_mouse_scroll(HWND hwnd, const macdrv_event *event)
 {
-    /* FPS mode: no absolute move to the frozen macOS pointer, as in macdrv_mouse_button */
-    UINT move = event->mouse_scroll.disassociated ? 0 : MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+    /* A wheel never moves the cursor on Windows, and motion events already keep Wine's cursor where the pointer
+     * is. An absolute move here jumped the cursor to the macOS pointer location: in FPS mode the pointer is frozen
+     * where the game took the mouse, and after FPS mode it stays wherever it was left, so a mouse-look camera turned
+     * with every trackpad scroll step (Dune's build menu). Send the wheel alone. */
+    const UINT move = 0;
 
     TRACE("win %p/%p scroll (%d,%d) at (%d,%d) time %lu (%lu ticks ago)\n", hwnd,
           event->window, event->mouse_scroll.x_scroll, event->mouse_scroll.y_scroll,
