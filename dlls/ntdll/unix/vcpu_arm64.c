@@ -1324,14 +1324,34 @@ static void stall_scan(void)
  * ([VCPU-SAMPLE]); map them with the +loaddll bases in the log. Threads parked in host waits are not sampled (they
  * are not burning CPU). */
 #define SAMPLE_BUCKETS 4096
-static struct { ULONG64 page; unsigned int count, sim; ULONG64 last_pc; ULONG64 last_x[31]; } sample_table[SAMPLE_BUCKETS];
+static struct { ULONG64 page; unsigned int count, sim; ULONG64 last_pc; ULONG64 last_x[31]; ULONG64 last_rip; } sample_table[SAMPLE_BUCKETS];
 static unsigned int sample_total, sample_sim, sample_dropped;
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Inside a FEX JIT block, the guest x64 rip of the block's first instruction (openrosetta 2026-10-07): x28 is FEX's
+ * per-thread state, whose first qword is the current block's header (written at every block entry); the header's first
+ * u32 is the offset to the block tail, which holds the block's host size and then its guest rip. Only trusted when pc
+ * lies inside that block; 0 otherwise. Reads go through vm_read_overwrite, so a stale pointer cannot fault. */
+static ULONG64 sample_guest_rip( const struct syscall_frame *frame )
+{
+    ULONG64 hdr = 0, tail_size[2];
+    UINT off = 0;
+    vm_size_t got;
+
+    if (vm_read_overwrite( mach_task_self(), (vm_address_t)frame->x[28], 8, (vm_address_t)&hdr, &got ) || !hdr)
+        return 0;
+    if (frame->pc < hdr) return 0;
+    if (vm_read_overwrite( mach_task_self(), (vm_address_t)hdr, 4, (vm_address_t)&off, &got ) || !off) return 0;
+    if (vm_read_overwrite( mach_task_self(), (vm_address_t)(hdr + off), 16, (vm_address_t)tail_size, &got )) return 0;
+    if (frame->pc >= hdr + tail_size[0]) return 0;
+    return tail_size[1];
+}
 
 static void sample_record( const struct syscall_frame *frame )
 {
     CHPE_V2_CPU_AREA_INFO *chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo;
     BOOL sim = chpe && chpe->InSimulation;
+    ULONG64 rip = sim ? sample_guest_rip( frame ) : 0;
     ULONG64 page = frame->pc >> 12;
     unsigned int i, h = (unsigned int)((page * 0x9e3779b97f4a7c15ull) >> 52);
 
@@ -1344,6 +1364,7 @@ static void sample_record( const struct syscall_frame *frame )
         sample_table[h].page = page;
         sample_table[h].count++;
         sample_table[h].last_pc = frame->pc;
+        sample_table[h].last_rip = rip;
         memcpy( sample_table[h].last_x, frame->x, 29 * sizeof(ULONG64) );
         sample_table[h].last_x[29] = frame->fp;
         sample_table[h].last_x[30] = frame->lr;
@@ -1401,8 +1422,8 @@ static void sample_report(void)
 
         if (vm_read_overwrite( mach_task_self(), (vm_address_t)start, words * 4, (vm_address_t)code, &got ) != KERN_SUCCESS)
             continue;
-        len = snprintf( line, sizeof(line), "code at %#llx (pc %#llx):", (unsigned long long)start,
-                        (unsigned long long)pc );
+        len = snprintf( line, sizeof(line), "code at %#llx (pc %#llx, guest block rip %#llx):", (unsigned long long)start,
+                        (unsigned long long)pc, (unsigned long long)copy[i].last_rip );
         for (j = 0; j < got / 4; j++) len += snprintf( line + len, sizeof(line) - len, " %08x", code[j] );
         fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
         /* the registers of that sample: a loop's bounds and counters (e.g. a spin threshold) */
