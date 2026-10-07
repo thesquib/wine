@@ -2661,6 +2661,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status && vcpu_prof_interval) vcpu_prof_note_priority( handle );
         return status;
     }
 
@@ -2676,6 +2677,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status && vcpu_prof_interval) vcpu_prof_note_priority( handle );
         return status;
     }
 

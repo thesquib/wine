@@ -49,6 +49,7 @@
 #include <sys/resource.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <pthread/qos.h>
 #include <mach/vm_statistics.h>
 #include <libkern/OSCacheControl.h>
 #include <Hypervisor/Hypervisor.h>
@@ -80,6 +81,7 @@ static vel1_pool vcpu_pool;
 static _Atomic int prof_threads_live, prof_threads_peak;
 static _Atomic uint64_t prof_rel_block, prof_rel_preempt;
 static void vcpu_pool_line( char *buf, size_t size );  /* prof_thread, above its definition, prints it */
+static void vcpu_pool_time_print( double hz );        /* likewise */
 int vcpu_check_s2;
 int vcpu_sect_alias;
 int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm-backed sections alias one object across processes */
@@ -615,6 +617,7 @@ static int vcpu_stallpc;  /* PMW_VCPU_STALLPC, see stall_scan */
 static void stall_scan(void);
 static unsigned int vcpu_sample_ms;  /* PMW_VCPU_SAMPLE_MS, see sample_thread */
 static void sample_report(void);
+static void prio_report( double cpu_s );  /* the CPU time per Windows base priority, below */
 static void *sample_thread( void *arg );
 static void stall_parse_dumps( const char *env );
 static unsigned int stall_stack_bytes;  /* PMW_VCPU_STALLPC_STACK, see stall_scan_stack */
@@ -641,6 +644,9 @@ static _Atomic unsigned int prof_epoch = 1;
 static _Atomic uint64_t prof_wait_cbs, prof_waits_with_cbs;
 static signed char prof_wait_class[2][4096];  /* 0 not looked up yet, 1 blocking wait, -1 not */
 static double prof_ticks_per_us = 1;
+/* M:N hand-off cost: vcpu_release (context save, vCPU destroy, slot release) and vcpu_ensure's re-acquire, split into
+ * the pool call (which includes any wait for a slot) and the vCPU create + context restore */
+static struct prof_bucket prof_pool_rel, prof_pool_acq, prof_pool_create;
 
 static const char * const prof_extra_names[VCPU_PROF_IDS] =
 {
@@ -921,7 +927,9 @@ static void *prof_thread( void *arg )
             char line[256];
             vcpu_pool_line( line, sizeof(line) );
             fprintf( stderr, "[VCPU-PROF] pid %d %s\n", (int)getpid(), line );
+            vcpu_pool_time_print( hz );
         }
+        prio_report( (cpu - last_cpu) / 1e6 );
         for (i = 0; i < n && i < 24; i++)
             fprintf( stderr, "[VCPU-PROF] pid %d   %-34s %9llu calls %8.3f s  %8.2f us avg%s\n",
                      (int)getpid(), rows[i].name ? rows[i].name : rows[i].buf,
@@ -1095,6 +1103,12 @@ struct vcpu_thread
     atomic_int          sample_req;    /* PMW_VCPU_SAMPLE_MS: the next KICK exit records this thread's pc */
     atomic_int          signal_kick;   /* a signal handler kicked: that KICK is never the diagnostics' to absorb */
     UINT                tid;
+    struct list         prio_entry;    /* PMW_VCPU_PROF: in prio_threads while prio_listed */
+    BOOL                prio_listed;   /* PMW_VCPU_PROF: registered by prio_register */
+    mach_port_t         prio_port;     /* PMW_VCPU_PROF: this thread's Mach port (a reference of its own) */
+    pthread_t           prio_pthread;  /* PMW_VCPU_PROF: for pthread_get_qos_class_np */
+    int                 prio_base;     /* PMW_VCPU_PROF: the server's base_priority (THREAD_PRIORITY_*), or PRIO_UNKNOWN */
+    uint64_t            prio_cpu_ns;   /* PMW_VCPU_PROF: user+system time at the previous report */
 };
 
 static pthread_key_t vcpu_key;
@@ -1316,6 +1330,234 @@ static void stall_scan(void)
         vel1_kick_remote( &vt->vcpu );  /* under stall_lock: vcpu_thread_exit unlinks before the destroy */
     }
     pthread_mutex_unlock( &stall_lock );
+}
+
+/* PMW_VCPU_PROF: CPU time per Windows base priority (THREAD_PRIORITY_*, the server's base_priority). Each Windows
+ * thread is listed with a Mach port of its own; every report reads its user+system time (THREAD_EXTENDED_INFO, ns),
+ * its Mach base priority, the latency/throughput tiers the server's apply_thread_priority set on it
+ * (thread_policy_get: tiers that match the base priority mean those thread_policy_set calls took) and its pthread QoS
+ * class. The base priority comes from the server when the thread starts and after every successful
+ * NtSetInformationThread( ThreadPriority / ThreadBasePriority ); a set through a handle without query access is
+ * missed. Process CPU not on a listed thread (driver and host threads, this profiler) is the "rest". prio_lock is
+ * only taken with every signal blocked: abort_thread from a signal would otherwise re-take it in prio_unregister. */
+#define PRIO_UNKNOWN 100
+#define PRIO_GROUPS  32  /* bases -15..15, then unknown */
+static pthread_mutex_t prio_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list prio_threads = LIST_INIT( prio_threads );
+static uint64_t prio_exit_ns[PRIO_GROUPS];            /* under prio_lock: CPU since the last report of threads gone */
+static unsigned int prio_exit_threads[PRIO_GROUPS];   /* under prio_lock */
+
+static inline unsigned int prio_group( int base )
+{
+    return base >= -15 && base <= 15 ? base + 15 : PRIO_GROUPS - 1;
+}
+
+static int prio_query( HANDLE handle, UINT *tid )
+{
+    THREAD_BASIC_INFORMATION info;
+
+    if (NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL )) return PRIO_UNKNOWN;
+    if (tid) *tid = HandleToULong( info.ClientId.UniqueThread );
+    return info.BasePriority;
+}
+
+static BOOL prio_thread_info( mach_port_t port, uint64_t *ns, int *pri )
+{
+    thread_extended_info_data_t info;
+    mach_msg_type_number_t count = THREAD_EXTENDED_INFO_COUNT;
+
+    if (thread_info( port, THREAD_EXTENDED_INFO, (thread_info_t)&info, &count )) return FALSE;
+    *ns = info.pth_user_time + info.pth_system_time;
+    if (pri) *pri = info.pth_priority;
+    return TRUE;
+}
+
+/* a LATENCY_QOS_TIER_n / THROUGHPUT_QOS_TIER_n value as n; -1 unspecified, -2 the query failed */
+static int prio_tier( mach_port_t port, thread_policy_flavor_t flavor )
+{
+    integer_t tier = 0;
+    mach_msg_type_number_t count = 1;
+    boolean_t get_default = FALSE;
+
+    if (thread_policy_get( port, flavor, &tier, &count, &get_default )) return -2;
+    return tier ? (tier & 0xffff) - 1 : -1;
+}
+
+/* on the starting thread, before it holds a vCPU slot */
+static void prio_register( struct vcpu_thread *vt )
+{
+    sigset_t old;
+    int base;
+
+    vt->tid = GetCurrentThreadId();
+    vt->prio_port = mach_thread_self();
+    vt->prio_pthread = pthread_self();
+    vt->prio_base = PRIO_UNKNOWN;
+    vt->prio_cpu_ns = 0;  /* the thread's whole time counts, its start-up too */
+    block_all_signals( &old );
+    pthread_mutex_lock( &prio_lock );
+    list_add_tail( &prio_threads, &vt->prio_entry );
+    vt->prio_listed = TRUE;
+    pthread_mutex_unlock( &prio_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    /* after the insert: a set from another thread finds the entry from now on, and this read sees any earlier one */
+    base = prio_query( GetCurrentThread(), NULL );
+    block_all_signals( &old );
+    pthread_mutex_lock( &prio_lock );
+    if (vt->prio_base == PRIO_UNKNOWN) vt->prio_base = base;
+    pthread_mutex_unlock( &prio_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
+static void prio_unregister( struct vcpu_thread *vt )
+{
+    sigset_t old;
+    uint64_t ns;
+
+    if (!vt->prio_listed) return;
+    block_all_signals( &old );
+    pthread_mutex_lock( &prio_lock );
+    if (prio_thread_info( vt->prio_port, &ns, NULL ) && ns > vt->prio_cpu_ns)
+        prio_exit_ns[prio_group( vt->prio_base )] += ns - vt->prio_cpu_ns;
+    prio_exit_threads[prio_group( vt->prio_base )]++;
+    list_remove( &vt->prio_entry );
+    vt->prio_listed = FALSE;
+    pthread_mutex_unlock( &prio_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    mach_port_deallocate( mach_task_self(), vt->prio_port );
+}
+
+/* NtSetInformationThread( ThreadPriority / ThreadBasePriority ) succeeded on handle */
+void vcpu_prof_note_priority( HANDLE handle )
+{
+    struct vcpu_thread *vt;
+    sigset_t old;
+    UINT tid = 0;
+    int base;
+
+    if (!prof_interval || (base = prio_query( handle, &tid )) == PRIO_UNKNOWN) return;
+    block_all_signals( &old );
+    pthread_mutex_lock( &prio_lock );
+    LIST_FOR_EACH_ENTRY( vt, &prio_threads, struct vcpu_thread, prio_entry )
+    {
+        if (vt->tid != tid) continue;
+        vt->prio_base = base;
+        break;
+    }
+    pthread_mutex_unlock( &prio_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
+static const char *prio_qos_name( qos_class_t qos )
+{
+    switch (qos)
+    {
+    case QOS_CLASS_USER_INTERACTIVE: return "ui";
+    case QOS_CLASS_USER_INITIATED:   return "init";
+    case QOS_CLASS_DEFAULT:          return "def";
+    case QOS_CLASS_UTILITY:          return "util";
+    case QOS_CLASS_BACKGROUND:       return "bg";
+    case QOS_CLASS_UNSPECIFIED:      return "-";
+    default:                         return "?";
+    }
+}
+
+static void prio_tier_str( char *buf, int tier )
+{
+    if (tier >= 0) snprintf( buf, 4, "%d", tier );
+    else strcpy( buf, tier == -1 ? "-" : "?" );
+}
+
+/* the profiler thread only */
+static void prio_report( double cpu_s )
+{
+    static struct prio_group
+    {
+        unsigned int threads, exited, kinds, more;
+        uint64_t     ns;
+        int          pri_min, pri_max;
+        struct { int lat, thr; qos_class_t qos; unsigned int n; } kind[4];
+    } groups[PRIO_GROUPS];
+    struct vcpu_thread *vt;
+    char line[4096];
+    uint64_t total_ns = 0;
+    unsigned int i, k;
+    int len;
+
+    memset( groups, 0, sizeof(groups) );
+    pthread_mutex_lock( &prio_lock );
+    LIST_FOR_EACH_ENTRY( vt, &prio_threads, struct vcpu_thread, prio_entry )
+    {
+        struct prio_group *g;
+        qos_class_t qos = QOS_CLASS_UNSPECIFIED;
+        int pri, rel, lat, thr;
+        uint64_t ns;
+
+        if (!prio_thread_info( vt->prio_port, &ns, &pri )) continue;
+        g = &groups[prio_group( vt->prio_base )];
+        if (ns > vt->prio_cpu_ns) g->ns += ns - vt->prio_cpu_ns;
+        vt->prio_cpu_ns = ns;
+        if (!g->threads++) g->pri_min = g->pri_max = pri;
+        g->pri_min = min( g->pri_min, pri );
+        g->pri_max = max( g->pri_max, pri );
+        lat = prio_tier( vt->prio_port, THREAD_LATENCY_QOS_POLICY );
+        thr = prio_tier( vt->prio_port, THREAD_THROUGHPUT_QOS_POLICY );
+        if (pthread_get_qos_class_np( vt->prio_pthread, &qos, &rel )) qos = (qos_class_t)-1;
+        for (k = 0; k < g->kinds; k++)
+            if (g->kind[k].lat == lat && g->kind[k].thr == thr && g->kind[k].qos == qos) break;
+        if (k == g->kinds && k < ARRAY_SIZE(g->kind))
+        {
+            g->kind[k].lat = lat;
+            g->kind[k].thr = thr;
+            g->kind[k].qos = qos;
+            g->kinds++;
+        }
+        if (k < g->kinds) g->kind[k].n++;
+        else g->more++;
+    }
+    for (i = 0; i < PRIO_GROUPS; i++)
+    {
+        groups[i].ns += prio_exit_ns[i];
+        groups[i].exited = prio_exit_threads[i];
+        prio_exit_ns[i] = 0;
+        prio_exit_threads[i] = 0;
+    }
+    pthread_mutex_unlock( &prio_lock );
+
+    len = snprintf( line, sizeof(line), "[VCPU-PROF] pid %d prio:", (int)getpid() );
+    for (i = 0; i < PRIO_GROUPS; i++)
+    {
+        struct prio_group *g = &groups[i];
+
+        if (!g->threads && !g->exited && !g->ns) continue;
+        total_ns += g->ns;
+        if (len >= (int)sizeof(line) - 256) continue;
+        if (i == PRIO_GROUPS - 1) len += snprintf( line + len, sizeof(line) - len, " base ?:" );
+        else len += snprintf( line + len, sizeof(line) - len, " base %d:", (int)i - 15 );
+        len += snprintf( line + len, sizeof(line) - len, " threads %u", g->threads );
+        if (g->exited) len += snprintf( line + len, sizeof(line) - len, " (+%u exited)", g->exited );
+        len += snprintf( line + len, sizeof(line) - len, " cpu %.3f s", g->ns / 1e9 );
+        if (g->threads)
+        {
+            len += snprintf( line + len, sizeof(line) - len, " [mach pri %d", g->pri_min );
+            if (g->pri_max != g->pri_min) len += snprintf( line + len, sizeof(line) - len, "-%d", g->pri_max );
+            for (k = 0; k < g->kinds; k++)
+            {
+                char lat[4], thr[4];
+
+                prio_tier_str( lat, g->kind[k].lat );
+                prio_tier_str( thr, g->kind[k].thr );
+                len += snprintf( line + len, sizeof(line) - len, "%s lat %s thr %s qos %s x%u", k ? "," : ";", lat, thr,
+                                 prio_qos_name( g->kind[k].qos ), g->kind[k].n );
+            }
+            if (g->more) len += snprintf( line + len, sizeof(line) - len, ", other x%u", g->more );
+            len += snprintf( line + len, sizeof(line) - len, "]" );
+        }
+        len += snprintf( line + len, sizeof(line) - len, " |" );
+    }
+    /* a group adds at most ~210 characters, so this always fits */
+    snprintf( line + len, sizeof(line) - len, " rest (no Windows thread) %.3f s\n", max( cpu_s - total_ns / 1e9, 0.0 ));
+    fputs( line, stderr );
 }
 
 /* PMW_VCPU_SAMPLE_MS=<ms> (diagnostic, default off; needs PMW_VCPU_PROF): a host thread kicks every thread that is
@@ -1621,6 +1863,40 @@ static void vcpu_pool_line( char *buf, size_t size )
               (unsigned long long)st.unblocks, atomic_load( &prof_threads_live ), atomic_load( &prof_threads_peak ));
 }
 
+/* PMW_VCPU_PROF: the interval's hand-offs (deltas). The pool's wait time counts every acquire, the thread-start ones
+ * too; those are not in the re-acquire rows, so "excl. waits" can come out slightly low. */
+static void vcpu_pool_time_print( double hz )
+{
+    static uint64_t last_c[3], last_t[3], last_wait_ns;
+    struct prof_bucket *b[3] = { &prof_pool_rel, &prof_pool_acq, &prof_pool_create };
+    uint64_t c[3], t[3];
+    double ms[3], wait_ms, handoff_ms;
+    vel1_pool_stats st;
+    unsigned int i;
+
+    vel1_pool_get_stats( &vcpu_pool, &st );
+    for (i = 0; i < 3; i++)
+    {
+        uint64_t nc = atomic_load_explicit( &b[i]->count, memory_order_relaxed );
+        uint64_t nt = atomic_load_explicit( &b[i]->ticks, memory_order_relaxed );
+        c[i] = nc - last_c[i];
+        t[i] = nt - last_t[i];
+        ms[i] = t[i] / hz * 1e3;
+        last_c[i] = nc;
+        last_t[i] = nt;
+    }
+    wait_ms = (st.total_wait_ns - last_wait_ns) / 1e6;
+    last_wait_ns = st.total_wait_ns;
+    handoff_ms = ms[0] + ms[2] + max( ms[1] - wait_ms, 0.0 );
+    fprintf( stderr, "[VCPU-PROF] pid %d pool time: releases %llu, %.1f ms (%.2f us avg) | re-acquires %llu: pool call "
+             "%.1f ms (%.2f us avg; pool waits %.1f ms) + create/restore %.1f ms (%.2f us avg) | hand-off excl. waits "
+             "%.1f ms = %.3f cores, %.2f us per release\n", (int)getpid(),
+             (unsigned long long)c[0], ms[0], c[0] ? ms[0] * 1e3 / c[0] : 0.0,
+             (unsigned long long)c[1], ms[1], c[1] ? ms[1] * 1e3 / c[1] : 0.0, wait_ms,
+             ms[2], c[2] ? ms[2] * 1e3 / c[2] : 0.0,
+             handoff_ms, handoff_ms / 1e3 / prof_interval, c[0] ? handoff_ms * 1e3 / c[0] : 0.0 );
+}
+
 /* wait for a slot. Every signal blocked: a thread killed while queued would leave a dead member in the FIFO */
 static void vcpu_pool_acquire( struct vcpu_thread *vt )
 {
@@ -1643,6 +1919,7 @@ static void vcpu_note_vcpu_up(void)
 static void vcpu_ensure( struct vcpu_thread *vt )
 {
     sigset_t old;
+    uint64_t t0 = 0, t1 = 0;
     int ret;
 
     if (vt->has_vcpu) return;
@@ -1651,7 +1928,9 @@ static void vcpu_ensure( struct vcpu_thread *vt )
      * vcpu_thread_exit, which releases only what a vCPU holds). Nothing may interrupt the create and restore either
      * (HVF, vel1 locks). */
     block_all_signals( &old );
+    if (prof_interval) t0 = prof_now();
     vcpu_pool_acquire( vt );
+    if (prof_interval) t1 = prof_now();
     ret = vcpu_create( &vt->vcpu, &vt->cfg );
     if (!ret) ret = vel1_ctx_restore( &vt->vcpu, &vt->ctx );
     if (ret)
@@ -1663,6 +1942,12 @@ static void vcpu_ensure( struct vcpu_thread *vt )
     }
     vt->has_vcpu = TRUE;
     vcpu_note_vcpu_up();
+    if (prof_interval)
+    {
+        uint64_t t2 = prof_now();
+        prof_add( &prof_pool_acq, t1 - t0 );
+        prof_add( &prof_pool_create, t2 - t1 );
+    }
     pthread_sigmask( SIG_SETMASK, &old, NULL );
 }
 
@@ -1670,9 +1955,11 @@ static void vcpu_ensure( struct vcpu_thread *vt )
  * always: the other order would let a waiter create while this vCPU still exists. FALSE: nothing was released */
 static BOOL vcpu_release( struct vcpu_thread *vt )
 {
+    uint64_t t0;
     int ret;
 
     if (!vt->has_vcpu || vt->hv_depth || vt->presenter) return FALSE;
+    t0 = prof_interval ? prof_now() : 0;
     if (vel1_ctx_save( &vt->vcpu, &vt->ctx )) return FALSE;
     if ((ret = vel1_vcpu_destroy( &vt->vcpu )))
     {
@@ -1683,6 +1970,7 @@ static BOOL vcpu_release( struct vcpu_thread *vt )
     vt->has_vcpu = FALSE;
     atomic_fetch_sub( &prof_vcpus_live, 1 );
     vel1_pool_release( &vcpu_pool, &vt->pool_member );
+    if (prof_interval) prof_add( &prof_pool_rel, prof_now() - t0 );
     return TRUE;
 }
 
@@ -2459,6 +2747,7 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
         while (live > peak && !atomic_compare_exchange_weak( &prof_threads_peak, &peak, live )) ;
     }
     vt->unblock_fd = ntdll_get_thread_data()->wait_fd[1];
+    if (prof_interval) prio_register( vt );  /* a server call: before the slot */
     if (vcpu_mn)
     {
         if ((ret = vel1_pool_member_init( &vcpu_pool, &vt->pool_member, 0 )))
@@ -2641,6 +2930,7 @@ void vcpu_thread_exit(void)
     int ret;
 
     if (!vcpu_mode || !(vt = vcpu_current())) return;
+    prio_unregister( vt );  /* first: every exit path below leaves the thread to die */
     if (vt->hv_depth || vel1_in_guest( &vt->vcpu ))
     {
         ERR( "thread %04x exits inside a vel1 call: its vCPU slot leaks\n", (UINT)GetCurrentThreadId() );
