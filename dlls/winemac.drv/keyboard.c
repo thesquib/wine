@@ -319,7 +319,6 @@ struct layout
 };
 
 static pthread_mutex_t layout_list_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t carbon_locale_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int macdrv_layout_list_needs_update = TRUE;
 
@@ -681,10 +680,6 @@ void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data)
 
     uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
 
-    /* CarbonCore initializes its locale list lazily and not thread-safely: two threads creating their first windows at
-     * once both ran INIT_Locales and one realloc'ed a handle the other had freed (macOS malloc: "pointer being freed was
-     * not allocated", Dune startup 2026-10-08). Serialize the whole locale/collator section. */
-    pthread_mutex_lock(&carbon_locale_mutex);
     LocaleRefFromLocaleString("POSIX", &localeRef);
     UCCreateCollator(localeRef, 0, collateOptions, &collatorRef);
     collateOptions |= kUCCollateComposeInsensitiveMask | kUCCollateWidthInsensitiveMask | kUCCollateCaseInsensitiveMask;
@@ -899,7 +894,6 @@ void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data)
     UCDisposeCollator(&collatorRef);
     UCDisposeCollator(&caseInsensitiveCollatorRef);
     UCDisposeCollator(&diacriticInsensitiveCollatorRef);
-    pthread_mutex_unlock(&carbon_locale_mutex);
 }
 
 
