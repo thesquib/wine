@@ -611,6 +611,8 @@ struct prof_bucket
 #define PROF_KINDS VEL1_EXIT__COUNT
 
 unsigned int vcpu_prof_interval;
+static int vcpu_stallpc;  /* PMW_VCPU_STALLPC, see stall_scan */
+static void stall_scan(void);
 #define prof_interval vcpu_prof_interval
 static struct prof_bucket prof_guest;
 static struct prof_bucket prof_kind[PROF_KINDS];
@@ -1005,6 +1007,7 @@ static void *prof_thread( void *arg )
         last_count[NROWS] = guest_c;
         last_ticks[NROWS] = guest_t;
         last_cpu = cpu;
+        if (vcpu_stallpc) stall_scan();
     }
     return NULL;
 }
@@ -1020,6 +1023,8 @@ static void prof_start(void)
         prof_interval = 0;
         return;
     }
+    vcpu_stallpc = (env = getenv( "PMW_VCPU_STALLPC" )) && atoi( env ) > 0;
+    if (vcpu_stallpc) fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_STALLPC on\n", (int)getpid() );
     {
         uint64_t freq;
         __asm__ volatile( "mrs %0, cntfrq_el0" : "=r" (freq) );
@@ -1062,9 +1067,73 @@ struct vcpu_thread
     struct vcpu_level  *wait_level;    /* PMW_VCPU_PROF: the level it returns to */
     unsigned int        wait_cbs;      /* PMW_VCPU_PROF: user callbacks made inside it */
     unsigned int        long_epoch;    /* PMW_VCPU_PROF: the report interval this thread last counted a long wait in */
+    struct list         stall_entry;   /* PMW_VCPU_STALLPC: in stall_threads */
+    atomic_int          stall_dump;    /* PMW_VCPU_STALLPC: the next KICK exit is the reporter's: log, re-enter */
+    uint64_t            stall_exits;   /* PMW_VCPU_STALLPC: exits at the reporter's previous tick */
+    unsigned int        stall_ticks;   /* PMW_VCPU_STALLPC: ticks in a row without an exit */
+    UINT                tid;
 };
 
 static pthread_key_t vcpu_key;
+
+/* PMW_VCPU_STALLPC=1 (diagnostic, default off; needs PMW_VCPU_PROF=<seconds>): a thread that stays inside the guest
+ * for a whole report interval (no exit at all, e.g. spinning on a flag) is invisible to everything else here. On each
+ * tick the profiler kicks such threads; the thread logs its guest registers on that KICK exit ([VCPU-STALL]) and
+ * re-enters without the suspend path. In ARM64EC code run by the emulator the registers are the emulator's; the x64
+ * context it last saved (ChpeV2CpuAreaInfo->ContextAmd64) is logged too. A Wine suspend (SIGUSR1) landing in the same
+ * KICK would be absorbed: diagnostic use only. */
+static pthread_mutex_t stall_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list stall_threads = LIST_INIT( stall_threads );
+
+static void stall_scan(void)
+{
+    struct vcpu_thread *vt;
+
+    pthread_mutex_lock( &stall_lock );
+    LIST_FOR_EACH_ENTRY( vt, &stall_threads, struct vcpu_thread, stall_entry )
+    {
+        uint64_t exits = __atomic_load_n( &vt->exits, __ATOMIC_RELAXED );
+
+        if (exits != vt->stall_exits || !vel1_in_guest( &vt->vcpu ))
+        {
+            vt->stall_exits = exits;
+            __atomic_store_n( &vt->stall_ticks, 0, __ATOMIC_RELAXED );
+            continue;
+        }
+        __atomic_add_fetch( &vt->stall_ticks, 1, __ATOMIC_RELAXED );
+        atomic_store( &vt->stall_dump, 1 );
+        vel1_kick_remote( &vt->vcpu );  /* under stall_lock: vcpu_thread_exit unlinks before the destroy */
+    }
+    pthread_mutex_unlock( &stall_lock );
+}
+
+static void stall_report( struct vcpu_thread *vt, const vel1_exit *e, const struct syscall_frame *frame )
+{
+    CHPE_V2_CPU_AREA_INFO *chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    ULONG64 pc = frame->pc & ~(ULONG64)3, page = pc & ~(ULONG64)0x3fff;
+    const UINT *code = (const UINT *)(pc - 32 < page ? page : pc - 32);
+    unsigned int i, n = (unsigned int)(((page + 0x4000) - (ULONG64)code) / 4);
+
+    fprintf( stderr, "[VCPU-STALL] pid %d thread %04x: no exit for %u interval(s): pc %#llx lr %#llx sp %#llx fp %#llx "
+             "cpsr %#x (exit elr %#llx spsr %#llx)\n", (int)getpid(), vt->tid,
+             __atomic_load_n( &vt->stall_ticks, __ATOMIC_RELAXED ), (unsigned long long)frame->pc,
+             (unsigned long long)frame->lr, (unsigned long long)frame->sp, (unsigned long long)frame->fp,
+             (UINT)frame->cpsr, (unsigned long long)e->elr, (unsigned long long)e->spsr );
+    for (i = 0; i < 29; i += 4)
+        fprintf( stderr, "[VCPU-STALL]   x%-2u %016llx %016llx %016llx %016llx\n", i,
+                 (unsigned long long)frame->x[i], (unsigned long long)frame->x[i + 1],
+                 (unsigned long long)(i + 2 < 29 ? frame->x[i + 2] : 0),
+                 (unsigned long long)(i + 3 < 29 ? frame->x[i + 3] : 0) );
+    /* the code around pc, within pc's 16K page: it is executing, so mapped and readable here (host VA == guest VA) */
+    fprintf( stderr, "[VCPU-STALL]   code at %#llx:", (unsigned long long)(ULONG_PTR)code );
+    for (i = 0; i < 16 && i < n; i++) fprintf( stderr, " %08x", code[i] );
+    fprintf( stderr, "\n" );
+    if (chpe)
+        fprintf( stderr, "[VCPU-STALL]   emulator: in simulation %u, in syscall callback %u; x64 context last saved: "
+                 "rip %#llx rsp %#llx\n", chpe->InSimulation, chpe->InSyscallCallback,
+                 chpe->ContextAmd64 ? (unsigned long long)chpe->ContextAmd64->Pc : 0ull,
+                 chpe->ContextAmd64 ? (unsigned long long)chpe->ContextAmd64->Sp : 0ull );
+}
 
 
 static void prof_wait_start( struct vcpu_thread *vt )
@@ -1941,6 +2010,13 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             vcpu_fatal_exit( vt, &e, NULL );
         }
 
+        /* PMW_VCPU_STALLPC: the reporter's kick; nothing to write back, the vCPU still holds the registers */
+        if (kind == VEL1_EXIT_KICK && vcpu_stallpc && atomic_exchange( &vt->stall_dump, 0 ))
+        {
+            stall_report( vt, &e, frame );
+            continue;
+        }
+
         /* from here to the dispatch (or the register write-back after a fault or kick) this is signal-handler work:
          * run it with what the handlers block, as they would */
         vcpu_block_signals( NULL );
@@ -2035,6 +2111,13 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     vt->has_vcpu = TRUE;
     vcpu_note_vcpu_up();
     pthread_setspecific( vcpu_key, vt );
+    vt->tid = GetCurrentThreadId();
+    if (vcpu_stallpc)
+    {
+        pthread_mutex_lock( &stall_lock );
+        list_add_tail( &stall_threads, &vt->stall_entry );
+        pthread_mutex_unlock( &stall_lock );
+    }
     atomic_store( &vt->in_syscall, 1 );
     vcpu_store_full( vt, frame );
     vcpu_note_entered();  /* before the first vel1_run: from now on gmm's TLBIs are real */
@@ -2201,6 +2284,12 @@ void vcpu_thread_exit(void)
         sigset_t all;  /* the thread is exiting: nothing may interrupt the destroy (vel1 locks, HVF) */
         sigfillset( &all );
         pthread_sigmask( SIG_BLOCK, &all, NULL );
+    }
+    if (vcpu_stallpc)
+    {
+        pthread_mutex_lock( &stall_lock );
+        list_remove( &vt->stall_entry );
+        pthread_mutex_unlock( &stall_lock );
     }
     pthread_setspecific( vcpu_key, NULL );
     atomic_fetch_sub( &prof_threads_live, 1 );
