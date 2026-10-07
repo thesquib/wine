@@ -613,6 +613,9 @@ struct prof_bucket
 unsigned int vcpu_prof_interval;
 static int vcpu_stallpc;  /* PMW_VCPU_STALLPC, see stall_scan */
 static void stall_scan(void);
+static unsigned int vcpu_sample_ms;  /* PMW_VCPU_SAMPLE_MS, see sample_thread */
+static void sample_report(void);
+static void *sample_thread( void *arg );
 static void stall_parse_dumps( const char *env );
 static unsigned int stall_stack_bytes;  /* PMW_VCPU_STALLPC_STACK, see stall_scan_stack */
 #define prof_interval vcpu_prof_interval
@@ -1010,6 +1013,7 @@ static void *prof_thread( void *arg )
         last_ticks[NROWS] = guest_t;
         last_cpu = cpu;
         if (vcpu_stallpc) stall_scan();
+        if (vcpu_sample_ms) sample_report();
     }
     return NULL;
 }
@@ -1027,6 +1031,18 @@ static void prof_start(void)
     }
     vcpu_stallpc = (env = getenv( "PMW_VCPU_STALLPC" )) && atoi( env ) > 0;
     if (vcpu_stallpc) stall_parse_dumps( getenv( "PMW_VCPU_STALLPC_DUMP" ));
+    if ((env = getenv( "PMW_VCPU_SAMPLE_MS" )) && atoi( env ) > 0)
+    {
+        pthread_t sampler;
+        sigset_t sampler_old;
+
+        vcpu_sample_ms = atoi( env );
+        fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_SAMPLE_MS=%u\n", (int)getpid(), vcpu_sample_ms );
+        block_all_signals( &sampler_old );
+        if (!pthread_create( &sampler, NULL, sample_thread, NULL )) pthread_detach( sampler );
+        else vcpu_sample_ms = 0;
+        pthread_sigmask( SIG_SETMASK, &sampler_old, NULL );
+    }
     if (vcpu_stallpc && (env = getenv( "PMW_VCPU_STALLPC_STACK" )))
         stall_stack_bytes = min( (unsigned int)strtoul( env, NULL, 0 ), 0x100000u ) & ~7u;
     if (vcpu_stallpc) fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_STALLPC on\n", (int)getpid() );
@@ -1076,6 +1092,8 @@ struct vcpu_thread
     atomic_int          stall_dump;    /* PMW_VCPU_STALLPC: the next KICK exit is the reporter's: log, re-enter */
     uint64_t            stall_exits;   /* PMW_VCPU_STALLPC: exits at the reporter's previous tick */
     unsigned int        stall_ticks;   /* PMW_VCPU_STALLPC: ticks in a row without an exit */
+    atomic_int          sample_req;    /* PMW_VCPU_SAMPLE_MS: the next KICK exit records this thread's pc */
+    atomic_int          signal_kick;   /* a signal handler kicked: that KICK is never the diagnostics' to absorb */
     UINT                tid;
 };
 
@@ -1298,6 +1316,95 @@ static void stall_scan(void)
         vel1_kick_remote( &vt->vcpu );  /* under stall_lock: vcpu_thread_exit unlinks before the destroy */
     }
     pthread_mutex_unlock( &stall_lock );
+}
+
+/* PMW_VCPU_SAMPLE_MS=<ms> (diagnostic, default off; needs PMW_VCPU_PROF): a host thread kicks every thread that is
+ * in the guest every <ms>; on that KICK exit the thread records its pc (bucketed by 4K page) and whether it was inside
+ * the ARM64EC emulator (FEX) or in native ARM64EC code, then re-enters. Each PROF interval prints the hottest pages
+ * ([VCPU-SAMPLE]); map them with the +loaddll bases in the log. Threads parked in host waits are not sampled (they
+ * are not burning CPU). */
+#define SAMPLE_BUCKETS 4096
+static struct { ULONG64 page; unsigned int count, sim; } sample_table[SAMPLE_BUCKETS];
+static unsigned int sample_total, sample_sim, sample_dropped;
+static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void sample_record( const struct syscall_frame *frame )
+{
+    CHPE_V2_CPU_AREA_INFO *chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    BOOL sim = chpe && chpe->InSimulation;
+    ULONG64 page = frame->pc >> 12;
+    unsigned int i, h = (unsigned int)((page * 0x9e3779b97f4a7c15ull) >> 52);
+
+    pthread_mutex_lock( &sample_lock );
+    sample_total++;
+    if (sim) sample_sim++;
+    for (i = 0; i < 64; i++, h = (h + 1) % SAMPLE_BUCKETS)
+    {
+        if (sample_table[h].count && sample_table[h].page != page) continue;
+        sample_table[h].page = page;
+        sample_table[h].count++;
+        if (sim) sample_table[h].sim++;
+        break;
+    }
+    if (i == 64) sample_dropped++;
+    pthread_mutex_unlock( &sample_lock );
+}
+
+static int sample_cmp( const void *a, const void *b )
+{
+    unsigned int ca = *(const unsigned int *)((const char *)a + sizeof(ULONG64));
+    unsigned int cb = *(const unsigned int *)((const char *)b + sizeof(ULONG64));
+    return ca < cb ? 1 : ca > cb ? -1 : 0;
+}
+
+static void sample_report(void)
+{
+    static __typeof__(sample_table) copy;
+    unsigned int total, sim, dropped, i, n = 0;
+    char line[1024];
+    int len = 0;
+
+    pthread_mutex_lock( &sample_lock );
+    memcpy( copy, sample_table, sizeof(copy) );
+    memset( sample_table, 0, sizeof(sample_table) );
+    total = sample_total; sim = sample_sim; dropped = sample_dropped;
+    sample_total = sample_sim = sample_dropped = 0;
+    pthread_mutex_unlock( &sample_lock );
+    if (!total) return;
+
+    for (i = 0; i < SAMPLE_BUCKETS; i++) if (copy[i].count) copy[n++] = copy[i];
+    qsort( copy, n, sizeof(copy[0]), sample_cmp );
+    fprintf( stderr, "[VCPU-SAMPLE] pid %d %u samples (%.1f%% inside the emulator, %u not bucketed), %u pages; top:\n",
+             (int)getpid(), total, 100.0 * sim / total, dropped, n );
+    for (i = 0; i < n && i < 40; i++)
+    {
+        len += snprintf( line + len, sizeof(line) - len, " %#llx000 %.1f%%%s", (unsigned long long)copy[i].page,
+                         100.0 * copy[i].count / total, copy[i].sim * 2 > copy[i].count ? "e" : "" );
+        if (i % 6 == 5 || i + 1 == n || i == 39)
+        {
+            fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
+            len = 0;
+        }
+    }
+}
+
+static void *sample_thread( void *arg )
+{
+    struct vcpu_thread *vt;
+
+    for (;;)
+    {
+        usleep( vcpu_sample_ms * 1000 );
+        pthread_mutex_lock( &stall_lock );
+        LIST_FOR_EACH_ENTRY( vt, &stall_threads, struct vcpu_thread, stall_entry )
+        {
+            if (!vel1_in_guest( &vt->vcpu )) continue;
+            atomic_store( &vt->sample_req, 1 );
+            vel1_kick_remote( &vt->vcpu );
+        }
+        pthread_mutex_unlock( &stall_lock );
+    }
+    return NULL;
 }
 
 static void stall_report( struct vcpu_thread *vt, const vel1_exit *e, const struct syscall_frame *frame )
@@ -2205,11 +2312,23 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             vcpu_fatal_exit( vt, &e, NULL );
         }
 
-        /* PMW_VCPU_STALLPC: the reporter's kick; nothing to write back, the vCPU still holds the registers */
-        if (kind == VEL1_EXIT_KICK && vcpu_stallpc && atomic_exchange( &vt->stall_dump, 0 ))
+        /* PMW_VCPU_STALLPC / PMW_VCPU_SAMPLE_MS: a diagnostics kick; nothing to write back, the vCPU still holds
+         * the registers. A kick a signal handler also asked for goes on to the normal path below. */
+        if (kind == VEL1_EXIT_KICK && (vcpu_stallpc || vcpu_sample_ms))
         {
-            stall_report( vt, &e, frame );
-            continue;
+            BOOL mine = FALSE;
+
+            if (vcpu_sample_ms && atomic_exchange( &vt->sample_req, 0 ))
+            {
+                sample_record( frame );
+                mine = TRUE;
+            }
+            if (vcpu_stallpc && atomic_exchange( &vt->stall_dump, 0 ))
+            {
+                stall_report( vt, &e, frame );
+                mine = TRUE;
+            }
+            if (mine && !atomic_load( &vt->signal_kick )) continue;
         }
 
         /* from here to the dispatch (or the register write-back after a fault or kick) this is signal-handler work:
@@ -2221,6 +2340,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         if (vel1_kick_take( &vt->vcpu ) || kind == VEL1_EXIT_KICK)
         {
             vt->kicks++;
+            atomic_store( &vt->signal_kick, 0 );
             if (!atomic_load( &vt->quit ))
                 vcpu_suspend( frame, kind == VEL1_EXIT_SYSCALL || kind == VEL1_EXIT_UNIX_CALL );
         }
@@ -2307,7 +2427,7 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     vcpu_note_vcpu_up();
     pthread_setspecific( vcpu_key, vt );
     vt->tid = GetCurrentThreadId();
-    if (vcpu_stallpc)
+    if (vcpu_stallpc || vcpu_sample_ms)
     {
         pthread_mutex_lock( &stall_lock );
         list_add_tail( &stall_threads, &vt->stall_entry );
@@ -2434,6 +2554,7 @@ BOOL vcpu_signal_kick( BOOL quit )
     if (!vt) return FALSE;
     if (quit) atomic_store( &vt->quit, 1 );
     if (atomic_load( &vt->in_syscall )) return FALSE;
+    atomic_store( &vt->signal_kick, 1 );
     if (vel1_kick_self( &vt->vcpu ) == VEL1_KICK_SIGNAL_FAILED)
     {
         /* the kick stays pending in vel1 (D8); the loop will see it at its next entry. In a signal handler: no ERR */
@@ -2480,7 +2601,7 @@ void vcpu_thread_exit(void)
         sigfillset( &all );
         pthread_sigmask( SIG_BLOCK, &all, NULL );
     }
-    if (vcpu_stallpc)
+    if (vcpu_stallpc || vcpu_sample_ms)
     {
         pthread_mutex_lock( &stall_lock );
         list_remove( &vt->stall_entry );
