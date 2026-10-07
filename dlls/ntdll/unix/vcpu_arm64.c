@@ -1324,7 +1324,7 @@ static void stall_scan(void)
  * ([VCPU-SAMPLE]); map them with the +loaddll bases in the log. Threads parked in host waits are not sampled (they
  * are not burning CPU). */
 #define SAMPLE_BUCKETS 4096
-static struct { ULONG64 page; unsigned int count, sim; ULONG64 last_pc; } sample_table[SAMPLE_BUCKETS];
+static struct { ULONG64 page; unsigned int count, sim; ULONG64 last_pc; ULONG64 last_x[31]; } sample_table[SAMPLE_BUCKETS];
 static unsigned int sample_total, sample_sim, sample_dropped;
 static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -1344,6 +1344,9 @@ static void sample_record( const struct syscall_frame *frame )
         sample_table[h].page = page;
         sample_table[h].count++;
         sample_table[h].last_pc = frame->pc;
+        memcpy( sample_table[h].last_x, frame->x, 29 * sizeof(ULONG64) );
+        sample_table[h].last_x[29] = frame->fp;
+        sample_table[h].last_x[30] = frame->lr;
         if (sim) sample_table[h].sim++;
         break;
     }
@@ -1402,6 +1405,15 @@ static void sample_report(void)
                         (unsigned long long)pc );
         for (j = 0; j < got / 4; j++) len += snprintf( line + len, sizeof(line) - len, " %08x", code[j] );
         fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
+        /* the registers of that sample: a loop's bounds and counters (e.g. a spin threshold) */
+        for (j = 0; j < 31; j += 8)
+        {
+            unsigned int r;
+            len = snprintf( line, sizeof(line), "  regs x%u-x%u:", j, min( j + 7, 30 ) );
+            for (r = j; r < j + 8 && r < 31; r++)
+                len += snprintf( line + len, sizeof(line) - len, " %llx", (unsigned long long)copy[i].last_x[r] );
+            fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
+        }
     }
 }
 
