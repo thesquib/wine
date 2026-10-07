@@ -356,6 +356,7 @@ typedef struct macdrv_event {
         struct {
             int             button;
             bool            pressed;
+            bool            disassociated;  /* x,y are the frozen macOS pointer, not where Wine's cursor is */
             int             x;
             int             y;
             unsigned long   time_ms;
