@@ -2445,6 +2445,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 pt = cgpoint_win_from_mac(pt);
 
                 event = macdrv_create_event(MOUSE_SCROLL, window);
+                event->mouse_scroll.disassociated = macdrv_mouse_disassociated;
                 event->mouse_scroll.x = floor(pt.x);
                 event->mouse_scroll.y = floor(pt.y);
                 event->mouse_scroll.time_ms = [self ticksForEventTime:[theEvent timestamp]];

@@ -370,6 +370,7 @@ typedef struct macdrv_event {
         struct {
             int             x_scroll;
             int             y_scroll;
+            bool            disassociated;  /* x,y are the frozen macOS pointer, as for mouse_button */
             int             x;
             int             y;
             unsigned long   time_ms;
