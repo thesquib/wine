@@ -917,9 +917,16 @@ void macdrv_mouse_button(HWND hwnd, const macdrv_event *event)
         }
     }
 
-    send_mouse_input(hwnd, event->window, flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
-                     event->mouse_button.x, event->mouse_button.y,
-                     data, FALSE, event->mouse_button.time_ms);
+    /* FPS mode (pointer disassociated): the macOS location is where the pointer froze when the game took the mouse,
+     * not where Wine's cursor has moved since through relative motion. An absolute move to it would jump the cursor
+     * on every click (DOOM-style and UE mouse-look turn to face that spot), so send the button alone, at Wine's
+     * cursor, as a Windows mouse does. */
+    if (event->mouse_button.disassociated)
+        send_mouse_input(hwnd, event->window, flags, 0, 0, data, FALSE, event->mouse_button.time_ms);
+    else
+        send_mouse_input(hwnd, event->window, flags | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE,
+                         event->mouse_button.x, event->mouse_button.y,
+                         data, FALSE, event->mouse_button.time_ms);
 }
 
 

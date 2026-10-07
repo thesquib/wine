@@ -2357,6 +2357,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 event = macdrv_create_event(MOUSE_BUTTON, window);
                 event->mouse_button.button = [theEvent buttonNumber];
                 event->mouse_button.pressed = pressed;
+                event->mouse_button.disassociated = macdrv_mouse_disassociated;
                 event->mouse_button.x = floor(pt.x);
                 event->mouse_button.y = floor(pt.y);
                 event->mouse_button.time_ms = [self ticksForEventTime:[theEvent timestamp]];
