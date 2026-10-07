@@ -150,6 +150,12 @@ static void send_mouse_input(HWND hwnd, macdrv_window cocoa_window, UINT flags, 
         SERVER_END_REQ;
     }
 
+    /* Without MOUSEEVENTF_MOVE Windows ignores dx/dy, but wineserver copies them into the raw input packet
+     * (lLastX/lLastY, as relative motion when ABSOLUTE is not set), so a wheel or FPS-mode button event carrying
+     * the pointer's coordinates turned a raw-input camera by hundreds of pixels (Dune, aiming at the floor on
+     * every scroll step). */
+    if (!(flags & MOUSEEVENTF_MOVE)) x = y = 0;
+
     input.type              = INPUT_MOUSE;
     input.mi.dx             = x;
     input.mi.dy             = y;
