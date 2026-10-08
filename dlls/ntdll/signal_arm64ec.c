@@ -1439,6 +1439,14 @@ static void __attribute__((used)) unwind_entry_thunk( CONTEXT *context )
 static void __attribute__((used)) capture_context( CONTEXT *context, UINT cpsr, UINT fpcr, UINT fpsr )
 {
     context->ContextFlags = CONTEXT_AMD64_FULL;
+    /* PMW: x64 RtlCaptureContext stores the selectors (signal_x86_64.c does); without them RaiseException handed
+     * x64 handlers stale stack (cs e6a0 ss 04f7 in nProtect GameMon64's vectored handler, 2026-10-09). The
+     * debug and home registers are zeroed so no stale stack shows there either. */
+    context->SegCs = 0x33;
+    context->SegDs = context->SegEs = context->SegGs = context->SegSs = 0x2b;
+    context->SegFs = 0x53;
+    context->Dr0 = context->Dr1 = context->Dr2 = context->Dr3 = context->Dr6 = context->Dr7 = 0;
+    context->P1Home = context->P2Home = context->P3Home = context->P4Home = context->P5Home = context->P6Home = 0;
     context->EFlags = cpsr_to_eflags( cpsr );
     context->MxCsr = fpcsr_to_mxcsr( fpcr, fpsr );
     context->FltSave.ControlWord = 0x27f;
