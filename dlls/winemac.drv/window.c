@@ -1788,8 +1788,12 @@ UINT macdrv_ShowWindow(HWND hwnd, INT cmd, RECT *rect, UINT swp)
     if (!thread_data->current_event || thread_data->current_event->window != data->cocoa_window)
         goto done;
 
-    if (thread_data->current_event->type != WINDOW_FRAME_CHANGED &&
-        thread_data->current_event->type != WINDOW_DID_UNMINIMIZE)
+    /* Not on WINDOW_DID_UNMINIMIZE: Cocoa restores the frame the window had, which is the restore rect win32u
+     * already computed, but in raw coordinates, and data->rects still holds the minimized geometry, so the
+     * visible->window conversion below is wrong too. Returning it made a fullscreen game in an emulated display
+     * mode (Wolfenstein II at 1280x720 on a 1512x982 screen) come back with the mode scale applied twice
+     * (1786x1160), which macOS clamped to 1512x916, and the game recreated its Vulkan surface every frame. */
+    if (thread_data->current_event->type != WINDOW_FRAME_CHANGED)
         goto done;
 
     macdrv_get_cocoa_window_frame(data->cocoa_window, &frame);
