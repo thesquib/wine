@@ -1338,6 +1338,11 @@ void *macdrv_save_metal_layer_delegate(void *layer_ptr)
          * crashed in objc_retain. Skipping restore eliminates the race. */
         CAMetalLayer *layer = (CAMetalLayer *)layer_ptr;
         layer.delegate = nil;
+        /* Bug (Proton macOS) 2026-10-08: this runs on the app's Vulkan thread, which never turns a run loop, so the
+         * implicit CATransaction the change opened was never committed and held every surface's layer (and its last
+         * drawable) for the life of the thread: ~one image per VkSurfaceKHR (vkchurntest; Wolfenstein II's Alt-Tab
+         * recreate storm reached 39 GB). Commit it here. */
+        [CATransaction flush];
         return NULL;
     }
 }
@@ -4693,9 +4698,31 @@ __attribute__((visibility("default")))
 void macdrv_view_release_metal_view(macdrv_metal_view v)
 {
     WineMetalView* view = (WineMetalView*)v;
+    /* Bug (Proton macOS) 2026-10-08: every destroyed VkSurfaceKHR leaves ~one presented image of Metal memory
+     * behind (vkchurntest, proton-darwin mac/vcpu/vktest), i.e. its CAMetalLayer outlives the view. Default-off
+     * probe: hold the layer one second past the view's release and report who else still retains it. */
+    static int trace = -1;
+    if (trace == -1)
+    {
+        const char *e = getenv("PMW_WINEMAC_LAYER_TRACE");
+        trace = e && e[0] && strcmp(e, "0");
+    }
     OnMainThread(^{
+        CALayer *layer = trace ? [view.layer retain] : nil;
+        if (layer)
+            fprintf(stderr, "winemac:LAYER-TRACE release view=%p rc=%lu layer=%p rc=%lu (incl. ours) superlayer=%p "
+                    "superview=%p delegate=%p contents=%p\n", view, (unsigned long)[view retainCount], layer,
+                    (unsigned long)[layer retainCount], layer.superlayer, view.superview, layer.delegate,
+                    layer.contents);
         [view removeFromSuperview];
         [view release];
+        if (layer)
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                fprintf(stderr, "winemac:LAYER-TRACE +1s layer=%p rc=%lu (incl. ours) superlayer=%p delegate=%p "
+                        "contents=%p\n", layer, (unsigned long)[layer retainCount], layer.superlayer,
+                        layer.delegate, layer.contents);
+                [layer release];
+            });
     });
 }
 
