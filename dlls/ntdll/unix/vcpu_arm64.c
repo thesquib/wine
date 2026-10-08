@@ -220,6 +220,33 @@ static int vcpu_create( vel1_vcpu *v, vel1_vcpu_cfg *cfg )
 
 
 /***********************************************************************
+ * PMW_VCPU_TEST_DROP_ENTSO=1 (test only, openrosetta relay 2026-10-08): an hv ops table whose set_sys_reg drops
+ * ACTLR_EL1 writes (HV_SUCCESS without calling HVF) and passes every other register through, so EnTSO does not read
+ * back and vcpu_create's NO_ENTSO fallback runs on a Mac that has EnTSO.
+ */
+static const vel1_hv_ops *drop_entso_live;
+static vel1_hv_ops drop_entso_ops;
+
+static int32_t drop_entso_set_sys_reg( uint64_t id, uint16_t reg, uint64_t v )
+{
+    if (reg == HV_SYS_REG_ACTLR_EL1) return HV_SUCCESS;
+    return drop_entso_live->set_sys_reg( id, reg, v );
+}
+
+static const vel1_hv_ops *vcpu_hv_ops(void)
+{
+    const char *env = getenv( "PMW_VCPU_TEST_DROP_ENTSO" );
+
+    if (!env || strcmp( env, "1" )) return vel1_hv_live_ops();
+    drop_entso_live = vel1_hv_live_ops();
+    drop_entso_ops = *drop_entso_live;
+    drop_entso_ops.set_sys_reg = drop_entso_set_sys_reg;
+    fprintf( stderr, "wine: vCPU mode: PMW_VCPU_TEST_DROP_ENTSO=1: ACTLR_EL1 writes are dropped (test)\n" );
+    return &drop_entso_ops;
+}
+
+
+/***********************************************************************
  * gmm stage-2 backend
  */
 static uint32_t s2_map( void *host, uint64_t ipa, size_t size, int perm )
@@ -2993,7 +3020,7 @@ void vcpu_init_process(void)
     if (pthread_key_create( &vcpu_key, NULL )) vcpu_fatal( "pthread_key_create failed\n" );
 
     block_all_signals( &old );  /* the kicker thread inherits this */
-    ret = vel1_vm_create( vel1_hv_live_ops(), VCPU_IPA_BITS, &info );
+    ret = vel1_vm_create( vcpu_hv_ops(), VCPU_IPA_BITS, &info );
     pthread_sigmask( SIG_SETMASK, &old, NULL );
     if (ret) vcpu_fatal( "vel1_vm_create(%u-bit IPA): %d (hv %#x, max %u)\n", VCPU_IPA_BITS, ret, info.hv_err,
                          info.max_ipa_bits );
