@@ -93,7 +93,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(winsock);
 
-#define u64_to_user_ptr(u) ((void *)(uintptr_t)(u))
+/* PMW_VCPU: a 32-bit ws2_32 stores 32-bit ADDRESSES in the afd ioctls' 64-bit pointer fields (sendmsg, recvmsg,
+ * transmitfile), so a WoW64 caller's value is widened like any ULongToPtr (send failed WSAEFAULT, 2026-10-09). */
+static inline void *u64_to_user_ptr( ULONG64 u )
+{
+#ifdef _WIN64
+    if (u && u <= 0xffffffff && in_wow64_call()) return wow64_ptr( (ULONG)u );
+#endif
+    return (void *)(uintptr_t)u;
+}
 
 union unix_sockaddr
 {

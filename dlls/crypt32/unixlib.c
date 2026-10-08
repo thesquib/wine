@@ -710,6 +710,8 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 #ifdef _WIN64
 
+/* PMW_VCPU: every ULongToPtr below took a 32-bit caller ADDRESS; wow64_host_ptr widens it (host BASE + p in a vCPU-mode
+ * WoW64 process). 32-bit WinINet/WinHTTP TLS needs it, 2026-10-09. */
 typedef ULONG PTR32;
 
 typedef struct
@@ -727,13 +729,13 @@ static NTSTATUS wow64_open_cert_store( void *args )
         PTR32 data_ret;
     } const *params32 = args;
 
-    const CRYPT_DATA_BLOB32 *pfx32 = ULongToPtr( params32->pfx );
-    CRYPT_DATA_BLOB pfx = { pfx32->cbData, ULongToPtr( pfx32->pbData ) };
+    const CRYPT_DATA_BLOB32 *pfx32 = wow64_host_ptr( params32->pfx );
+    CRYPT_DATA_BLOB pfx = { pfx32->cbData, wow64_host_ptr( pfx32->pbData ) };
     struct open_cert_store_params params =
     {
         &pfx,
-        ULongToPtr( params32->password ),
-        ULongToPtr( params32->data_ret )
+        wow64_host_ptr( params32->password ),
+        wow64_host_ptr( params32->data_ret )
     };
 
     return open_cert_store( &params );
@@ -751,8 +753,8 @@ static NTSTATUS wow64_import_store_key( void *args )
     struct import_store_key_params params =
     {
         params32->data,
-        ULongToPtr( params32->buf ),
-        ULongToPtr( params32->buf_size )
+        wow64_host_ptr( params32->buf ),
+        wow64_host_ptr( params32->buf_size )
     };
 
     return import_store_key( &params );
@@ -772,8 +774,8 @@ static NTSTATUS wow64_import_store_cert( void *args )
     {
         params32->data,
         params32->index,
-        ULongToPtr( params32->buf ),
-        ULongToPtr( params32->buf_size )
+        wow64_host_ptr( params32->buf ),
+        wow64_host_ptr( params32->buf_size )
     };
 
     return import_store_cert( &params );
@@ -790,9 +792,9 @@ static NTSTATUS wow64_enum_root_certs( void *args )
 
     struct enum_root_certs_params params =
     {
-        ULongToPtr( params32->buffer ),
+        wow64_host_ptr( params32->buffer ),
         params32->size,
-        ULongToPtr( params32->needed )
+        wow64_host_ptr( params32->needed )
     };
 
     return enum_root_certs( &params );

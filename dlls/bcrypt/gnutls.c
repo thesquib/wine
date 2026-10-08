@@ -3748,6 +3748,8 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 #ifdef _WIN64
 
+/* PMW_VCPU: every ULongToPtr below took a 32-bit caller ADDRESS; wow64_host_ptr widens it (host BASE + p in a vCPU-mode
+ * WoW64 process). 32-bit WinINet/WinHTTP TLS needs it, 2026-10-09. */
 typedef ULONG PTR32;
 
 struct key_symmetric32
@@ -3814,17 +3816,17 @@ static union padding *get_padding( union padding32 *padding32, union padding *pa
     switch (flags)
     {
     case BCRYPT_PAD_OAEP:
-        padding->oaep.pszAlgId = ULongToPtr( padding32->oaep.pszAlgId );
-        padding->oaep.pbLabel = ULongToPtr( padding32->oaep.pbLabel );
+        padding->oaep.pszAlgId = wow64_host_ptr( padding32->oaep.pszAlgId );
+        padding->oaep.pbLabel = wow64_host_ptr( padding32->oaep.pbLabel );
         padding->oaep.cbLabel = padding32->oaep.cbLabel;
         return padding;
 
     case BCRYPT_PAD_PKCS1:
-        padding->pkcs1.pszAlgId = ULongToPtr( padding32->pkcs1.pszAlgId );
+        padding->pkcs1.pszAlgId = wow64_host_ptr( padding32->pkcs1.pszAlgId );
         return padding;
 
     case BCRYPT_PAD_PSS:
-        padding->pss.pszAlgId = ULongToPtr( padding32->pss.pszAlgId );
+        padding->pss.pszAlgId = wow64_host_ptr( padding32->pss.pszAlgId );
         padding->pss.cbSalt = padding32->pss.cbSalt;
         return padding;
 
@@ -3841,9 +3843,9 @@ static struct key *get_symmetric_key( struct key32 *key32, struct key *key )
     memcpy( key->private, key32->private, sizeof(key->private) );
     key->u.s.mode       = key32->u.s.mode;
     key->u.s.block_size = key32->u.s.block_size;
-    key->u.s.vector     = ULongToPtr(key32->u.s.vector);
+    key->u.s.vector     = wow64_host_ptr(key32->u.s.vector);
     key->u.s.vector_len = key32->u.s.vector_len;
-    key->u.s.secret     = ULongToPtr(key32->u.s.secret);
+    key->u.s.secret     = wow64_host_ptr(key32->u.s.secret);
     key->u.s.secret_len = key32->u.s.secret_len;
     return key;
 }
@@ -3895,11 +3897,11 @@ static NTSTATUS wow64_key_symmetric_set_auth_data( void *args )
 
     NTSTATUS ret;
     struct key key;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_symmetric_set_auth_data_params params =
     {
         get_symmetric_key( key32, &key ),
-        ULongToPtr(params32->auth_data),
+        wow64_host_ptr(params32->auth_data),
         params32->len
     };
 
@@ -3921,13 +3923,13 @@ static NTSTATUS wow64_key_symmetric_encrypt( void *args )
 
     NTSTATUS ret;
     struct key key;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_symmetric_encrypt_params params =
     {
         get_symmetric_key( key32, &key ),
-        ULongToPtr(params32->input),
+        wow64_host_ptr(params32->input),
         params32->input_len,
-        ULongToPtr(params32->output),
+        wow64_host_ptr(params32->output),
         params32->output_len
     };
 
@@ -3949,13 +3951,13 @@ static NTSTATUS wow64_key_symmetric_decrypt( void *args )
 
     NTSTATUS ret;
     struct key key;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_symmetric_decrypt_params params =
     {
         get_symmetric_key( key32, &key ),
-        ULongToPtr(params32->input),
+        wow64_host_ptr(params32->input),
         params32->input_len,
-        ULongToPtr(params32->output),
+        wow64_host_ptr(params32->output),
         params32->output_len
     };
 
@@ -3975,11 +3977,11 @@ static NTSTATUS wow64_key_symmetric_get_tag( void *args )
 
     NTSTATUS ret;
     struct key key;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_symmetric_get_tag_params params =
     {
         get_symmetric_key( key32, &key ),
-        ULongToPtr(params32->tag),
+        wow64_host_ptr(params32->tag),
         params32->len
     };
 
@@ -4024,16 +4026,16 @@ static NTSTATUS wow64_key_asymmetric_decrypt( void *args )
     NTSTATUS ret;
     struct key key;
     union padding padding;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_asymmetric_decrypt_params params =
     {
         get_asymmetric_key( key32, &key ),
-        ULongToPtr(params32->input),
+        wow64_host_ptr(params32->input),
         params32->input_len,
-        get_padding( ULongToPtr(params32->padding), &padding, params32->flags ),
-        ULongToPtr(params32->output),
+        get_padding( wow64_host_ptr(params32->padding), &padding, params32->flags ),
+        wow64_host_ptr(params32->output),
         params32->output_len,
-        ULongToPtr(params32->ret_len),
+        wow64_host_ptr(params32->ret_len),
         params32->flags
     };
 
@@ -4059,16 +4061,16 @@ static NTSTATUS wow64_key_asymmetric_encrypt( void *args )
     NTSTATUS ret;
     struct key key;
     union padding padding;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_asymmetric_encrypt_params params =
     {
         get_asymmetric_key( key32, &key ),
-        ULongToPtr(params32->input),
+        wow64_host_ptr(params32->input),
         params32->input_len,
-        get_padding( ULongToPtr(params32->padding), &padding, params32->flags ),
-        ULongToPtr(params32->output),
+        get_padding( wow64_host_ptr(params32->padding), &padding, params32->flags ),
+        wow64_host_ptr(params32->output),
         params32->output_len,
-        ULongToPtr(params32->ret_len),
+        wow64_host_ptr(params32->ret_len),
         params32->flags
     };
 
@@ -4087,8 +4089,8 @@ static NTSTATUS wow64_key_asymmetric_duplicate( void *args )
 
     NTSTATUS ret;
     struct key key_orig, key_copy;
-    struct key32 *key_orig32 = ULongToPtr( params32->key_orig );
-    struct key32 *key_copy32 = ULongToPtr( params32->key_copy );
+    struct key32 *key_orig32 = wow64_host_ptr( params32->key_orig );
+    struct key32 *key_copy32 = wow64_host_ptr( params32->key_copy );
     struct key_asymmetric_duplicate_params params =
     {
         get_asymmetric_key( key_orig32, &key_orig ),
@@ -4117,16 +4119,16 @@ static NTSTATUS wow64_key_asymmetric_sign( void *args )
     NTSTATUS ret;
     struct key key;
     union padding padding;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_asymmetric_sign_params params =
     {
         get_asymmetric_key( key32, &key ),
-        get_padding(ULongToPtr( params32->padding ), &padding, params32->flags),
-        ULongToPtr(params32->input),
+        get_padding(wow64_host_ptr( params32->padding ), &padding, params32->flags),
+        wow64_host_ptr(params32->input),
         params32->input_len,
-        ULongToPtr(params32->output),
+        wow64_host_ptr(params32->output),
         params32->output_len,
-        ULongToPtr(params32->ret_len),
+        wow64_host_ptr(params32->ret_len),
         params32->flags
     };
 
@@ -4151,14 +4153,14 @@ static NTSTATUS wow64_key_asymmetric_verify( void *args )
     NTSTATUS ret;
     struct key key;
     union padding padding;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_asymmetric_verify_params params =
     {
         get_asymmetric_key( key32, &key ),
-        get_padding(ULongToPtr( params32->padding ), &padding, params32->flags),
-        ULongToPtr(params32->hash),
+        get_padding(wow64_host_ptr( params32->padding ), &padding, params32->flags),
+        wow64_host_ptr(params32->hash),
         params32->hash_len,
-        ULongToPtr(params32->signature),
+        wow64_host_ptr(params32->signature),
         params32->signature_len,
         params32->flags
     };
@@ -4189,14 +4191,14 @@ static NTSTATUS wow64_key_asymmetric_export( void *args )
 
     NTSTATUS ret;
     struct key key;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_asymmetric_export_params params =
     {
         get_asymmetric_key( key32, &key ),
         params32->flags,
-        ULongToPtr(params32->buf),
+        wow64_host_ptr(params32->buf),
         params32->len,
-        ULongToPtr(params32->ret_len),
+        wow64_host_ptr(params32->ret_len),
     };
 
     ret = key_asymmetric_export( &params );
@@ -4216,12 +4218,12 @@ static NTSTATUS wow64_key_asymmetric_import( void *args )
 
     NTSTATUS ret;
     struct key key;
-    struct key32 *key32 = ULongToPtr( params32->key );
+    struct key32 *key32 = wow64_host_ptr( params32->key );
     struct key_asymmetric_import_params params =
     {
         get_asymmetric_key( key32, &key ),
         params32->flags,
-        ULongToPtr(params32->buf),
+        wow64_host_ptr(params32->buf),
         params32->len
     };
 
@@ -4243,15 +4245,15 @@ static NTSTATUS wow64_key_asymmetric_derive_key( void *args )
 
     NTSTATUS ret;
     struct key privkey, pubkey;
-    struct key32 *privkey32 = ULongToPtr( params32->privkey );
-    struct key32 *pubkey32 = ULongToPtr( params32->pubkey );
+    struct key32 *privkey32 = wow64_host_ptr( params32->privkey );
+    struct key32 *pubkey32 = wow64_host_ptr( params32->pubkey );
     struct key_asymmetric_derive_key_params params =
     {
         get_asymmetric_key( privkey32, &privkey ),
         get_asymmetric_key( pubkey32, &pubkey ),
-        ULongToPtr(params32->output),
+        wow64_host_ptr(params32->output),
         params32->output_len,
-        ULongToPtr(params32->ret_len),
+        wow64_host_ptr(params32->ret_len),
     };
 
     ret = key_asymmetric_derive_key( &params );

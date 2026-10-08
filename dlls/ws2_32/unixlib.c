@@ -1206,6 +1206,9 @@ static NTSTATUS put_hostent32( const struct WS_hostent *host, struct WS_hostent3
 }
 
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process). The PtrToUlong write-backs in put_addrinfo32/put_hostent32 stay: BASE is 4 GiB aligned, so the low
+ * 32 bits of a host pointer into the caller's buffer are its guest address. */
 static NTSTATUS wow64_unix_getaddrinfo( void *args )
 {
     struct
@@ -1221,16 +1224,16 @@ static NTSTATUS wow64_unix_getaddrinfo( void *args )
     struct WS_addrinfo hints;
     struct getaddrinfo_params params =
     {
-        ULongToPtr( params32->node ),
-        ULongToPtr( params32->service ),
+        wow64_host_ptr( params32->node ),
+        wow64_host_ptr( params32->service ),
         NULL,
         NULL,
-        ULongToPtr(params32->size)
+        wow64_host_ptr(params32->size)
     };
 
     if (params32->hints)
     {
-        const struct WS_addrinfo32 *hints32 = ULongToPtr(params32->hints);
+        const struct WS_addrinfo32 *hints32 = wow64_host_ptr(params32->hints);
         hints.ai_flags    = hints32->ai_flags;
         hints.ai_family   = hints32->ai_family;
         hints.ai_socktype = hints32->ai_socktype;
@@ -1240,7 +1243,7 @@ static NTSTATUS wow64_unix_getaddrinfo( void *args )
 
     if (!(params.info = malloc( *params.size ))) return WSAENOBUFS;
     status = unix_getaddrinfo( &params );
-    if (!status) put_addrinfo32( params.info, ULongToPtr(params32->info), ULongToPtr(params32->size) );
+    if (!status) put_addrinfo32( params.info, wow64_host_ptr(params32->info), wow64_host_ptr(params32->size) );
     free( params.info );
     return status;
 }
@@ -1260,17 +1263,17 @@ static NTSTATUS wow64_unix_gethostbyaddr( void *args )
     NTSTATUS status;
     struct gethostbyaddr_params params =
     {
-        ULongToPtr( params32->addr ),
+        wow64_host_ptr( params32->addr ),
         params32->len,
         params32->family,
         NULL,
-        ULongToPtr(params32->size)
+        wow64_host_ptr(params32->size)
     };
 
     if (!(params.host = malloc( *params.size ))) return WSAENOBUFS;
     status = unix_gethostbyaddr( &params );
     if (!status)
-        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size) );
+        status = put_hostent32( params.host, wow64_host_ptr(params32->host), wow64_host_ptr(params32->size) );
     free( params.host );
     return status;
 }
@@ -1288,15 +1291,15 @@ static NTSTATUS wow64_unix_gethostbyname( void *args )
     NTSTATUS status;
     struct gethostbyname_params params =
     {
-        ULongToPtr( params32->name ),
+        wow64_host_ptr( params32->name ),
         NULL,
-        ULongToPtr(params32->size)
+        wow64_host_ptr(params32->size)
     };
 
     if (!(params.host = malloc( *params.size ))) return WSAENOBUFS;
     status = unix_gethostbyname( &params );
     if (!status)
-        status = put_hostent32( params.host, ULongToPtr(params32->host), ULongToPtr(params32->size) );
+        status = put_hostent32( params.host, wow64_host_ptr(params32->host), wow64_host_ptr(params32->size) );
     free( params.host );
     return status;
 }
@@ -1310,7 +1313,7 @@ static NTSTATUS wow64_unix_gethostname( void *args )
         unsigned int size;
     } const *params32 = args;
 
-    struct gethostname_params params = { ULongToPtr(params32->name), params32->size };
+    struct gethostname_params params = { wow64_host_ptr(params32->name), params32->size };
 
     if (!unix_gethostname( &params )) return 0;
     return errno_from_unix( errno );
@@ -1332,11 +1335,11 @@ static NTSTATUS wow64_unix_getnameinfo( void *args )
 
     struct getnameinfo_params params =
     {
-        ULongToPtr( params32->addr ),
+        wow64_host_ptr( params32->addr ),
         params32->addr_len,
-        ULongToPtr( params32->host ),
+        wow64_host_ptr( params32->host ),
         params32->host_len,
-        ULongToPtr( params32->serv ),
+        wow64_host_ptr( params32->serv ),
         params32->serv_len,
         params32->flags
     };
