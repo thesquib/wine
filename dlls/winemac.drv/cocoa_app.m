@@ -2919,14 +2919,20 @@ static NSString* WineLocalizedString(unsigned int stringID)
         BOOL sameProcess = (senderPid == getpid());
         uintptr_t layerPtrVal = [(NSNumber *)info[@"layerPtr"] unsignedLongLongValue];
 
+        /* The resolver returns target retained; the block retains its own
+         * reference (targetObj) when dispatch_async copies it, so the view or
+         * window outlives a destroy that lands before the block runs
+         * (steamwebhelper, 2026-10-08: the main thread messaged a freed view
+         * and faulted in a loop, Steam never logged on). */
+        id targetObj = (id)target;
         dispatch_async(dispatch_get_main_queue(), ^{
             NSView *view;
             if (isWindow) {
-                NSWindow *win = (__bridge NSWindow *)target;
+                NSWindow *win = (NSWindow *)targetObj;
                 view = [win contentView];
                 fprintf(stderr, "winemac:E.1 - using NSWindow=%p contentView=%p\n", (void *)win, (void *)view);
             } else {
-                view = (__bridge NSView *)target;
+                view = (NSView *)targetObj;
             }
             if (!view) {
                 fprintf(stderr, "winemac:E.1 - no view available\n");
@@ -3200,6 +3206,7 @@ static NSString* WineLocalizedString(unsigned int stringID)
                 fflush(stderr);
             }
         });
+        [targetObj release];
     }
 
     - (void) otherWineAppWillActivate:(NSNotification *)note

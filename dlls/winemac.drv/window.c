@@ -295,6 +295,9 @@ void *macdrv_lookup_client_view(void *hwnd)
  *      Cross-process requests that miss step 1/2 are declined.
  *
  * out_is_window: set to 1 if returned pointer is an NSWindow*, 0 if NSView*.
+ * The result is retained (taken under win_data_mutex, before the window can
+ * be destroyed); the caller releases it. The caller messages it later on the
+ * main queue, by which time steamwebhelper may have destroyed the window.
  * Pure CF/pthread, safe from any thread (no Wine NT syscalls).
  */
 __attribute__((visibility("default")))
@@ -327,12 +330,14 @@ void *macdrv_resolve_hwnd_for_hosting(void *target_hwnd, void **out_hwnd, int *o
         if (data) {
             if (data->client_view) {
                 void *v = (void *)data->client_view;
+                CFRetain(v);
                 pthread_mutex_unlock(&win_data_mutex);
                 if (out_hwnd) *out_hwnd = target_hwnd;
                 return v;
             }
             if (data->cocoa_window) {
                 void *w = (void *)data->cocoa_window;
+                CFRetain(w);
                 pthread_mutex_unlock(&win_data_mutex);
                 if (out_hwnd) *out_hwnd = target_hwnd;
                 if (out_is_window) *out_is_window = 1;
@@ -393,6 +398,7 @@ void *macdrv_resolve_hwnd_for_hosting(void *target_hwnd, void **out_hwnd, int *o
             free(vals);
         }
     }
+    if (best) CFRetain(best);
     pthread_mutex_unlock(&win_data_mutex);
 
     if (best) {
