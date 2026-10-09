@@ -60,6 +60,9 @@ static inline UINT eflags_to_cpsr( UINT eflags )
     UINT ret = 0;
 
     if (eflags & 0x0001) ret |= 0x20000000;  /* carry */
+    if (eflags & 0x0004) ret |= 0x00004000;  /* parity (RES0 in SPSR, emulator only) */
+    if (eflags & 0x0010) ret |= 0x00008000;  /* adjust (RES0 in SPSR, emulator only) */
+    if (eflags & 0x0400) ret |= 0x00010000;  /* direction (RES0 in SPSR, emulator only) */
     if (eflags & 0x0040) ret |= 0x40000000;  /* zero */
     if (eflags & 0x0080) ret |= 0x80000000;  /* negative */
     if (eflags & 0x0100) ret |= 0x00200000;  /* trap */
@@ -71,6 +74,9 @@ static inline UINT cpsr_to_eflags( UINT cpsr )
 {
     UINT ret = 0x202;
 
+    if (cpsr & 0x00004000) ret |= 0x0004;  /* parity */
+    if (cpsr & 0x00008000) ret |= 0x0010;  /* adjust */
+    if (cpsr & 0x00010000) ret |= 0x0400;  /* direction */
     if (cpsr & 0x00200000) ret |= 0x0100;  /* trap */
     if (cpsr & 0x10000000) ret |= 0x0800;  /* overflow */
     if (cpsr & 0x20000000) ret |= 0x0001;  /* carry */

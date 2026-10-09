@@ -153,6 +153,10 @@ static DWORD64 get_fault_esr( ucontext_t *sigcontext )
 
 #endif /* linux */
 
+/* x86 PF/AF/DF carried by the ARM64EC emulator in Cpsr bits 14-16 (RES0 in SPSR,
+ * see __wine_arm64ec_ext_eflags); never let them reach the real PSTATE */
+#define CPSR_EXT_EFLAGS 0x0001c000
+
 /* stack layout when calling KiUserExceptionDispatcher */
 struct exc_stack_layout
 {
@@ -321,7 +325,7 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 
     FP_sig(sigcontext)     = context->Fp;   /* Frame pointer */
     LR_sig(sigcontext)     = context->Lr;   /* Link register */
-    PSTATE_sig(sigcontext) = context->Cpsr; /* Current State Register */
+    PSTATE_sig(sigcontext) = context->Cpsr & ~CPSR_EXT_EFLAGS; /* Current State Register */
     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = context->X[i];
     restore_fpu( context, sigcontext );
 }
@@ -1661,7 +1665,7 @@ static void usr2_handler( int signal, siginfo_t *siginfo, void *_sigcontext )
     }
     FP_sig(sigcontext)     = frame->fp;
     LR_sig(sigcontext)     = frame->lr;
-    PSTATE_sig(sigcontext) = frame->cpsr;
+    PSTATE_sig(sigcontext) = frame->cpsr & ~CPSR_EXT_EFLAGS;
     for (i = 0; i <= 28; i++) REGn_sig( i, sigcontext ) = frame->x[i];
 
 #ifdef linux

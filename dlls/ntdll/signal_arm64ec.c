@@ -1904,6 +1904,10 @@ NTSTATUS __attribute__((naked)) __wine_unix_call_arm64ec( unixlib_handle_t handl
 
 NTSTATUS (WINAPI *__wine_unix_call_dispatcher_arm64ec)( unixlib_handle_t, unsigned int, void * ) = __wine_unix_call_arm64ec;
 
+/* Capability marker for the emulator: Cpsr bits 14-16 carry x86 PF/AF/DF through
+ * context conversions (eflags_to_cpsr/cpsr_to_eflags), and are stripped before PSTATE. */
+const int __wine_arm64ec_ext_eflags = 1;
+
 static void __attribute__((naked)) arm64x_check_call_early(void)
 {
     asm( "mov x11, x9\n\t"
