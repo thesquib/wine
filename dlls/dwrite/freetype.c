@@ -816,6 +816,9 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 typedef ULONG PTR32;
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process); the font object is a 64-bit host value and stays as it is. */
+
 static NTSTATUS wow64_create_font_object(void *args)
 {
     struct
@@ -827,10 +830,10 @@ static NTSTATUS wow64_create_font_object(void *args)
     } const *params32 = args;
     struct create_font_object_params params =
     {
-        ULongToPtr(params32->data),
+        wow64_host_ptr(params32->data),
         params32->size,
         params32->index,
-        ULongToPtr(params32->object),
+        wow64_host_ptr(params32->object),
     };
 
     return create_font_object(&params);
@@ -877,13 +880,13 @@ static NTSTATUS wow64_get_glyph_outline(void *args)
         float emsize;
         PTR32 outline;
     } const *params32 = args;
-    struct dwrite_outline32 *outline32 = ULongToPtr(params32->outline);
+    struct dwrite_outline32 *outline32 = wow64_host_ptr(params32->outline);
     struct dwrite_outline outline =
     {
-        .tags.values = ULongToPtr(outline32->tags.values),
+        .tags.values = wow64_host_ptr(outline32->tags.values),
         .tags.count = outline32->tags.count,
         .tags.size = outline32->tags.size,
-        .points.values = ULongToPtr(outline32->points.values),
+        .points.values = wow64_host_ptr(outline32->points.values),
         .points.count = outline32->points.count,
         .points.size = outline32->points.size,
     };
@@ -914,7 +917,7 @@ static NTSTATUS wow64_get_glyph_count(void *args)
     struct get_glyph_count_params params =
     {
         params32->object,
-        ULongToPtr(params32->count),
+        wow64_host_ptr(params32->count),
     };
 
     return get_glyph_count(&params);
@@ -937,8 +940,8 @@ static NTSTATUS wow64_get_glyph_advance(void *args)
         params32->glyph,
         params32->mode,
         params32->emsize,
-        ULongToPtr(params32->advance),
-        ULongToPtr(params32->has_contours),
+        wow64_host_ptr(params32->advance),
+        wow64_host_ptr(params32->has_contours),
     };
 
     return get_glyph_advance(&params);
@@ -962,7 +965,7 @@ static NTSTATUS wow64_get_glyph_bbox(void *args)
         params32->glyph,
         params32->emsize,
         params32->m,
-        ULongToPtr(params32->bbox),
+        wow64_host_ptr(params32->bbox),
     };
 
     return get_glyph_bbox(&params);
@@ -993,8 +996,8 @@ static NTSTATUS wow64_get_glyph_bitmap(void *args)
         params32->m,
         params32->bbox,
         params32->pitch,
-        ULongToPtr(params32->bitmap),
-        ULongToPtr(params32->is_1bpp),
+        wow64_host_ptr(params32->bitmap),
+        wow64_host_ptr(params32->is_1bpp),
     };
 
     return get_glyph_bitmap(&params);
@@ -1018,7 +1021,7 @@ static NTSTATUS wow64_get_design_glyph_metrics(void *args)
         params32->glyph,
         params32->upem,
         params32->ascent,
-        ULongToPtr(params32->metrics),
+        wow64_host_ptr(params32->metrics),
     };
 
     return get_design_glyph_metrics(&params);
