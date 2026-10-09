@@ -817,17 +817,80 @@ static DWORD get_service_binary_path(const struct service_entry *service_entry, 
     return ERROR_SUCCESS;
 }
 
-static DWORD get_winedevice_binary_path(struct service_entry *service_entry, WCHAR **path, BOOL *is_wow64)
+/* resolve a driver ImagePath the same way ntoskrnl's load_driver() does */
+static WCHAR *get_driver_image_path(const WCHAR *path)
 {
-    WCHAR system_dir[MAX_PATH];
-    DWORD type;
+    WCHAR windir[MAX_PATH], *ret;
+    DWORD len;
+
+    if (!wcsnicmp(path, L"\\SystemRoot\\", 12)) path += 12;
+    else if (!wcsncmp(path, L"\\??\\", 4)) return wcsdup(path + 4);
+    else if (RtlDetermineDosPathNameType_U(path) != RtlPathTypeRelative) return wcsdup(path);
+
+    len = GetWindowsDirectoryW(windir, MAX_PATH);
+    if (!(ret = malloc((len + wcslen(path) + 2) * sizeof(WCHAR)))) return NULL;
+    swprintf(ret, len + wcslen(path) + 2, L"%s\\%s", windir, path);
+    return ret;
+}
+
+/* read the machine field of a PE image, 0 on failure */
+static USHORT get_image_machine(const WCHAR *path)
+{
+    IMAGE_DOS_HEADER dos;
+    struct
+    {
+        DWORD signature;
+        IMAGE_FILE_HEADER file;
+    } nt;
+    USHORT machine = 0;
+    HANDLE file;
+    DWORD count;
+
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return 0;
+
+    if (ReadFile(file, &dos, sizeof(dos), &count, NULL) && count == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE &&
+        SetFilePointer(file, dos.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER &&
+        ReadFile(file, &nt, sizeof(nt), &count, NULL) && count == sizeof(nt) &&
+        nt.signature == IMAGE_NT_SIGNATURE)
+        machine = nt.file.Machine;
+
+    CloseHandle(file);
+    return machine;
+}
+
+/* Pick the winedevice.exe flavour able to host the driver image:
+ * - a 32-bit image goes to the WoW64 winedevice;
+ * - an x86-64 image on an ARM64 host goes to winedevice running as an
+ *   ARM64EC (x86-64 emulating) process, like Windows on ARM does for
+ *   any x64 image.  ARM64X and ARM64 images stay in the native host. */
+static DWORD get_winedevice_binary_path(struct service_entry *service_entry, WCHAR **path, BOOL *is_wow64,
+                                        USHORT *machine)
+{
+    WCHAR system_dir[MAX_PATH], *image;
+    USHORT image_machine = 0, process_machine, native_machine;
+
+    *machine = 0;
+    if ((image = get_driver_image_path(*path)))
+    {
+        image_machine = get_image_machine(image);
+        TRACE("driver image %s machine %04x\n", debugstr_w(image), image_machine);
+        free(image);
+    }
 
     if (!is_win64)
         *is_wow64 = FALSE;
-    else if (GetBinaryTypeW(*path, &type))
-        *is_wow64 = (type == SCS_32BIT_BINARY);
+    else if (image_machine)
+        *is_wow64 = (image_machine == IMAGE_FILE_MACHINE_I386 || image_machine == IMAGE_FILE_MACHINE_ARMNT);
     else
         *is_wow64 = service_entry->is_wow64;
+
+    if (image_machine == IMAGE_FILE_MACHINE_AMD64 &&
+        IsWow64Process2(GetCurrentProcess(), &process_machine, &native_machine) &&
+        native_machine == IMAGE_FILE_MACHINE_ARM64)
+        *machine = IMAGE_FILE_MACHINE_AMD64;
 
     GetSystemDirectoryW(system_dir, MAX_PATH);
     free(*path);
@@ -839,7 +902,8 @@ static DWORD get_winedevice_binary_path(struct service_entry *service_entry, WCH
     return ERROR_SUCCESS;
 }
 
-static struct process_entry *get_winedevice_process(struct service_entry *service_entry, WCHAR *path, BOOL is_wow64)
+static struct process_entry *get_winedevice_process(struct service_entry *service_entry, WCHAR *path, BOOL is_wow64,
+                                                    USHORT machine)
 {
     struct service_entry *winedevice_entry;
 
@@ -853,6 +917,7 @@ static struct process_entry *get_winedevice_process(struct service_entry *servic
         if (!winedevice_entry->process) continue;
 
         if (winedevice_entry->is_wow64 != is_wow64) continue;
+        if (winedevice_entry->machine != machine) continue;
         if (!winedevice_entry->config.lpBinaryPathName) continue;
         if (lstrcmpW(winedevice_entry->config.lpBinaryPathName, path)) continue;
 
@@ -866,7 +931,7 @@ static struct process_entry *get_winedevice_process(struct service_entry *servic
 }
 
 static DWORD add_winedevice_service(const struct service_entry *service, WCHAR *path, BOOL is_wow64,
-                                    struct service_entry **entry)
+                                    USHORT machine, struct service_entry **entry)
 {
     static WCHAR name[ARRAY_SIZE(L"Winedevice") + 10]; /* lstrlenW("4294967295") */
     static DWORD current = 0;
@@ -884,6 +949,7 @@ static DWORD add_winedevice_service(const struct service_entry *service, WCHAR *
         return err;
 
     (*entry)->is_wow64                  = is_wow64;
+    (*entry)->machine                   = machine;
     (*entry)->config.dwServiceType      = SERVICE_WIN32_OWN_PROCESS;
     (*entry)->config.dwStartType        = SERVICE_DEMAND_START;
     (*entry)->status.dwServiceType      = (*entry)->config.dwServiceType;
@@ -914,8 +980,12 @@ static DWORD service_start_process(struct service_entry *service_entry, struct p
 {
     struct process_entry *process;
     PROCESS_INFORMATION pi;
-    STARTUPINFOW si;
+    STARTUPINFOEXW si;
+    ULONG_PTR attr_buf[32];
+    SIZE_T attr_size;
+    DWORD flags = CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS;
     BOOL is_wow64 = FALSE;
+    USHORT machine = 0;
     HANDLE token;
     WCHAR *path;
     DWORD err;
@@ -949,20 +1019,20 @@ static DWORD service_start_process(struct service_entry *service_entry, struct p
         struct service_entry *winedevice_entry;
         WCHAR *group;
 
-        if ((err = get_winedevice_binary_path(service_entry, &path, &is_wow64)))
+        if ((err = get_winedevice_binary_path(service_entry, &path, &is_wow64, &machine)))
         {
             service_unlock(service_entry);
             free(path);
             return err;
         }
 
-        if ((process = get_winedevice_process(service_entry, path, is_wow64)))
+        if ((process = get_winedevice_process(service_entry, path, is_wow64, machine)))
         {
             free(path);
             goto found;
         }
 
-        err = add_winedevice_service(service_entry, path, is_wow64, &winedevice_entry);
+        err = add_winedevice_service(service_entry, path, is_wow64, machine, &winedevice_entry);
         free(path);
         if (err != ERROR_SUCCESS)
         {
@@ -1021,12 +1091,12 @@ found:
         return err;
     }
 
-    ZeroMemory(&si, sizeof(STARTUPINFOW));
-    si.cb = sizeof(STARTUPINFOW);
+    ZeroMemory(&si, sizeof(si));
+    si.StartupInfo.cb = sizeof(si.StartupInfo);
     if (!(service_entry->config.dwServiceType & SERVICE_INTERACTIVE_PROCESS)
         && service_entry->config.lpDisplayName && wcscmp(service_entry->config.lpDisplayName, L"Arc Service"))
     {
-        si.lpDesktop = (WCHAR *)L"__wineservice_winstation\\Default";
+        si.StartupInfo.lpDesktop = (WCHAR *)L"__wineservice_winstation\\Default";
     }
     else if (!(service_entry->config.dwServiceType & SERVICE_INTERACTIVE_PROCESS))
     {
@@ -1070,7 +1140,29 @@ found:
     process->use_count++;
     service_unlock(service_entry);
 
-    r = CreateProcessW(NULL, path, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS, environment, NULL, &si, &pi);
+    if (service_entry->machine)
+    {
+        /* run the image as the given machine (e.g. an x86-64 driver host on ARM64) */
+        si.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)attr_buf;
+        attr_size = sizeof(attr_buf);
+        if (InitializeProcThreadAttributeList(si.lpAttributeList, 1, 0, &attr_size) &&
+            UpdateProcThreadAttribute(si.lpAttributeList, 0, PROC_THREAD_ATTRIBUTE_MACHINE_TYPE,
+                                      &service_entry->machine, sizeof(service_entry->machine), NULL, NULL))
+        {
+            si.StartupInfo.cb = sizeof(si);
+            flags |= EXTENDED_STARTUPINFO_PRESENT;
+        }
+        else
+        {
+            WINE_ERR("failed to set machine %04x for %s, error %lu\n", service_entry->machine,
+                     wine_dbgstr_w(service_entry->name), GetLastError());
+            si.lpAttributeList = NULL;
+        }
+        TRACE("starting %s as machine %04x\n", debugstr_w(path), service_entry->machine);
+    }
+
+    r = CreateProcessW(NULL, path, NULL, NULL, FALSE, flags, environment, NULL, &si.StartupInfo, &pi);
+    if (si.lpAttributeList) DeleteProcThreadAttributeList(si.lpAttributeList);
     free(path);
     if (!r)
     {
