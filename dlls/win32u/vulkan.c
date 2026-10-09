@@ -1599,6 +1599,20 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     if (device->extensions.has_VK_EXT_external_memory_dma_buf)
         device->extensions.has_VK_KHR_external_memory_fd = 1;
 
+    /* PROTON_DARWIN: KosmicKrisp's VK_PMW_metalfx_scaler (MetalFX upscaling) is enabled on every device whose host
+     * offers it. It has no features and changes nothing unless its commands are called, but games enable only the
+     * device extensions they know: DOOM: The Dark Ages ignores the list xessVKGetRequiredDeviceExtensions returns,
+     * so the clean-room libxess.dll could never reach it otherwise. PROTON_PMW_METALFX=0 leaves it to the app. */
+    if (physical_device->extensions.has_VK_PMW_metalfx_scaler && !device->extensions.has_VK_PMW_metalfx_scaler)
+    {
+        const char *env = getenv( "PROTON_PMW_METALFX" );
+        if (!env || strcmp( env, "0" ))
+        {
+            TRACE( "Enabling VK_PMW_metalfx_scaler for the host device\n" );
+            device->extensions.has_VK_PMW_metalfx_scaler = 1;
+        }
+    }
+
     if (physical_device->map_placed_align)
     {
         VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *map_placed_features;
