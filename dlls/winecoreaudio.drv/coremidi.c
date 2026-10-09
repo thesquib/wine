@@ -1268,6 +1268,9 @@ NTSTATUS unix_midi_notify_wait(void *args)
 
 typedef UINT PTR32;
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (32-bit address at host BASE + p in a vCPU-mode WoW64 process);
+ * hMidi is a handle and stays ULongToPtr. */
+
 NTSTATUS unix_wow64_midi_init(void *args)
 {
     struct
@@ -1276,7 +1279,7 @@ NTSTATUS unix_wow64_midi_init(void *args)
     } *params32 = args;
     struct midi_init_params params =
     {
-        .err = ULongToPtr(params32->err)
+        .err = wow64_host_ptr(params32->err)
     };
     return unix_midi_init(&params);
 }
@@ -1373,7 +1376,7 @@ NTSTATUS unix_wow64_midi_out_message(void *args)
         PTR32 err;
         PTR32 notify;
     } *params32 = args;
-    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct notify_context32 *notify32 = wow64_host_ptr(params32->notify);
     struct midi_open_desc32 *desc32;
     struct midi_hdr32 *hdr32;
     struct notify_context notify;
@@ -1386,7 +1389,7 @@ NTSTATUS unix_wow64_midi_out_message(void *args)
         .user = params32->user,
         .param_1 = params32->param_1,
         .param_2 = params32->param_2,
-        .err = ULongToPtr(params32->err),
+        .err = wow64_host_ptr(params32->err),
         .notify = &notify
     };
     notify32->send_notify = FALSE;
@@ -1394,7 +1397,7 @@ NTSTATUS unix_wow64_midi_out_message(void *args)
     switch (params32->msg)
     {
     case MODM_OPEN:
-        desc32 = ULongToPtr(params32->param_1);
+        desc32 = wow64_host_ptr(params32->param_1);
 
         open_desc.hMidi = ULongToPtr(desc32->hMidi);
         open_desc.dwCallback = desc32->dwCallback;
@@ -1408,10 +1411,10 @@ NTSTATUS unix_wow64_midi_out_message(void *args)
         break;
 
     case MODM_LONGDATA:
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         memset(&hdr, 0, sizeof(hdr));
-        hdr.lpData = ULongToPtr(hdr32->lpData);
+        hdr.lpData = wow64_host_ptr(hdr32->lpData);
         hdr.dwBufferLength = hdr32->dwBufferLength;
         hdr.dwFlags = hdr32->dwFlags;
 
@@ -1420,13 +1423,13 @@ NTSTATUS unix_wow64_midi_out_message(void *args)
         break;
 
     case MODM_PREPARE: /* prepare and unprepare are easier to handle explicitly */
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         *params.err = wow64_midi_out_prepare(params32->dev_id, hdr32, params32->param_2);
         return STATUS_SUCCESS;
 
     case MODM_UNPREPARE:
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         *params.err = wow64_midi_out_unprepare(params32->dev_id, hdr32, params32->param_2);
         return STATUS_SUCCESS;
@@ -1437,7 +1440,7 @@ NTSTATUS unix_wow64_midi_out_message(void *args)
     switch (params32->msg)
     {
     case MODM_LONGDATA:
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         hdr32->dwFlags = hdr.dwFlags;
         break;
@@ -1497,7 +1500,7 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
         PTR32 err;
         PTR32 notify;
     } *params32 = args;
-    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct notify_context32 *notify32 = wow64_host_ptr(params32->notify);
     struct midi_open_desc32 *desc32;
     struct midi_hdr32 *hdr32;
     struct notify_context notify;
@@ -1510,7 +1513,7 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
         .user = params32->user,
         .param_1 = params32->param_1,
         .param_2 = params32->param_2,
-        .err = ULongToPtr(params32->err),
+        .err = wow64_host_ptr(params32->err),
         .notify = &notify
     };
     notify32->send_notify = FALSE;
@@ -1518,7 +1521,7 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
     switch (params32->msg)
     {
     case MIDM_OPEN:
-        desc32 = ULongToPtr(params32->param_1);
+        desc32 = wow64_host_ptr(params32->param_1);
 
         open_desc.hMidi = ULongToPtr(desc32->hMidi);
         open_desc.dwCallback = desc32->dwCallback;
@@ -1532,10 +1535,10 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
         break;
 
     case MIDM_ADDBUFFER:
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         hdr = calloc(1, sizeof(*hdr));
-        hdr->lpData = ULongToPtr(hdr32->lpData);
+        hdr->lpData = wow64_host_ptr(hdr32->lpData);
         hdr->dwBufferLength = hdr32->dwBufferLength;
         hdr->dwFlags = hdr32->dwFlags;
         hdr->dwReserved[7] = params32->param_1; /* keep hdr32 for MIM_LONGDATA notification */
@@ -1545,13 +1548,13 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
         break;
 
     case MIDM_PREPARE: /* prepare and unprepare are easier to handle explicitly */
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         *params.err = wow64_midi_in_prepare(params32->dev_id, hdr32, params32->param_2);
         return STATUS_SUCCESS;
 
     case MIDM_UNPREPARE:
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         *params.err = wow64_midi_in_unprepare(params32->dev_id, hdr32, params32->param_2);
         return STATUS_SUCCESS;
@@ -1562,7 +1565,7 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
     switch (params32->msg)
     {
     case MIDM_ADDBUFFER:
-        hdr32 = ULongToPtr(params32->param_1);
+        hdr32 = wow64_host_ptr(params32->param_1);
 
         if (!*params.err)
         {
@@ -1583,7 +1586,7 @@ NTSTATUS unix_wow64_midi_in_message(void *args)
         {
             hdr = (MIDIHDR *)notify.param_1;
             notify32->param_1 = hdr->dwReserved[7];
-            hdr32 = ULongToPtr(notify32->param_1);
+            hdr32 = wow64_host_ptr(notify32->param_1);
             hdr32->dwBytesRecorded = hdr->dwBytesRecorded;
             hdr32->dwFlags = hdr->dwFlags;
             free(hdr);
@@ -1599,13 +1602,13 @@ NTSTATUS unix_wow64_midi_notify_wait(void *args)
         PTR32 quit;
         PTR32 notify;
     } *params32 = args;
-    struct notify_context32 *notify32 = ULongToPtr(params32->notify);
+    struct notify_context32 *notify32 = wow64_host_ptr(params32->notify);
     struct midi_hdr32 *hdr32;
     struct notify_context notify;
     MIDIHDR *hdr;
     struct midi_notify_wait_params params =
     {
-        .quit = ULongToPtr(params32->quit),
+        .quit = wow64_host_ptr(params32->quit),
         .notify = &notify
     };
     notify32->send_notify = FALSE;
@@ -1620,7 +1623,7 @@ NTSTATUS unix_wow64_midi_notify_wait(void *args)
         {
             hdr = (MIDIHDR *)notify.param_1;
             notify32->param_1 = hdr->dwReserved[7];
-            hdr32 = ULongToPtr(notify32->param_1);
+            hdr32 = wow64_host_ptr(notify32->param_1);
             hdr32->dwBytesRecorded = hdr->dwBytesRecorded;
             hdr32->dwFlags = hdr->dwFlags;
             free(hdr);

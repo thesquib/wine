@@ -1901,6 +1901,9 @@ static NTSTATUS unix_wow64_main_loop(void *args)
     return unix_main_loop(&params);
 }
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process). The PtrToUlong write-backs stay: BASE is 4 GiB aligned, so the low 32 bits of a host pointer into the
+ * 32-bit window are its guest address. */
 static NTSTATUS unix_wow64_get_endpoint_ids(void *args)
 {
     struct
@@ -1915,7 +1918,7 @@ static NTSTATUS unix_wow64_get_endpoint_ids(void *args)
     struct get_endpoint_ids_params params =
     {
         .flow = params32->flow,
-        .endpoints = ULongToPtr(params32->endpoints),
+        .endpoints = wow64_host_ptr(params32->endpoints),
         .size = params32->size
     };
     unix_get_endpoint_ids(&params);
@@ -1944,16 +1947,16 @@ static NTSTATUS unix_wow64_create_stream(void *args)
     } *params32 = args;
     struct create_stream_params params =
     {
-        .name = ULongToPtr(params32->name),
-        .device = ULongToPtr(params32->device),
+        .name = wow64_host_ptr(params32->name),
+        .device = wow64_host_ptr(params32->device),
         .flow = params32->flow,
         .share = params32->share,
         .flags = params32->flags,
         .duration = params32->duration,
         .period = params32->period,
-        .fmt = ULongToPtr(params32->fmt),
-        .channel_count = ULongToPtr(params32->channel_count),
-        .stream = ULongToPtr(params32->stream)
+        .fmt = wow64_host_ptr(params32->fmt),
+        .channel_count = wow64_host_ptr(params32->channel_count),
+        .stream = wow64_host_ptr(params32->stream)
     };
     unix_create_stream(&params);
     params32->result = params.result;
@@ -1996,7 +1999,7 @@ static NTSTATUS unix_wow64_get_render_buffer(void *args)
     };
     unix_get_render_buffer(&params);
     params32->result = params.result;
-    *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    *(unsigned int *)wow64_host_ptr(params32->data) = PtrToUlong(data);
     return STATUS_SUCCESS;
 }
 
@@ -2017,14 +2020,14 @@ static NTSTATUS unix_wow64_get_capture_buffer(void *args)
     {
         .stream = params32->stream,
         .data = &data,
-        .frames = ULongToPtr(params32->frames),
-        .flags = ULongToPtr(params32->flags),
-        .devpos = ULongToPtr(params32->devpos),
-        .qpcpos = ULongToPtr(params32->qpcpos)
+        .frames = wow64_host_ptr(params32->frames),
+        .flags = wow64_host_ptr(params32->flags),
+        .devpos = wow64_host_ptr(params32->devpos),
+        .qpcpos = wow64_host_ptr(params32->qpcpos)
     };
     unix_get_capture_buffer(&params);
     params32->result = params.result;
-    *(unsigned int *)ULongToPtr(params32->data) = PtrToUlong(data);
+    *(unsigned int *)wow64_host_ptr(params32->data) = PtrToUlong(data);
     return STATUS_SUCCESS;
 };
 
@@ -2040,10 +2043,10 @@ static NTSTATUS unix_wow64_is_format_supported(void *args)
     } *params32 = args;
     struct is_format_supported_params params =
     {
-        .device = ULongToPtr(params32->device),
+        .device = wow64_host_ptr(params32->device),
         .flow = params32->flow,
         .share = params32->share,
-        .fmt_in = ULongToPtr(params32->fmt_in),
+        .fmt_in = wow64_host_ptr(params32->fmt_in),
     };
     unix_is_format_supported(&params);
     params32->result = params.result;
@@ -2061,9 +2064,9 @@ static NTSTATUS unix_wow64_get_mix_format(void *args)
     } *params32 = args;
     struct get_mix_format_params params =
     {
-        .device = ULongToPtr(params32->device),
+        .device = wow64_host_ptr(params32->device),
         .flow = params32->flow,
-        .fmt = ULongToPtr(params32->fmt)
+        .fmt = wow64_host_ptr(params32->fmt)
     };
     unix_get_mix_format(&params);
     params32->result = params.result;
@@ -2082,10 +2085,10 @@ static NTSTATUS unix_wow64_get_device_period(void *args)
     } *params32 = args;
     struct get_device_period_params params =
     {
-        .device = ULongToPtr(params32->device),
+        .device = wow64_host_ptr(params32->device),
         .flow = params32->flow,
-        .def_period = ULongToPtr(params32->def_period),
-        .min_period = ULongToPtr(params32->min_period),
+        .def_period = wow64_host_ptr(params32->def_period),
+        .min_period = wow64_host_ptr(params32->min_period),
     };
     unix_get_device_period(&params);
     params32->result = params.result;
@@ -2103,7 +2106,7 @@ static NTSTATUS unix_wow64_get_buffer_size(void *args)
     struct get_buffer_size_params params =
     {
         .stream = params32->stream,
-        .frames = ULongToPtr(params32->frames)
+        .frames = wow64_host_ptr(params32->frames)
     };
     unix_get_buffer_size(&params);
     params32->result = params.result;
@@ -2121,7 +2124,7 @@ static NTSTATUS unix_wow64_get_latency(void *args)
     struct get_latency_params params =
     {
         .stream = params32->stream,
-        .latency = ULongToPtr(params32->latency)
+        .latency = wow64_host_ptr(params32->latency)
     };
     unix_get_latency(&params);
     params32->result = params.result;
@@ -2139,7 +2142,7 @@ static NTSTATUS unix_wow64_get_current_padding(void *args)
     struct get_current_padding_params params =
     {
         .stream = params32->stream,
-        .padding = ULongToPtr(params32->padding)
+        .padding = wow64_host_ptr(params32->padding)
     };
     unix_get_current_padding(&params);
     params32->result = params.result;
@@ -2157,7 +2160,7 @@ static NTSTATUS unix_wow64_get_next_packet_size(void *args)
     struct get_next_packet_size_params params =
     {
         .stream = params32->stream,
-        .frames = ULongToPtr(params32->frames)
+        .frames = wow64_host_ptr(params32->frames)
     };
     unix_get_next_packet_size(&params);
     params32->result = params.result;
@@ -2178,8 +2181,8 @@ static NTSTATUS unix_wow64_get_position(void *args)
     {
         .stream = params32->stream,
         .device = params32->device,
-        .pos = ULongToPtr(params32->pos),
-        .qpctime = ULongToPtr(params32->qpctime)
+        .pos = wow64_host_ptr(params32->pos),
+        .qpctime = wow64_host_ptr(params32->qpctime)
     };
     unix_get_position(&params);
     params32->result = params.result;
@@ -2197,7 +2200,7 @@ static NTSTATUS unix_wow64_get_frequency(void *args)
     struct get_frequency_params params =
     {
         .stream = params32->stream,
-        .freq = ULongToPtr(params32->freq)
+        .freq = wow64_host_ptr(params32->freq)
     };
     unix_get_frequency(&params);
     params32->result = params.result;
@@ -2217,8 +2220,8 @@ static NTSTATUS unix_wow64_set_volumes(void *args)
     {
         .stream = params32->stream,
         .master_volume = params32->master_volume,
-        .volumes = ULongToPtr(params32->volumes),
-        .session_volumes = ULongToPtr(params32->session_volumes),
+        .volumes = wow64_host_ptr(params32->volumes),
+        .session_volumes = wow64_host_ptr(params32->session_volumes),
     };
     return unix_set_volumes(&params);
 }
@@ -2268,19 +2271,19 @@ static NTSTATUS unix_wow64_get_prop_value(void *args)
     PROPVARIANT value;
     struct get_prop_value_params params =
     {
-        .device = ULongToPtr(params32->device),
+        .device = wow64_host_ptr(params32->device),
         .flow = params32->flow,
-        .guid = ULongToPtr(params32->guid),
-        .prop = ULongToPtr(params32->prop),
+        .guid = wow64_host_ptr(params32->guid),
+        .prop = wow64_host_ptr(params32->prop),
         .value = &value,
-        .buffer = ULongToPtr(params32->buffer),
-        .buffer_size = ULongToPtr(params32->buffer_size)
+        .buffer = wow64_host_ptr(params32->buffer),
+        .buffer_size = wow64_host_ptr(params32->buffer_size)
     };
     unix_get_prop_value(&params);
     params32->result = params.result;
     if (SUCCEEDED(params.result))
     {
-        value32 = UlongToPtr(params32->value);
+        value32 = wow64_host_ptr(params32->value);
         value32->vt = value.vt;
         switch (value.vt)
         {
