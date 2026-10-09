@@ -2150,11 +2150,27 @@ static BOOL macdrv_context_create(int format, void *shared, const int *attrib_li
                 profile = value;
                 break;
 
+            case WGL_CONTEXT_OPENGL_NO_ERROR_ARB:
+                /* PMW: win32u advertises WGL_ARB_create_context_no_error (SDL2 then always passes this);
+                 * no-error only permits skipping error checks, so ignoring it is conformant. */
+                TRACE("WGL_CONTEXT_OPENGL_NO_ERROR_ARB %d ignored\n", value);
+                break;
+
             default:
                 WARN("Unknown attribute %s.\n", debugstr_attrib(attr, value));
                 RtlSetLastWin32Error(ERROR_INVALID_PARAMETER);
                 return FALSE;
         }
+    }
+
+    /* PMW: OS X has no compatibility profile above 2.1. A compatibility request for 3.0+ (SDL2 GoldSrc asks for
+     * 4.2 compatibility) gets the legacy 2.1 context instead of failing; the application sees GL_VERSION 2.1. */
+    if (major >= 3 && profile == WGL_CONTEXT_COMPATIBILITY_PROFILE_BIT_ARB &&
+        !(flags & WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB))
+    {
+        WARN("compatibility profile %u.%u requested, giving the legacy 2.1 context\n", major, minor);
+        major = 2;
+        minor = 1;
     }
 
     if ((major == 3 && (minor == 2 || minor == 3)) ||
