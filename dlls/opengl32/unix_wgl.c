@@ -2693,7 +2693,7 @@ NTSTATUS return_wow64_string( const void *str, PTR32 *wow64_str )
     else if (wow64_strings[i].wow64_str) *wow64_str = wow64_strings[i].wow64_str;
     else if (*wow64_str)
     {
-        strcpy( UlongToPtr(*wow64_str), str );
+        strcpy( wow64_host_ptr(*wow64_str), str );  /* PMW_VCPU: a 32-bit caller buffer */
         wow64_strings[i].wow64_str = *wow64_str;
     }
 
@@ -3107,7 +3107,8 @@ static void *wow64_map_buffer( TEB *teb, struct buffer *buffer, GLenum target, G
 
     buffer->host_ptr = ptr;
     if (!offset && !length) length = buffer->size;
-    if (ULongToPtr(PtrToUlong(ptr)) == ptr) /* we're lucky */
+    /* PMW_VCPU: reachable from 32-bit code only inside its window (host BASE + p) */
+    if (wow64_host_ptr(PtrToUlong(ptr)) == ptr) /* we're lucky */
     {
         buffer->map_ptr = ptr;
         TRACE( "returning %p\n", buffer->map_ptr );
@@ -3491,7 +3492,7 @@ NTSTATUS wow64_get_pixel_formats( void *args )
     {
         .teb = get_teb64(params32->teb),
         .hdc = ULongToPtr(params32->hdc),
-        .formats = ULongToPtr(params32->formats),
+        .formats = wow64_host_ptr(params32->formats),  /* PMW_VCPU: a 32-bit caller buffer */
         .max_formats = params32->max_formats,
     };
     NTSTATUS status;

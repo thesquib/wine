@@ -462,6 +462,38 @@ sub get_func_ret($$)
     return $ret;
 }
 
+# PMW_VCPU: in a vCPU-mode WoW64 process a 32-bit address is at host BASE + p, so 32-bit pointer arguments go through
+# wow64_host_ptr (BASE 0 elsewhere: the same zero extension as ULongToPtr). Handles and values stay ULongToPtr. A
+# pointer that GL reads as an offset into a bound buffer when one is bound (vertex arrays, indices, indirect, pixel
+# pack/unpack) goes through wow64_gl_buffer_ptr, which widens it only when nothing is bound at that binding.
+sub get_wow64_buffer_binding($$)
+{
+    my ($name, $pname) = @_;
+    return "GL_DRAW_INDIRECT_BUFFER_BINDING" if $pname eq "indirect";
+    return "GL_ELEMENT_ARRAY_BUFFER_BINDING" if $pname eq "indices" && $name =~ /^gl(Multi)?(Mode)?Draw(Range)?Elements/;
+    return "GL_ARRAY_BUFFER_BINDING" if $pname =~ /^(pointer|ptr)$/ && $name !~ /^glGet/ &&
+                                        $name =~ /(Pointer|^glInterleavedArrays)[A-Z]*$/;
+    return "GL_PIXEL_UNPACK_BUFFER_BINDING"
+        if $name =~ /^gl((Compressed)?(Tex|Texture|MultiTex)(Sub)?Image[1234]D|DrawPixels|Bitmap|PolygonStipple|ColorTable|ColorSubTable|ConvolutionFilter[12]D|SeparableFilter2D|PixelMap(f|ui|us)v)[A-Z]*$/;
+    return "GL_PIXEL_PACK_BUFFER_BINDING"
+        if $name =~ /^gl(Readn?Pixels|Getn?(Compressed)?(Tex|Texture|MultiTex)(Sub)?Image|Getn?(PolygonStipple|ColorTable|ConvolutionFilter|SeparableFilter|Histogram|Minmax|PixelMap(f|ui|us)v))[A-Z]*$/;
+    return undef;
+}
+
+sub get_wow64_ptr_expr($$$)
+{
+    my ($name, $pname, $value) = @_;
+    my $binding = get_wow64_buffer_binding( $name, $pname );
+    return "wow64_gl_buffer_ptr( teb, $binding, $value )" if defined $binding;
+    return "wow64_host_ptr( $value )";
+}
+
+sub is_wow64_address_type($)
+{
+    my $arg_type = shift;
+    return $arg_type =~ /[\*\[]/ || $arg_type =~ /^(const )?(GLstring|LPCSTR|LPGLYPHMETRICSFLOAT)$/;
+}
+
 sub generate_unix_thunk($$$$)
 {
     my ($name, $func, $is_wow64, $prefix) = @_;
@@ -532,7 +564,15 @@ sub generate_unix_thunk($$$$)
                     $arg_type =~ s/^const //;
                 }
                 $vars .= "    $arg_type$pname;\n";
-                $input_conv .= "    $pname = copy_wow64_ptr32s( params->$pname, params->$pointer_array_count{$_} );\n";
+                if ($arg_type =~ /(sizei|int)ptr/)
+                {
+                    $input_conv .= "    $pname = copy_wow64_ptr32s( params->$pname, params->$pointer_array_count{$_} );\n";
+                }
+                else
+                {
+                    my $binding = get_wow64_buffer_binding( $name, $pname ) || "0";
+                    $input_conv .= "    $pname = copy_wow64_host_ptr32s( teb, $binding, params->$pname, params->$pointer_array_count{$_} );\n";
+                }
                 $output_conv .= "    free( $pname );\n";
                 $call_args .= " $pname,";
             }
@@ -540,12 +580,25 @@ sub generate_unix_thunk($$$$)
             {
                 $arg_type =~ s/\*$//;
                 $vars .= "    $arg_type$pname\_arg;\n";
-                $output_conv .= "    *(PTR32 *)UlongToPtr(params->$pname) = PtrToUlong( $pname\_arg );\n";
+                $output_conv .= "    *(PTR32 *)wow64_host_ptr(params->$pname) = PtrToUlong( $pname\_arg );\n";
                 $call_args .= " &$pname\_arg,";
             }
             elsif ($arg_type =~ /(sizei|int)ptr/)
             {
-                $call_args .= " (" . $arg_type . ")ULongToPtr(params->$pname),";
+                if ($arg_type =~ /\*/)
+                {
+                    $call_args .= " (" . $arg_type . ")wow64_host_ptr(params->$pname),";
+                }
+                else
+                {
+                    $call_args .= " (" . $arg_type . ")ULongToPtr(params->$pname),";
+                }
+            }
+            elsif (is_wow64_address_type( $arg_type ))
+            {
+                $call_args .= " " . get_wow64_ptr_expr( $name, $pname, "params->$pname" ) . ",";
+                $need_manual_thunk = 1 if $arg_type =~ /(\*.*\*|(sizei|int)ptr.*\*)/;
+                $need_lock = 1 if $arg_type =~ /GLsync/;
             }
             else
             {
@@ -641,7 +694,7 @@ sub generate_unix_thunk($$$$)
     $ret .= "    assert( !is_wine_reserved_texture( $teb, params->texture ));\n" if $has_texture;
     if (defined $textures_in_thunks{$name})
     {
-        my $textures = $is_wow64 ? "UlongToPtr(params->textures)" : "params->textures";
+        my $textures = $is_wow64 ? "wow64_host_ptr(params->textures)" : "params->textures";
         $ret .= "    if ($textures)\n";
         $ret .= "    {\n";
         $ret .= "        for (const GLuint *tex = $textures, *end = tex + params->$textures_in_thunks{$name}; tex != end; tex++)\n";
@@ -678,7 +731,7 @@ sub generate_unix_thunk($$$$)
     $ret .= "    pop_default_fbo( $teb );\n" if defined $hide_default_fbo_thunks{$name};
     if (defined $textures_out_thunks{$name})
     {
-        my $textures = $is_wow64 ? "UlongToPtr(params->textures)" : "params->textures";
+        my $textures = $is_wow64 ? "wow64_host_ptr(params->textures)" : "params->textures";
         $ret .= "    for (const GLuint *tex = $textures, *end = tex + params->$textures_out_thunks{$name}; tex != end; tex++) ";
         $ret .= "assert( !is_wine_reserved_texture( $teb, *tex ));\n";
     }
@@ -687,7 +740,7 @@ sub generate_unix_thunk($$$$)
         my $state_args = $state_attrib_funcs{$name};
         if ($is_wow64)
         {
-            $state_args =~ s/PARAMSPTR/UlongToPtr/g;
+            $state_args =~ s/PARAMSPTR/wow64_host_ptr/g;
         }
         else
         {

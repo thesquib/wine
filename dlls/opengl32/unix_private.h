@@ -59,9 +59,14 @@ static inline const struct opengl_funcs *get_dc_funcs( HDC hdc )
 
 #ifdef _WIN64
 
-static inline void *copy_wow64_ptr32s( UINT_PTR address, ULONG count )
+/* PMW_VCPU: 32-bit caller addresses go through wow64_host_ptr (in a vCPU-mode WoW64 process a 32-bit address is at
+ * host BASE + p; BASE is 0 elsewhere). PtrToUlong write-backs of host pointers into the 32-bit space stay: BASE is
+ * 4 GiB aligned, so the low 32 bits of such a pointer are its guest address. */
+
+/* an array of 32-bit VALUES (GLintptr / GLsizeiptr) at a 32-bit address */
+static inline void *copy_wow64_ptr32s( ULONG address, ULONG count )
 {
-    ULONG *ptrs = (ULONG *)address;
+    ULONG *ptrs = wow64_host_ptr( address );
     void **tmp;
 
     if (!ptrs || !(tmp = calloc( count, sizeof(*tmp) ))) return NULL;
@@ -69,9 +74,37 @@ static inline void *copy_wow64_ptr32s( UINT_PTR address, ULONG count )
     return tmp;
 }
 
+/* PMW_VCPU: a vertex array / indices / indirect / pixel pack-unpack pointer, which GL reads as an offset into the
+ * buffer bound at binding when one is bound and as a client address otherwise: widen it only in the second case. Off
+ * the vCPU route both are the same value and no GL query is made. */
+static inline void *wow64_gl_buffer_ptr( TEB *teb, GLenum binding, ULONG p )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    void *host = wow64_host_ptr( p );
+    GLint bound = 0;
+
+    if (host == ULongToPtr( p )) return host;
+    funcs->p_glGetIntegerv( binding, &bound );
+    return bound ? ULongToPtr( p ) : host;
+}
+
+/* an array of 32-bit ADDRESSES at a 32-bit address (binding 0: always addresses, else see wow64_gl_buffer_ptr) */
+static inline void *copy_wow64_host_ptr32s( TEB *teb, GLenum binding, ULONG address, ULONG count )
+{
+    ULONG *ptrs = wow64_host_ptr( address );
+    GLint bound = 0;
+    void **tmp;
+
+    if (!ptrs || !(tmp = calloc( count, sizeof(*tmp) ))) return NULL;
+    if (binding && wow64_host_ptr( 0x10000 ) != ULongToPtr( 0x10000 ))
+        ((const struct opengl_funcs *)teb->glTable)->p_glGetIntegerv( binding, &bound );
+    while (count--) tmp[count] = bound ? ULongToPtr(ptrs[count]) : wow64_host_ptr(ptrs[count]);
+    return tmp;
+}
+
 static inline TEB *get_teb64( ULONG teb32 )
 {
-    TEB32 *teb32_ptr = ULongToPtr( teb32 );
+    TEB32 *teb32_ptr = wow64_host_ptr( teb32 );
     return (TEB *)((char *)teb32_ptr + teb32_ptr->WowTebOffset);
 }
 
