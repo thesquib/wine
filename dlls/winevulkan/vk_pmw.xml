@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Vendor-private Vulkan extensions of the proton-mac (PMW) fork. Not part of the
+Khronos registry. Merged into Mesa's generators (vk_extensions, dispatch table,
+entrypoints, command queue) next to vk.xml; the C declarations are in
+include/vulkan/vk_pmw_metalfx.h and must match this file. The same fragment is
+meant to be merged into winevulkan's vk.xml so make_vulkan can thunk it: only
+plain handles, POD structs and scalars cross the API, no Metal objects.
+
+Extension number 90001 is far outside the Khronos range, so its enum offsets
+(1000000000 + 90000 * 1000 + offset) cannot collide with a real extension.
+
+SPDX-License-Identifier: MIT
+-->
+<registry>
+    <types>
+        <type category="handle" parent="VkDevice" objtypeenum="VK_OBJECT_TYPE_UNKNOWN"><type>VK_DEFINE_NON_DISPATCHABLE_HANDLE</type>(<name>VkMetalFXScalerPMW</name>)</type>
+        <type name="VkMetalFXScalerTypePMW" category="enum"/>
+        <type name="VkMetalFXColorProcessingModePMW" category="enum"/>
+        <type name="VkMetalFXScalerCreateFlagBitsPMW" category="enum"/>
+        <type requires="VkMetalFXScalerCreateFlagBitsPMW" category="bitmask">typedef <type>VkFlags</type> <name>VkMetalFXScalerCreateFlagsPMW</name>;</type>
+        <type category="struct" name="VkPhysicalDeviceMetalFXScalerPropertiesPMW" returnedonly="true" structextends="VkPhysicalDeviceProperties2">
+            <member values="VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_METALFX_SCALER_PROPERTIES_PMW"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true"><type>void</type>*                            <name>pNext</name></member>
+            <member><type>VkBool32</type>                         <name>spatialScaler</name></member>
+            <member><type>VkBool32</type>                         <name>temporalScaler</name></member>
+            <member><type>float</type>                            <name>temporalMinScale</name></member>
+            <member><type>float</type>                            <name>temporalMaxScale</name></member>
+            <member><type>VkImageUsageFlags</type>                <name>inputImageUsage</name></member>
+            <member><type>VkImageUsageFlags</type>                <name>outputImageUsage</name></member>
+        </type>
+        <type category="struct" name="VkMetalFXScalerCreateInfoPMW">
+            <member values="VK_STRUCTURE_TYPE_METALFX_SCALER_CREATE_INFO_PMW"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*                      <name>pNext</name></member>
+            <member optional="true"><type>VkMetalFXScalerCreateFlagsPMW</type>    <name>flags</name></member>
+            <member><type>VkMetalFXScalerTypePMW</type>           <name>scalerType</name></member>
+            <member><type>VkFormat</type>                         <name>colorFormat</name></member>
+            <member optional="true"><type>VkFormat</type>         <name>depthFormat</name></member>
+            <member optional="true"><type>VkFormat</type>         <name>motionFormat</name></member>
+            <member optional="true"><type>VkFormat</type>         <name>reactiveMaskFormat</name></member>
+            <member><type>VkFormat</type>                         <name>outputFormat</name></member>
+            <member><type>VkExtent2D</type>                       <name>inputExtent</name></member>
+            <member><type>VkExtent2D</type>                       <name>outputExtent</name></member>
+            <member optional="true"><type>VkMetalFXColorProcessingModePMW</type>  <name>colorProcessingMode</name></member>
+            <member optional="true"><type>float</type>            <name>inputContentMinScale</name></member>
+            <member optional="true"><type>float</type>            <name>inputContentMaxScale</name></member>
+        </type>
+        <type category="struct" name="VkMetalFXUpscaleInfoPMW">
+            <member values="VK_STRUCTURE_TYPE_METALFX_UPSCALE_INFO_PMW"><type>VkStructureType</type> <name>sType</name></member>
+            <member optional="true">const <type>void</type>*                      <name>pNext</name></member>
+            <member><type>VkImage</type>                          <name>colorImage</name></member>
+            <member optional="true"><type>VkImage</type>          <name>depthImage</name></member>
+            <member optional="true"><type>VkImage</type>          <name>motionImage</name></member>
+            <member optional="true"><type>VkImage</type>          <name>exposureImage</name></member>
+            <member optional="true"><type>VkImage</type>          <name>reactiveMaskImage</name></member>
+            <member><type>VkImage</type>                          <name>outputImage</name></member>
+            <member><type>VkExtent2D</type>                       <name>inputContentExtent</name></member>
+            <member><type>float</type>                            <name>jitterOffsetX</name></member>
+            <member><type>float</type>                            <name>jitterOffsetY</name></member>
+            <member><type>float</type>                            <name>motionVectorScaleX</name></member>
+            <member><type>float</type>                            <name>motionVectorScaleY</name></member>
+            <member><type>float</type>                            <name>preExposure</name></member>
+            <member><type>VkBool32</type>                         <name>reset</name></member>
+            <member><type>VkBool32</type>                         <name>depthReversed</name></member>
+        </type>
+    </types>
+
+    <enums name="VkMetalFXScalerTypePMW" type="enum">
+        <enum value="0" name="VK_METALFX_SCALER_TYPE_SPATIAL_PMW"/>
+        <enum value="1" name="VK_METALFX_SCALER_TYPE_TEMPORAL_PMW"/>
+    </enums>
+    <enums name="VkMetalFXColorProcessingModePMW" type="enum">
+        <enum value="0" name="VK_METALFX_COLOR_PROCESSING_MODE_PERCEPTUAL_PMW"/>
+        <enum value="1" name="VK_METALFX_COLOR_PROCESSING_MODE_LINEAR_PMW"/>
+        <enum value="2" name="VK_METALFX_COLOR_PROCESSING_MODE_HDR_PMW"/>
+    </enums>
+    <enums name="VkMetalFXScalerCreateFlagBitsPMW" type="bitmask">
+        <enum bitpos="0" name="VK_METALFX_SCALER_CREATE_AUTO_EXPOSURE_BIT_PMW"/>
+        <enum bitpos="1" name="VK_METALFX_SCALER_CREATE_REACTIVE_MASK_BIT_PMW"/>
+        <enum bitpos="2" name="VK_METALFX_SCALER_CREATE_DYNAMIC_RESOLUTION_BIT_PMW"/>
+        <enum bitpos="3" name="VK_METALFX_SCALER_CREATE_SYNCHRONOUS_INIT_BIT_PMW"/>
+    </enums>
+
+    <commands>
+        <command successcodes="VK_SUCCESS" errorcodes="VK_ERROR_OUT_OF_HOST_MEMORY,VK_ERROR_OUT_OF_DEVICE_MEMORY,VK_ERROR_FORMAT_NOT_SUPPORTED,VK_ERROR_FEATURE_NOT_PRESENT,VK_ERROR_INITIALIZATION_FAILED">
+            <proto><type>VkResult</type> <name>vkCreateMetalFXScalerPMW</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param>const <type>VkMetalFXScalerCreateInfoPMW</type>* <name>pCreateInfo</name></param>
+            <param optional="true">const <type>VkAllocationCallbacks</type>* <name>pAllocator</name></param>
+            <param><type>VkMetalFXScalerPMW</type>* <name>pScaler</name></param>
+        </command>
+        <command>
+            <proto><type>void</type> <name>vkDestroyMetalFXScalerPMW</name></proto>
+            <param><type>VkDevice</type> <name>device</name></param>
+            <param optional="true" externsync="true"><type>VkMetalFXScalerPMW</type> <name>scaler</name></param>
+            <param optional="true">const <type>VkAllocationCallbacks</type>* <name>pAllocator</name></param>
+        </command>
+        <command queues="VK_QUEUE_COMPUTE_BIT,VK_QUEUE_GRAPHICS_BIT" renderpass="outside" cmdbufferlevel="primary,secondary" tasks="action">
+            <proto><type>void</type> <name>vkCmdMetalFXUpscalePMW</name></proto>
+            <param externsync="true"><type>VkCommandBuffer</type> <name>commandBuffer</name></param>
+            <param externsync="true"><type>VkMetalFXScalerPMW</type> <name>scaler</name></param>
+            <param>const <type>VkMetalFXUpscaleInfoPMW</type>* <name>pUpscaleInfo</name></param>
+        </command>
+    </commands>
+
+    <extensions>
+        <extension name="VK_PMW_metalfx_scaler" number="90001" type="device" author="PMW" contact="proton-mac" supported="vulkan" depends="VK_KHR_get_physical_device_properties2,VK_VERSION_1_1">
+            <require>
+                <enum value="1" name="VK_PMW_METALFX_SCALER_SPEC_VERSION"/>
+                <enum value="&quot;VK_PMW_metalfx_scaler&quot;" name="VK_PMW_METALFX_SCALER_EXTENSION_NAME"/>
+                <enum offset="0" extends="VkStructureType" name="VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_METALFX_SCALER_PROPERTIES_PMW"/>
+                <enum offset="1" extends="VkStructureType" name="VK_STRUCTURE_TYPE_METALFX_SCALER_CREATE_INFO_PMW"/>
+                <enum offset="2" extends="VkStructureType" name="VK_STRUCTURE_TYPE_METALFX_UPSCALE_INFO_PMW"/>
+                <type name="VkMetalFXScalerPMW"/>
+                <type name="VkMetalFXScalerTypePMW"/>
+                <type name="VkMetalFXColorProcessingModePMW"/>
+                <type name="VkMetalFXScalerCreateFlagBitsPMW"/>
+                <type name="VkMetalFXScalerCreateFlagsPMW"/>
+                <type name="VkPhysicalDeviceMetalFXScalerPropertiesPMW"/>
+                <type name="VkMetalFXScalerCreateInfoPMW"/>
+                <type name="VkMetalFXUpscaleInfoPMW"/>
+                <command name="vkCreateMetalFXScalerPMW"/>
+                <command name="vkDestroyMetalFXScalerPMW"/>
+                <command name="vkCmdMetalFXUpscalePMW"/>
+            </require>
+        </extension>
+    </extensions>
+</registry>
