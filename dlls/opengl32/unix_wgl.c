@@ -1686,7 +1686,11 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
 
     if (TRACE_ON(opengl)) for (i = 0; i < count; i++) TRACE( "++ %s\n", extensions[i] );
 
-    funcs->p_glGetIntegerv( GL_CONTEXT_PROFILE_MASK, &profile );
+    /* PMW: GL_CONTEXT_PROFILE_MASK is GL 3.2+; on a legacy context (OS X 2.1) it raised GL_INVALID_ENUM that the
+     * application's first glGetError then saw (SDL2 GoldSrc: "Failed to create SDL Window"). */
+    profile = 0;
+    if (ctx->major_version > 3 || (ctx->major_version == 3 && ctx->minor_version >= 2))
+        funcs->p_glGetIntegerv( GL_CONTEXT_PROFILE_MASK, &profile );
     ctx->base.is_core = !!(profile & GL_CONTEXT_CORE_PROFILE_BIT);
     ctx->base.has_GL_ARB_viewport_array = is_extension_supported( ctx, "GL_ARB_viewport_array" );
     ctx->base.has_GL_ARB_clip_control = is_extension_supported( ctx, "GL_ARB_clip_control" );
@@ -1695,6 +1699,9 @@ static void make_context_current( TEB *teb, const struct opengl_funcs *funcs, HD
     ctx->base.has_GL_ARB_vertex_program = !ctx->base.is_core && is_extension_supported( ctx, "GL_ARB_vertex_program" );
     ctx->base.integer_scaling = fs_hack_is_integer();
     if (!ctx->base.gamma_program) fs_hack_setup_gamma_shader( &ctx->base, funcs );
+    /* PMW: this one-time setup runs before the application has made a call on this context, so any GL error left
+     * now is ours (e.g. the gamma shader failing to build on a 2.1 context); do not hand it to the application. */
+    for (i = 0; i < 8 && funcs->p_glGetError() != GL_NO_ERROR; i++) {}
     /* Drawable's FBO could've changed in driver. */
     pop_default_fbo( teb );
 }
