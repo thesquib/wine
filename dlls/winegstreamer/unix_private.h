@@ -106,9 +106,12 @@ extern GstTaskPool *wg_task_pool_new(void);
 
 /* wg_allocator.c */
 
+/* PMW_VCPU: host base of a vCPU-mode WoW64 process's 32-bit space (0 elsewhere), see wg_parser.c */
+extern UINT_PTR wg_wow64_base;
+
 static inline BYTE *wg_sample_data(struct wg_sample *sample)
 {
-    return (BYTE *)(UINT_PTR)sample->data;
+    return (BYTE *)(wg_wow64_base + (UINT_PTR)sample->data);
 }
 
 /* wg_allocator_release_sample can be used to release any sample that was requested. */

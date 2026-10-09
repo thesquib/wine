@@ -2346,9 +2346,20 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 
 C_ASSERT(ARRAYSIZE(__wine_unix_call_funcs) == unix_wg_funcs_count);
 
+UINT_PTR wg_wow64_base;
+
 #ifdef _WIN64
 
 typedef ULONG PTR32;
+
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process); the wg_parser_t/wg_transform_t/wg_muxer_t values are host pointers and stay as they are. A wg_sample's
+ * data is a 32-bit guest address too, and wg_sample_data also runs on GStreamer threads (no TEB to derive BASE
+ * from), so the sample thunks latch BASE, which is the same for every thread of the process, in wg_wow64_base. */
+static void latch_wow64_base(void)
+{
+    wg_wow64_base = (UINT_PTR)wow64_host_ptr(1) - 1;
+}
 
 struct wg_media_type32
 {
@@ -2368,7 +2379,7 @@ static NTSTATUS wow64_wg_parser_connect(void *args)
     struct wg_parser_connect_params params =
     {
         .parser = params32->parser,
-        .uri = ULongToPtr(params32->uri),
+        .uri = wow64_host_ptr(params32->uri),
         .file_size = params32->file_size,
     };
 
@@ -2385,7 +2396,7 @@ static NTSTATUS wow64_wg_parser_push_data(void *args) {
     struct wg_parser_push_data_params params =
     {
         .parser = params32->parser,
-        .data = ULongToPtr(params32->data),
+        .data = wow64_host_ptr(params32->data),
         .size = params32->size,
     };
 
@@ -2402,7 +2413,7 @@ static NTSTATUS wow64_wg_parser_stream_get_current_format(void *args)
     struct wg_parser_stream_get_current_format_params params =
     {
         .stream = params32->stream,
-        .format = ULongToPtr(params32->format),
+        .format = wow64_host_ptr(params32->format),
     };
 
     return wg_parser_stream_get_current_format(&params);
@@ -2418,7 +2429,7 @@ static NTSTATUS wow64_wg_parser_stream_get_codec_format(void *args)
     struct wg_parser_stream_get_codec_format_params params =
     {
         .stream = params32->stream,
-        .format = ULongToPtr(params32->format),
+        .format = wow64_host_ptr(params32->format),
     };
 
     return wg_parser_stream_get_codec_format(&params);
@@ -2434,7 +2445,7 @@ static NTSTATUS wow64_wg_parser_stream_enable(void *args)
     struct wg_parser_stream_enable_params params =
     {
         .stream = params32->stream,
-        .format = ULongToPtr(params32->format),
+        .format = wow64_host_ptr(params32->format),
     };
 
     return wg_parser_stream_enable(&params);
@@ -2452,7 +2463,7 @@ static NTSTATUS wow64_wg_parser_stream_get_buffer(void *args)
     {
         .parser = params32->parser,
         .stream = params32->stream,
-        .buffer = ULongToPtr(params32->buffer),
+        .buffer = wow64_host_ptr(params32->buffer),
     };
     return wg_parser_stream_get_buffer(&params);
 }
@@ -2469,7 +2480,7 @@ static NTSTATUS wow64_wg_parser_stream_copy_buffer(void *args)
     struct wg_parser_stream_copy_buffer_params params =
     {
         .stream = params32->stream,
-        .data = ULongToPtr(params32->data),
+        .data = wow64_host_ptr(params32->data),
         .offset = params32->offset,
         .size = params32->size,
     };
@@ -2489,8 +2500,8 @@ static NTSTATUS wow64_wg_parser_stream_get_tag(void *args)
     {
         .stream = params32->stream,
         .tag = params32->tag,
-        .buffer = ULongToPtr(params32->buffer),
-        .size = ULongToPtr(params32->size),
+        .buffer = wow64_host_ptr(params32->buffer),
+        .size = wow64_host_ptr(params32->size),
     };
 
     return wg_parser_stream_get_tag(&params);
@@ -2511,13 +2522,13 @@ NTSTATUS wow64_wg_transform_create(void *args)
         {
             .major = params32->input_type.major,
             .format_size = params32->input_type.format_size,
-            .u.format = ULongToPtr(params32->input_type.format),
+            .u.format = wow64_host_ptr(params32->input_type.format),
         },
         .output_type =
         {
             .major = params32->output_type.major,
             .format_size = params32->output_type.format_size,
-            .u.format = ULongToPtr(params32->output_type.format),
+            .u.format = wow64_host_ptr(params32->output_type.format),
         },
         .attrs = params32->attrs,
     };
@@ -2542,7 +2553,7 @@ NTSTATUS wow64_wg_transform_get_output_type(void *args)
         {
             .major = params32->media_type.major,
             .format_size = params32->media_type.format_size,
-            .u.format = ULongToPtr(params32->media_type.format),
+            .u.format = wow64_host_ptr(params32->media_type.format),
         },
     };
     NTSTATUS status;
@@ -2567,7 +2578,7 @@ NTSTATUS wow64_wg_transform_set_output_type(void *args)
         {
             .major = params32->media_type.major,
             .format_size = params32->media_type.format_size,
-            .u.format = ULongToPtr(params32->media_type.format),
+            .u.format = wow64_host_ptr(params32->media_type.format),
         },
     };
     return wg_transform_set_output_type(&params);
@@ -2584,10 +2595,11 @@ NTSTATUS wow64_wg_transform_push_data(void *args)
     struct wg_transform_push_data_params params =
     {
         .transform = params32->transform,
-        .sample = ULongToPtr(params32->sample),
+        .sample = wow64_host_ptr(params32->sample),
     };
     NTSTATUS ret;
 
+    latch_wow64_base();
     ret = wg_transform_push_data(&params);
     params32->result = params.result;
     return ret;
@@ -2604,10 +2616,11 @@ NTSTATUS wow64_wg_transform_read_data(void *args)
     struct wg_transform_read_data_params params =
     {
         .transform = params32->transform,
-        .sample = ULongToPtr(params32->sample),
+        .sample = wow64_host_ptr(params32->sample),
     };
     NTSTATUS ret;
 
+    latch_wow64_base();
     ret = wg_transform_read_data(&params);
     params32->result = params.result;
     return ret;
@@ -2622,7 +2635,7 @@ NTSTATUS wow64_wg_muxer_create(void *args)
     } *params32 = args;
     struct wg_muxer_create_params params =
     {
-        .format = ULongToPtr(params32->format),
+        .format = wow64_host_ptr(params32->format),
     };
     NTSTATUS ret;
 
@@ -2643,7 +2656,7 @@ NTSTATUS wow64_wg_muxer_add_stream(void *args)
     {
         .muxer = params32->muxer,
         .stream_id = params32->stream_id,
-        .format = ULongToPtr(params32->format),
+        .format = wow64_host_ptr(params32->format),
     };
     return wg_muxer_add_stream(&params);
 }
@@ -2659,9 +2672,10 @@ NTSTATUS wow64_wg_muxer_push_sample(void *args)
     struct wg_muxer_push_sample_params params =
     {
         .muxer = params32->muxer,
-        .sample = ULongToPtr(params32->sample),
+        .sample = wow64_host_ptr(params32->sample),
         .stream_id = params32->stream_id,
     };
+    latch_wow64_base();
     return wg_muxer_push_sample(&params);
 }
 
@@ -2677,7 +2691,7 @@ NTSTATUS wow64_wg_muxer_read_data(void *args)
     struct wg_muxer_read_data_params params =
     {
         .muxer = params32->muxer,
-        .buffer = ULongToPtr(params32->buffer),
+        .buffer = wow64_host_ptr(params32->buffer),
         .size = params32->size,
         .offset = params32->offset,
     };
