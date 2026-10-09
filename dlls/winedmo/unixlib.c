@@ -165,6 +165,11 @@ C_ASSERT(ARRAY_SIZE(__wine_unix_call_funcs) == unix_funcs_count);
 
 typedef ULONG PTR32;
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process). The context write-back and the callbacks' context stay: BASE is 4 GiB aligned, so the low 32 bits of a
+ * host pointer into the 32-bit window are its guest address. demuxer_read and demuxer_stream_type carry a 32-bit
+ * address in a UINT64 field (sample data, media type format), so they get thunks too. */
+
 static NTSTATUS wow64_demuxer_create( void *arg )
 {
     struct
@@ -179,8 +184,8 @@ static NTSTATUS wow64_demuxer_create( void *arg )
     struct demuxer_create_params params;
     NTSTATUS status;
 
-    params.url = UintToPtr( params32->url );
-    params.context = UintToPtr( params32->context );
+    params.url = wow64_host_ptr( params32->url );
+    params.context = wow64_host_ptr( params32->context );
     if ((status = demuxer_create( &params ))) return status;
     params32->demuxer = params.demuxer;
     memcpy( params32->mime_type, params.mime_type, 256 );
@@ -207,6 +212,32 @@ static NTSTATUS wow64_demuxer_destroy( void *arg )
     return status;
 }
 
+static NTSTATUS wow64_demuxer_read( void *arg )
+{
+    struct demuxer_read_params *params32 = arg, params = *params32;
+    NTSTATUS status;
+
+    params.sample.data = (UINT_PTR)wow64_host_ptr( params32->sample.data );
+    status = demuxer_read( &params );
+    params.sample.data = params32->sample.data;
+    *params32 = params;
+
+    return status;
+}
+
+static NTSTATUS wow64_demuxer_stream_type( void *arg )
+{
+    struct demuxer_stream_type_params *params32 = arg, params = *params32;
+    NTSTATUS status;
+
+    params.media_type.format = wow64_host_ptr( params32->media_type.__pad );
+    status = demuxer_stream_type( &params );
+    params32->media_type.major = params.media_type.major;
+    params32->media_type.format_size = params.media_type.format_size;
+
+    return status;
+}
+
 const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
 {
 #define X64( name ) [unix_##name] = wow64_##name
@@ -215,11 +246,11 @@ const unixlib_entry_t __wine_unix_call_wow64_funcs[] =
     X( demuxer_check ),
     X64( demuxer_create ),
     X64( demuxer_destroy ),
-    X( demuxer_read ),
+    X64( demuxer_read ),
     X( demuxer_seek ),
     X( demuxer_stream_lang ),
     X( demuxer_stream_name ),
-    X( demuxer_stream_type ),
+    X64( demuxer_stream_type ),
 };
 
 C_ASSERT(ARRAY_SIZE(__wine_unix_call_wow64_funcs) == unix_funcs_count);
