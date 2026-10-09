@@ -973,7 +973,7 @@ class VkFunction(object):
         params = ", ".join([p.variable(conv, unwrap, params_prefix) for p in self.params])
         if self.extra_param:
             if conv:
-                params += ", UlongToPtr({0}{1})".format(params_prefix, self.extra_param)
+                params += ", wow64_host_ptr({0}{1})".format(params_prefix, self.extra_param)  # PMW_VCPU: a client object
             else:
                 params += ", {0}{1}".format(params_prefix, self.extra_param)
 
@@ -1303,6 +1303,22 @@ class VkVariable(object):
             return True
         return self.is_pointer_pointer()
 
+    def wow64_ptr(self, value, pointee=False):
+        """ PMW_VCPU: a 32-bit value of this variable (or with pointee, of what it points to) as the host sees it.
+        In a vCPU-mode WoW64 process a 32-bit address is at host BASE + p, so addresses (pointers, strings,
+        dispatchable handles, which are the address of their client object) go through wow64_host_ptr (BASE 0
+        elsewhere: the same zero extension as UlongToPtr). Win32 handles, callbacks and pUserData are opaque to the
+        host and keep UlongToPtr. """
+
+        opaque = self.type in ["HWND", "HINSTANCE", "HANDLE"] or self.type.startswith("PFN")
+        if pointee:
+            opaque = opaque and self.pointer.count('*') == 1
+        elif self.is_pointer() or self.is_static_array():
+            opaque = self.name == "pUserData"
+        if opaque:
+            return "UlongToPtr({0})".format(value)
+        return "wow64_host_ptr({0})".format(value)
+
     def is_handle(self):
         return self.handle is not None
 
@@ -1419,7 +1435,7 @@ class VkVariable(object):
         else:
             ptr = ""
 
-        return f"{ptr}({cast_type})UlongToPtr({prefix}{self.name})"
+        return f"{ptr}({cast_type}){self.wow64_ptr(prefix + self.name)}"
 
 
 class VkMember(VkVariable):
@@ -1557,7 +1573,8 @@ class VkMember(VkVariable):
             elif self.is_generic_handle():
                 if direction == Direction.OUTPUT:
                     LOGGER.error("OUTPUT parameter {0}.{1} cannot be unwrapped".format(self.type, self.name))
-                return "{0}{1} = wine_vk_unwrap_handle({2}{3}, {2}{1});\n".format(output, self.name, input, self.object_type)
+                return "{0}{1} = wine_vk_unwrap_handle{4}({2}{3}, {2}{1});\n".format(output, self.name, input,
+                    self.object_type, "32" if conv else "")
             else:
                 selector_part = ", {0}{1}".format(input, self.selector) if self.selector else ""
                 conversions.append(StructConversionFunction(self.struct, direction, conv, unwrap, is_const))
@@ -1576,7 +1593,7 @@ class VkMember(VkVariable):
         elif conv and direction == Direction.OUTPUT and self.is_pointer():
             return "{0}{1} = PtrToUlong({2}{1});\n".format(output, self.name, input)
         elif conv and direction == Direction.INPUT and self.is_pointer():
-            return "{0}{1} = UlongToPtr({2}{1});\n".format(output, self.name, input)
+            return "{0}{1} = {2};\n".format(output, self.name, self.wow64_ptr(input + self.name))
         elif direction == Direction.INPUT:
             return "{0}{1} = {2};\n".format(output, self.name, self.value(input, conv))
         else:
@@ -1813,7 +1830,7 @@ class VkParam(VkVariable):
                 return "    convert_{0}_{3}({4}{1}, &{2}_host);\n".format(self.type, self.value(prefix, conv),
                     self.name, suffix, ctx_param)
             elif self.is_pointer_size() and self.type != "size_t":
-                return "    {0}_host = UlongToPtr(*{1});\n".format(self.name, self.value(prefix, conv))
+                return "    {0}_host = {1};\n".format(self.name, self.wow64_ptr("*" + self.value(prefix, conv), pointee=True))
             else:
                 return "    {0}_host = *{1};\n".format(self.name, self.value(prefix, conv))
         else:
@@ -1977,8 +1994,8 @@ class VkParam(VkVariable):
         if unwrap != Unwrap.NONE:
             unwrap_handle = None
             if self.object_type != None and self.type == "uint64_t":
-                unwrap_handle = "wine_vk_unwrap_handle({0}{1}, {0}{2})".format(
-                    params_prefix, self.object_type, self.name)
+                unwrap_handle = "wine_vk_unwrap_handle{3}({0}{1}, {0}{2})".format(
+                    params_prefix, self.object_type, self.name, "32" if conv else "")
 
             elif self.is_handle():
                 # We need to pass the host handle to the host Vulkan calls and
@@ -2407,7 +2424,7 @@ class StructConversionFunction(object):
 
         if needs_extensions:
             if self.conv and self.direction == Direction.INPUT:
-                body += "\n    for (in_header = UlongToPtr(in->pNext); in_header; in_header = UlongToPtr(in_header->pNext))\n"
+                body += "\n    for (in_header = wow64_host_ptr(in->pNext); in_header; in_header = wow64_host_ptr(in_header->pNext))\n"
             else:
                 body += "\n    for (in_header = (void *)in->pNext; in_header; in_header = (void *)in_header->pNext)\n"
             body += "    {\n"
@@ -2595,7 +2612,7 @@ class ArrayConversionFunction(object):
                         body += "        {\n"
                         body += "            out[i] = conversion_context_alloc(ctx, sizeof(*out[i]));\n"
                         if self.conv:
-                            in_param = "({0} *)UlongToPtr(in[i])".format(win_type)
+                            in_param = "({0} *)wow64_host_ptr(in[i])".format(win_type)
                         else:
                             in_param = "in[i]"
                         conversions.append(StructConversionFunction(struct, self.direction, self.conv, self.unwrap, is_const))
@@ -2605,7 +2622,7 @@ class ArrayConversionFunction(object):
                         body += "        else\n"
                         body += "            out[i] = NULL;\n"
                     else:
-                        body += "        out[i] = UlongToPtr(in[i]);\n"
+                        body += "        out[i] = wow64_host_ptr(in[i]);\n"
             elif self.array.is_handle():
                 if pointer_array:
                     LOGGER.error("Unhandled handle pointer arrays")
@@ -2613,7 +2630,7 @@ class ArrayConversionFunction(object):
                 if not self.conv or not handle.is_dispatchable():
                     input = "in[i]"
                 elif self.direction == Direction.INPUT:
-                    input = "UlongToPtr(in[i])"
+                    input = "wow64_host_ptr(in[i])"  # PMW_VCPU: the address of the client object
                 else:
                     input = "PtrToUlong(in[i])"
 
@@ -2625,7 +2642,7 @@ class ArrayConversionFunction(object):
                     LOGGER.warning("Unhandled handle output conversion")
             elif pointer_array:
                 if self.direction == Direction.INPUT:
-                    body += "        out[i] = UlongToPtr(in[i]);\n"
+                    body += "        out[i] = wow64_host_ptr(in[i]);\n"
                 else:
                     body += "        out[i] = PtrToUlong(in[i]);\n"
             else:
@@ -2741,6 +2758,21 @@ class VkGenerator(object):
         f.write("    default:\n")
         f.write("       return handle;\n")
         f.write("    }\n")
+        f.write("}\n\n")
+
+        # PMW_VCPU: a dispatchable handle from a WoW64 caller is the 32-bit address of its client object
+        f.write("static uint64_t wine_vk_unwrap_handle32(uint32_t type, uint64_t handle)\n")
+        f.write("{\n")
+        f.write("    switch(type)\n")
+        f.write("    {\n")
+        for handle in self.registry.handles:
+            if not handle.is_required() or not handle.is_wrapped() or handle.is_alias() or not handle.is_dispatchable():
+                continue
+            f.write("    case {}:\n".format(handle.object_type))
+        f.write("        handle = (uintptr_t) wow64_host_ptr((ULONG) handle);\n")
+        f.write("        break;\n")
+        f.write("    }\n")
+        f.write("    return wine_vk_unwrap_handle(type, handle);\n")
         f.write("}\n\n")
 
         f.write(conv_helpers)

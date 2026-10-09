@@ -115,6 +115,16 @@ static inline struct wine_deferred_operation *wine_deferred_operation_from_handl
 
 typedef UINT32 PTR32;
 
+/* PMW_VCPU: 32-bit caller addresses go through wow64_host_ptr (in a vCPU-mode WoW64 process a 32-bit address is at
+ * host BASE + p; BASE is 0 elsewhere). PtrToUlong write-backs of host pointers into the 32-bit space stay: BASE is
+ * 4 GiB aligned, so the low 32 bits of such a pointer are its guest address. */
+#ifndef _WIN64
+static inline void *wow64_host_ptr( ULONG p )
+{
+    return ULongToPtr( p );
+}
+#endif
+
 typedef struct
 {
     VkStructureType sType;
@@ -131,7 +141,7 @@ static inline void *find_next_struct32(void *s, VkStructureType t)
 {
     VkBaseOutStructure32 *header;
 
-    for (header = s; header; header = UlongToPtr(header->pNext))
+    for (header = s; header; header = wow64_host_ptr(header->pNext))
     {
         if (header->sType == t)
             return header;

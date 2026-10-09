@@ -2308,7 +2308,8 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
     }
 
 #ifdef _WIN64
-    if (NtCurrentTeb()->WowTebOffset && res == VK_SUCCESS && (UINT_PTR)*data >> 32)
+    /* PMW_VCPU: reachable from 32-bit code only inside its window (host BASE + p) */
+    if (NtCurrentTeb()->WowTebOffset && res == VK_SUCCESS && wow64_host_ptr( PtrToUlong(*data) ) != *data)
     {
         FIXME( "returned mapping %p does not fit 32-bit pointer\n", *data );
         device->p_vkUnmapMemory( device->host.device, memory->obj.host.device_memory );

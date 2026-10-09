@@ -1023,7 +1023,7 @@ NTSTATUS wow64_init_vulkan(void *arg)
     struct init_params params;
     params.call_vulkan_debug_report_callback = params32->call_vulkan_debug_report_callback;
     params.call_vulkan_debug_utils_callback = params32->call_vulkan_debug_utils_callback;
-    params.extensions = UlongToPtr(params32->extensions);
+    params.extensions = wow64_host_ptr(params32->extensions);  /* PMW_VCPU: a 32-bit caller buffer */
     return init_vulkan(&params);
 }
 
@@ -1034,7 +1034,8 @@ NTSTATUS vk_is_available_instance_function32(void *arg)
         UINT32 instance;
         UINT32 name;
     } *params = arg;
-    return is_available_instance_function(UlongToPtr(params->instance), UlongToPtr(params->name));
+    /* PMW_VCPU: the client object and the name are 32-bit caller addresses */
+    return is_available_instance_function(wow64_host_ptr(params->instance), wow64_host_ptr(params->name));
 }
 
 /* PROTON_DARWIN PMW_VK_BATCH (loader.c): run queued vkCmd* records in order, each through the unix call table
@@ -1071,5 +1072,6 @@ NTSTATUS vk_is_available_device_function32(void *arg)
         UINT32 device;
         UINT32 name;
     } *params = arg;
-    return is_available_device_function(UlongToPtr(params->device), UlongToPtr(params->name));
+    /* PMW_VCPU: the client object and the name are 32-bit caller addresses */
+    return is_available_device_function(wow64_host_ptr(params->device), wow64_host_ptr(params->name));
 }
