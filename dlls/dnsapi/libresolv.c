@@ -355,6 +355,9 @@ C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
 
 typedef ULONG PTR32;
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process). */
+
 static NTSTATUS wow64_resolv_get_searchlist( void *args )
 {
     struct
@@ -365,8 +368,8 @@ static NTSTATUS wow64_resolv_get_searchlist( void *args )
 
     struct get_searchlist_params params =
     {
-        ULongToPtr(params32->list),
-        ULongToPtr(params32->len)
+        wow64_host_ptr(params32->list),
+        wow64_host_ptr(params32->len)
     };
 
     return resolv_get_searchlist( &params );
@@ -384,8 +387,8 @@ static NTSTATUS wow64_resolv_get_serverlist( void *args )
     struct get_serverlist_params params =
     {
         params32->family,
-        ULongToPtr(params32->addrs),
-        ULongToPtr(params32->len)
+        wow64_host_ptr(params32->addrs),
+        wow64_host_ptr(params32->len)
     };
 
     return resolv_get_serverlist( &params );
@@ -404,11 +407,11 @@ static NTSTATUS wow64_resolv_query( void *args )
 
     struct query_params params =
     {
-        ULongToPtr(params32->name),
+        wow64_host_ptr(params32->name),
         params32->type,
         params32->options,
-        ULongToPtr(params32->buf),
-        ULongToPtr(params32->len)
+        wow64_host_ptr(params32->buf),
+        wow64_host_ptr(params32->len)
     };
 
     return resolv_query( &params );

@@ -323,6 +323,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
 
 typedef ULONG PTR32;
 
+/* PMW_VCPU: guest addresses go through wow64_host_ptr (a 32-bit address is at host BASE + p in a vCPU-mode WoW64
+ * process); abort_event is a handle and stays. The audio_lock write-back stays: the buffer is a zero_bits
+ * allocation, inside the 32-bit window, whose low 32 bits are its guest address. */
+
 static NTSTATUS wow64_tts_voice_load(void *args)
 {
     struct
@@ -335,7 +339,7 @@ static NTSTATUS wow64_tts_voice_load(void *args)
     struct tts_voice_load_params params =
     {
         .tts = params32->tts,
-        .model_path = ULongToPtr(params32->model_path),
+        .model_path = wow64_host_ptr(params32->model_path),
         .speaker_id = params32->speaker_id,
     };
     NTSTATUS ret;
@@ -355,7 +359,7 @@ static NTSTATUS wow64_tts_voice_set_config(void *args)
     struct tts_voice_set_config_params params =
     {
         .voice = params32->voice,
-        .length_scale = ULongToPtr(params32->length_scale),
+        .length_scale = wow64_host_ptr(params32->length_scale),
     };
 
     return tts_voice_set_config(&params);
@@ -374,7 +378,7 @@ static NTSTATUS wow64_tts_voice_synthesize(void *args)
     struct tts_voice_synthesize_params params =
     {
         .voice = params32->voice,
-        .text = ULongToPtr(params32->text),
+        .text = wow64_host_ptr(params32->text),
         .size = params32->size,
         .abort_event = ULongToHandle(params32->abort_event),
     };
