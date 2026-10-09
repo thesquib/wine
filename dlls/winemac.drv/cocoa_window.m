@@ -516,6 +516,29 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
 @end
 
 
+/* Every WineMetalView (a Vulkan/Metal swapchain target) at or below view. */
+static void collect_metal_views(NSView *view, NSMutableArray *out)
+{
+    if ([view isKindOfClass:[WineMetalView class]])
+        [out addObject:view];
+    for (NSView *sub in [view subviews])
+        collect_metal_views(sub, out);
+}
+
+/* PMW_WINEMAC_NO_EXPOSE_REPAIR=1 turns off the occlusion -> visible repair
+ * (-noteOcclusionChangeForMetalContent), to A/B it. Cached single getenv. */
+static int pmw_expose_repair_disabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *v = getenv("PMW_WINEMAC_NO_EXPOSE_REPAIR");
+        cached = (v && *v && strcmp(v, "0")) ? 1 : 0;
+    }
+    return cached;
+}
+
+
 @interface WineWindow ()
 
 @property (readwrite, nonatomic) BOOL disabled;
@@ -767,10 +790,22 @@ static CVReturn WineDisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTi
              * never restores it, so a delegate check would miss them. Only BARE
              * E.1 overlay layers (CALayerHost / stray CAMetalLayer not owned by
              * a WineMetalView subview) get torn down. */
+            /* Bug (Proton macOS) 2026-10-09: walk ALL descendants, not just
+             * direct subviews. A child-window Vulkan surface (every Steam CEF
+             * window: the compositor draws into a child HWND) puts its
+             * WineMetalView inside the client-surface cocoa_view, one level
+             * down. When the E.1 same-process attach had moved that view's
+             * CAMetalLayer up onto this view's layer, the direct-subview check
+             * missed it and the strip below left the live swapchain layer with
+             * no superlayer: presents kept succeeding into a detached layer and
+             * the window stayed black until the surface was recreated (seen on
+             * the hover popup and "Launching" popup, vcpu-game-steam-20261009-230053.log). */
             NSMutableSet *liveMetalLayers = [NSMutableSet set];
-            for (NSView *sv in [self subviews])
-                if ([sv isKindOfClass:[WineMetalView class]] && [sv layer])
-                    [liveMetalLayers addObject:[NSValue valueWithNonretainedObject:[sv layer]]];
+            NSMutableArray *metalViews = [NSMutableArray array];
+            collect_metal_views(self, metalViews);
+            for (WineMetalView *mv in metalViews)
+                if ([mv layer])
+                    [liveMetalLayers addObject:[NSValue valueWithNonretainedObject:[mv layer]]];
             NSArray *existing = [self.layer.sublayers copy];
             [CATransaction begin];
             [CATransaction setDisableActions:YES];
@@ -3501,9 +3536,73 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
         [controller windowGotFocus:self];
     }
 
+    /* Bug (Proton macOS) 2026-10-09: Steam's CEF windows (ANGLE-Vulkan over
+     * KosmicKrisp, one CAMetalLayer per compositor child HWND) go BLACK after
+     * a while in the background and stay black until something makes Chromium
+     * present again: the main window's web view comes back when Steam re-shows
+     * it, the Friends list (static content, never re-presents on its own)
+     * stays black until it is closed and reopened. Chromium presents only on
+     * damage, and on Windows the OS asks it to repaint with WM_PAINT whenever
+     * a window is uncovered; under winemac nothing does, so whatever happened
+     * to the layer's on-screen content while the window was occluded (its
+     * drawable released by the window server, or the layer detached by an E.1
+     * re-host / software-surface strip) is never repaired.
+     *
+     * On every occluded -> visible transition of a window that holds a Metal
+     * swapchain view: (1) re-insert any WineMetalView whose layer has lost its
+     * superlayer (re-adding the view makes AppKit put its backing layer back),
+     * (2) post WINDOW_EXPOSED so the window's thread invalidates the HWND and
+     * its children (RedrawWindow), which Chromium turns into a full-damage
+     * redraw, i.e. a new present. PMW_WINEMAC_NO_EXPOSE_REPAIR=1 disables. */
+    - (void) noteOcclusionChangeForMetalContent
+    {
+        BOOL visible = ([self occlusionState] & NSWindowOcclusionStateVisible) != 0;
+        NSTimeInterval now = [[NSProcessInfo processInfo] systemUptime];
+        BOOL becameVisible = occlusionStateKnown && !occlusionWasVisible && visible;
+
+        if (!visible && (!occlusionStateKnown || occlusionWasVisible))
+            occludedSince = now;
+        occlusionStateKnown = YES;
+        occlusionWasVisible = visible;
+
+        if (!becameVisible || pmw_expose_repair_disabled()) return;
+
+        NSMutableArray *metalViews = [NSMutableArray array];
+        collect_metal_views([self contentView], metalViews);
+        if (![metalViews count]) return;
+
+        int reattached = 0;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        for (WineMetalView *mv in metalViews)
+        {
+            NSView *sv = [mv superview];
+            if (!sv || ![mv layer] || [mv layer].superlayer) continue;
+            [mv retain];
+            [mv removeFromSuperview];
+            [sv addSubview:mv positioned:NSWindowBelow relativeTo:nil];
+            [mv release];
+            if (![mv layer].superlayer && [sv layer])
+                [[sv layer] insertSublayer:[mv layer] atIndex:0];
+            reattached++;
+        }
+        [CATransaction commit];
+
+        [queue discardEventsMatchingMask:event_mask_for_type(WINDOW_EXPOSED) forWindow:self];
+        macdrv_event* event = macdrv_create_event(WINDOW_EXPOSED, self);
+        [queue postEvent:event];
+        macdrv_release_event(event);
+
+        if (reattached || now - occludedSince >= 1.0)
+            fprintf(stderr, "winemac:EXPOSE hwnd=%p visible after %.1f s occluded: %lu metal view(s), "
+                    "%d detached layer(s) re-attached, redraw posted\n", self.hwnd, now - occludedSince,
+                    (unsigned long)[metalViews count], reattached);
+    }
+
     - (void) windowDidChangeOcclusionState:(NSNotification*)notification
     {
         [self checkWineDisplayLink];
+        [self noteOcclusionChangeForMetalContent];
     }
 
     - (void) windowDidChangeScreen:(NSNotification*)notification

@@ -235,6 +235,7 @@ extern void macdrv_window_maximize_requested(HWND hwnd);
 extern void macdrv_window_minimize_requested(HWND hwnd);
 extern void macdrv_window_did_minimize(HWND hwnd);
 extern void macdrv_window_did_unminimize(HWND hwnd);
+extern void macdrv_window_exposed(HWND hwnd);
 extern void macdrv_window_brought_forward(HWND hwnd);
 extern void macdrv_window_resize_ended(HWND hwnd);
 extern void macdrv_window_restore_requested(HWND hwnd, const macdrv_event *event);

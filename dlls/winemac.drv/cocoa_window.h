@@ -84,6 +84,11 @@
     BOOL fakingClose;
 
     CAShapeLayer* contentViewMaskLayer;
+
+    /* Occlusion -> visible repair, see -noteOcclusionChangeForMetalContent */
+    BOOL occlusionStateKnown;
+    BOOL occlusionWasVisible;
+    NSTimeInterval occludedSince;
 }
 
 @property (retain, readonly, nonatomic) WineEventQueue* queue;

@@ -69,6 +69,7 @@ static const char *dbgstr_event(int type)
         "WINDOW_DID_UNMINIMIZE",
         "WINDOW_DRAG_BEGIN",
         "WINDOW_DRAG_END",
+        "WINDOW_EXPOSED",
         "WINDOW_FRAME_CHANGED",
         "WINDOW_GOT_FOCUS",
         "WINDOW_LOST_FOCUS",
@@ -126,6 +127,7 @@ static macdrv_event_mask get_event_mask(DWORD mask)
         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_BUTTON);
         event_mask |= event_mask_for_type(STATUS_ITEM_MOUSE_MOVE);
         event_mask |= event_mask_for_type(WINDOW_DID_UNMINIMIZE);
+        event_mask |= event_mask_for_type(WINDOW_EXPOSED);
         event_mask |= event_mask_for_type(WINDOW_FRAME_CHANGED);
         event_mask |= event_mask_for_type(WINDOW_GOT_FOCUS);
         event_mask |= event_mask_for_type(WINDOW_LOST_FOCUS);
@@ -456,6 +458,9 @@ void macdrv_handle_event(const macdrv_event *event)
         break;
     case WINDOW_DRAG_END:
         macdrv_window_drag_end(hwnd);
+        break;
+    case WINDOW_EXPOSED:
+        macdrv_window_exposed(hwnd);
         break;
     case WINDOW_FRAME_CHANGED:
         macdrv_window_frame_changed(hwnd, event);

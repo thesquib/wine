@@ -2252,6 +2252,25 @@ void macdrv_window_did_minimize(HWND hwnd)
 
 
 /***********************************************************************
+ *              macdrv_window_exposed
+ *
+ * Handler for WINDOW_EXPOSED events: a window holding a Metal swapchain view
+ * became visible again after being occluded. Ask the app to repaint, as
+ * Windows does when a window is uncovered. A GPU-composited Chromium window
+ * turns the WM_PAINT into a full-damage compositor redraw and presents again;
+ * without it, a static CEF window (Steam's Friends list) keeps whatever its
+ * layer shows after the occlusion, which can be black. No RDW_ERASE/RDW_FRAME:
+ * a GDI erase or frame paint would flush the window surface and set a
+ * software colorImage over the GPU content.
+ */
+void macdrv_window_exposed(HWND hwnd)
+{
+    TRACE("win %p\n", hwnd);
+    NtUserRedrawWindow(hwnd, NULL, 0, RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+
+/***********************************************************************
  *              macdrv_window_did_unminimize
  *
  * Handler for WINDOW_DID_UNMINIMIZE events.
