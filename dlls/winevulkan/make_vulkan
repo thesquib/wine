@@ -3184,6 +3184,9 @@ class VkRegistry(object):
 
         root.extend(video_root)
         root.extend(ET.parse("winevk.xml").getroot())
+        # PROTON_DARWIN: vendor-private VK_PMW_* extensions of our KosmicKrisp fork (same fragment as KK's
+        # src/vulkan/registry/vk_pmw.xml), so PE code reaches them through the generated thunks.
+        root.extend(ET.parse("vk_pmw.xml").getroot())
 
         self._parse_enums(root)
         self._parse_types(root)
