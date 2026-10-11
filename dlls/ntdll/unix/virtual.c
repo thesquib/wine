@@ -7634,12 +7634,28 @@ static unsigned int fill_basic_memory_info( const void *addr, MEMORY_BASIC_INFOR
 
     base = ROUND_ADDR( addr, page_mask );
 
+    if (vcpu_mode && ((ULONG_PTR)base == 0x7ffe0000 ||
+        (wow_window && base == (char *)wow_window + 0x7ffe0000)))
+    {
+        info->BaseAddress = info->AllocationBase = base;
+        info->RegionSize = 0x1000;
+        info->State = MEM_COMMIT;
+        info->Protect = info->AllocationProtect = PAGE_READONLY;
+        info->Type = MEM_PRIVATE;
+        return STATUS_SUCCESS;
+    }
+
     if (is_beyond_limit( base, 1, working_set_limit )) return STATUS_INVALID_PARAMETER;
 
     /* Find the view containing the address */
 
     virtual_mutex_enter( &sigset );
     view = get_memory_region_size( base, &alloc_base, &alloc_end, &fake_reserved );
+    if (vcpu_mode && (ULONG_PTR)base < 0x7ffe0000 && (ULONG_PTR)alloc_end > 0x7ffe0000)
+        alloc_end = (char *)0x7ffe0000;
+    if (vcpu_mode && wow_window && base < (char *)wow_window + 0x7ffe0000 &&
+        alloc_end > (char *)wow_window + 0x7ffe0000)
+        alloc_end = (char *)wow_window + 0x7ffe0000;
 
     /* Fill the info structure */
 
@@ -8827,6 +8843,23 @@ NTSTATUS WINAPI NtReadVirtualMemory( HANDLE process, const void *addr, void *buf
     else if (process == GetCurrentProcess())
     {
         addr = wow_canon_arg( addr, __func__ );
+#if defined(__APPLE__) && defined(__aarch64__)
+        if (vcpu_mode)
+        {
+            ULONG_PTR guest = (ULONG_PTR)addr;
+            if (wow_window && guest - (ULONG_PTR)wow_window < WOW_WINDOW_SIZE)
+                guest -= (ULONG_PTR)wow_window;
+            if ((guest < 0x7ffe0000 && size > 0x7ffe0000 - guest) ||
+                (guest >= 0x7ffe0000 && guest < 0x7fff0000 &&
+                 (guest >= 0x7ffe1000 || size > 0x7ffe1000 - guest)))
+            {
+                if (bytes_read) *bytes_read = 0;
+                return STATUS_PARTIAL_COPY;
+            }
+            if (guest >= 0x7ffe0000 && guest < 0x7ffe1000)
+                addr = (char *)vcpu_kuser_host() + (guest - 0x7ffe0000);
+        }
+#endif
         __TRY
         {
             memmove( buffer, addr, size );

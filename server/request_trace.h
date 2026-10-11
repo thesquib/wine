@@ -128,6 +128,7 @@ static void dump_init_process_done_request( const struct init_process_done_reque
     dump_uint64( " teb=", &req->teb );
     dump_uint64( ", peb=", &req->peb );
     dump_uint64( ", ldt_copy=", &req->ldt_copy );
+    dump_uint64( ", guest_shared_data=", &req->guest_shared_data );
 }
 
 static void dump_init_process_done_reply( const struct init_process_done_reply *req )

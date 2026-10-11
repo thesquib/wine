@@ -1789,6 +1789,9 @@ void server_init_process_done(void)
     {
         req->teb = wine_server_client_ptr( teb );
         req->peb = NtCurrentTeb64() ? NtCurrentTeb64()->Peb : wine_server_client_ptr( peb );
+#if defined(__APPLE__) && defined(__aarch64__)
+        req->guest_shared_data = vcpu_mode ? wine_server_client_ptr( vcpu_kuser_host() ) : 0;
+#endif
         status = wine_server_call( req );
         suspend = reply->suspend;
     }

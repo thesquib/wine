@@ -694,6 +694,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->startup_info    = NULL;
     process->idle_event      = NULL;
     process->peb             = 0;
+    process->guest_shared_data = 0;
     process->dir_cache       = NULL;
     process->winstation      = 0;
     process->desktop         = 0;
@@ -1495,6 +1496,7 @@ DECL_HANDLER(init_process_done)
 
     current->teb = req->teb;
     process->peb = req->peb;
+    process->guest_shared_data = req->guest_shared_data;
 
     process->start_time = current_time;
 

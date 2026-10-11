@@ -26,6 +26,8 @@
 #include <stdio.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 #ifdef HAVE_SYS_SYSCTL_H
@@ -391,6 +393,22 @@ int send_thread_signal( struct thread *thread, int sig )
     return (ret != -1);
 }
 
+/* Translate a WoW64 guest address using the target's relocated PEB window.
+ * The shared-data hole retains its legacy low address, as in the vCPU mapper. */
+static client_ptr_t remote_read_address( struct process *process, client_ptr_t ptr )
+{
+#if defined(__aarch64__)
+    const char *mode = getenv( "PMW_VCPU" );
+    const client_ptr_t low_mask = 0xffffffffULL;
+    client_ptr_t base = process->peb & ~low_mask;
+
+    if (mode && !strcmp( mode, "1" ) && is_wow64_process( process ) && base &&
+        ptr && ptr <= low_mask && !(ptr >= 0x7ffe0000 && ptr < 0x7fff0000))
+        return base + ptr;
+#endif
+    return ptr;
+}
+
 /* read data from a process memory space */
 int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t size, char *dest )
 {
@@ -408,6 +426,26 @@ int read_process_memory( struct process *process, client_ptr_t ptr, data_size_t 
         set_error( STATUS_ACCESS_DENIED );
         return 0;
     }
+
+    /* The guest shared page has no low-address Mach mapping. Read the
+     * target's published backing, retaining the normal handle/port checks. */
+    if (process->guest_shared_data)
+    {
+        client_ptr_t guest = ptr, base = process->peb & ~0xffffffffULL;
+        if (is_wow64_process( process ) && base && ptr - base <= 0xffffffffULL)
+            guest -= base;
+        if ((guest < 0x7ffe0000 && size > 0x7ffe0000 - guest) ||
+            (guest >= 0x7ffe0000 && guest < 0x7fff0000 &&
+             (guest >= 0x7ffe1000 || size > 0x7ffe1000 - guest)))
+        {
+            set_error( STATUS_PARTIAL_COPY );
+            return 0;
+        }
+        if (guest >= 0x7ffe0000 && guest < 0x7ffe1000)
+            ptr = process->guest_shared_data + (guest - 0x7ffe0000);
+        else ptr = remote_read_address( process, ptr );
+    }
+    else ptr = remote_read_address( process, ptr );
 
     ret = mach_vm_read_overwrite( process_port, (mach_vm_address_t)ptr, (mach_vm_size_t)size, (mach_vm_address_t)dest, &bytes_read );
     mach_set_error( ret );

@@ -1161,6 +1161,7 @@ struct cpu_topology_override
     client_ptr_t teb;          /* TEB of new thread (in process address space) */
     client_ptr_t peb;          /* PEB of new process (in process address space) */
     client_ptr_t ldt_copy;     /* address of LDT copy (in process address space) */
+    client_ptr_t guest_shared_data; /* host backing of the vCPU shared-data page, or zero */
 @REPLY
     int          suspend;      /* is process suspended? */
 @END

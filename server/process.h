@@ -78,6 +78,7 @@ struct process
     obj_handle_t         desktop;         /* handle to desktop to use for new threads */
     struct token        *token;           /* security token associated with this process */
     struct list          views;           /* list of memory views */
+    client_ptr_t         guest_shared_data; /* target host backing of vCPU shared data */
     client_ptr_t         peb;             /* PEB address in client address space */
     struct dir_cache    *dir_cache;       /* map of client-side directory cache */
     unsigned int         trace_data;      /* opaque data used by the process tracing mechanism */
