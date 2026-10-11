@@ -3506,6 +3506,25 @@ static BOOL wow_window_request( ULONG_PTR *limit_low, ULONG_PTR *limit_high )
  * the host side cannot touch the low twin, and Wine's views live at BASE + p. 0 stays 0 ("anywhere"); gmm_vm_canon
  * leaves KUSER's legacy low page where it is. Counted as "w6:arg canon" under PMW_VCPU_PROF.
  */
+/* Experimental opt-in 64-bit low-address support; host views use the existing mirror. */
+static BOOL vcpu_low64;
+
+void *virtual_low64_host_pointer( const void *addr )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    if (vcpu_low64 && wow_window && addr && (ULONG_PTR)addr < WOW_WINDOW_SIZE)
+        return (void *)(ULONG_PTR)gmm_vm_canon( vcpu_gmm(), (ULONG_PTR)addr );
+#endif
+    return (void *)addr;
+}
+
+static void *low64_guest_pointer( void *addr )
+{
+    if (vcpu_low64 && wow_window && (ULONG_PTR)addr - (ULONG_PTR)wow_window < WOW_WINDOW_SIZE)
+        return (void *)((ULONG_PTR)addr - (ULONG_PTR)wow_window);
+    return addr;
+}
+
 static void *wow_canon_arg( const void *addr, const char *func )
 {
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -3516,7 +3535,7 @@ static void *wow_canon_arg( const void *addr, const char *func )
     canon = (void *)(ULONG_PTR)gmm_vm_canon( vcpu_gmm(), (ULONG_PTR)addr );
     if (canon == addr) return canon;
     if (vcpu_prof_interval) vcpu_prof_add( VCPU_PROF_WOW_ARG_CANON, 0 );
-    if (InterlockedIncrement( &reported ) <= 16)
+    if (!vcpu_low64 && InterlockedIncrement( &reported ) <= 16)
         ERR( "%s: 32-bit address %p was not widened, using %p\n", func, addr, canon );
     return canon;
 #else
@@ -6981,6 +7000,13 @@ void virtual_set_large_address_space(void)
         if (!is_wow64())
         {
             if (!vcpu_mode) address_space_start = (void *)0x10000;  /* vCPU mode: nothing below 4 GiB */
+#if defined(__APPLE__) && defined(__aarch64__)
+            if (vcpu_mode && getenv("PMW_VCPU_LOW64") && !strcmp(getenv("PMW_VCPU_LOW64"), "1"))
+            {
+                vcpu_wow_window_open();
+                vcpu_low64 = wow_window != NULL;
+            }
+#endif
 #ifndef __APPLE__  /* don't free the zerofill section on macOS */
             if ((main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) &&
                 (main_image_info.DllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE))
@@ -7157,6 +7183,8 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
 {
     static const ULONG type_mask = MEM_COMMIT | MEM_RESERVE | MEM_TOP_DOWN | MEM_WRITE_WATCH | MEM_RESET;
     ULONG_PTR limit;
+    BOOL low = vcpu_low64 && *ret && (ULONG_PTR)*ret < WOW_WINDOW_SIZE;
+    NTSTATUS status;
 
     TRACE("%p %p %08lx %x %08x\n", process, *ret, *size_ptr, type, protect );
 
@@ -7204,7 +7232,9 @@ NTSTATUS WINAPI NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR z
     else
         limit = 0;
 
-    return allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+    status = allocate_virtual_memory( ret, size_ptr, type, protect, 0, limit, 0, 0 );
+    if (low) *ret = low64_guest_pointer( *ret );
+    return status;
 }
 
 
@@ -7359,6 +7389,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     sigset_t sigset;
     unsigned int status = STATUS_SUCCESS;
     LPVOID addr = *addr_ptr;
+    BOOL low = vcpu_low64 && addr && (ULONG_PTR)addr < WOW_WINDOW_SIZE;
     SIZE_T size = *size_ptr;
 
     TRACE("%p %p %08lx %x\n", process, addr, size, type );
@@ -7433,7 +7464,7 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
 
     if (status == STATUS_SUCCESS)
     {
-        *addr_ptr = base;
+        *addr_ptr = low ? low64_guest_pointer( base ) : base;
         *size_ptr = size;
     }
 
@@ -7457,6 +7488,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
     BYTE vprot;
     SIZE_T size = *size_ptr;
     LPVOID addr = *addr_ptr;
+    BOOL low = vcpu_low64 && addr && (ULONG_PTR)addr < WOW_WINDOW_SIZE;
     DWORD old;
 
     TRACE("%p %p %08lx %08x\n", process, addr, size, new_prot );
@@ -7541,7 +7573,7 @@ NTSTATUS WINAPI NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T 
 
     if (status == STATUS_SUCCESS)
     {
-        *addr_ptr = base;
+        *addr_ptr = low ? low64_guest_pointer( base ) : base;
         *size_ptr = size;
         *old_prot = old;
     }
@@ -8189,6 +8221,7 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
                                       PVOID buffer, SIZE_T len, SIZE_T *res_len )
 {
     NTSTATUS status;
+    BOOL low = vcpu_low64 && addr && (ULONG_PTR)addr < WOW_WINDOW_SIZE;
 
     TRACE("(%p, %p, info_class=%d, %p, %ld, %p)\n",
           process, addr, info_class, buffer, len, res_len);
@@ -8197,7 +8230,14 @@ NTSTATUS WINAPI NtQueryVirtualMemory( HANDLE process, LPCVOID addr,
     switch(info_class)
     {
         case MemoryBasicInformation:
-            return get_basic_memory_info( process, addr, buffer, len, res_len );
+            status = get_basic_memory_info( process, addr, buffer, len, res_len );
+            if (!status && low && process == NtCurrentProcess())
+            {
+                MEMORY_BASIC_INFORMATION *info = buffer;
+                info->BaseAddress = low64_guest_pointer( info->BaseAddress );
+                info->AllocationBase = low64_guest_pointer( info->AllocationBase );
+            }
+            return status;
 
         case MemoryWorkingSetExInformation:
             return get_working_set_ex( process, addr, buffer, len, res_len );

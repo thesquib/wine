@@ -2458,6 +2458,7 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
     /* W5: 32-bit code reaches W through gmm's low mirror, so it faults at p < 4 GiB while Wine's views (guard pages,
      * write watches, stack growth) live at BASE + p. Gated on is_wow64(): the mirror is set in every vCPU process. */
     if (mem_abort && is_wow64() && far < ((uint64_t)1 << 32)) far = gmm_vm_canon( gmm, far );
+    else if (mem_abort) far = (ULONG_PTR)virtual_low64_host_pointer( (void *)(ULONG_PTR)far );
     vt->faults++;
     if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_RAISED];
     if (mem_abort)

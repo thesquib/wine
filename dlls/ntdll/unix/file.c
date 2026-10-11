@@ -6540,6 +6540,8 @@ NTSTATUS WINAPI NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, vo
     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
            handle, event, apc, apc_user, io, buffer, length, offset, key );
 
+    buffer = virtual_low64_host_pointer( buffer );
+
     if (!io) return STATUS_ACCESS_VIOLATION;
 
     status = server_get_unix_fd( handle, FILE_READ_DATA, &unix_handle, &needs_close, &type, &options );
@@ -6831,6 +6833,8 @@ NTSTATUS WINAPI NtWriteFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
 
     TRACE( "(%p,%p,%p,%p,%p,%p,0x%08x,%p,%p)\n",
            handle, event, apc, apc_user, io, buffer, length, offset, key );
+
+    buffer = virtual_low64_host_pointer( buffer );
 
     if (!io) return STATUS_ACCESS_VIOLATION;
 
