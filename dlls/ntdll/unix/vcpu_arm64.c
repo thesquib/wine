@@ -47,6 +47,8 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
+#include <time.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread/qos.h>
@@ -649,9 +651,11 @@ unsigned int vcpu_prof_interval;
 static int vcpu_stallpc;  /* PMW_VCPU_STALLPC, see stall_scan */
 static void stall_scan(void);
 static unsigned int vcpu_sample_ms;  /* PMW_VCPU_SAMPLE_MS, see sample_thread */
+static unsigned int vcpu_rips;  /* PMW_VCPU_RIPS, see rips_report */
 static void sample_report(void);
 static void prio_report( double cpu_s );  /* the CPU time per Windows base priority, below */
 static void *sample_thread( void *arg );
+static void rips_start(void);
 static void stall_parse_dumps( const char *env );
 static unsigned int stall_stack_bytes;  /* PMW_VCPU_STALLPC_STACK, see stall_scan_stack */
 #define prof_interval vcpu_prof_interval
@@ -1080,8 +1084,9 @@ static void prof_start(void)
         vcpu_sample_ms = atoi( env );
         fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_SAMPLE_MS=%u\n", (int)getpid(), vcpu_sample_ms );
         block_all_signals( &sampler_old );
+        rips_start();  /* before the sampler thread: it reads vcpu_rips */
         if (!pthread_create( &sampler, NULL, sample_thread, NULL )) pthread_detach( sampler );
-        else vcpu_sample_ms = 0;
+        else vcpu_sample_ms = vcpu_rips = 0;
         pthread_sigmask( SIG_SETMASK, &sampler_old, NULL );
     }
     if (vcpu_stallpc && (env = getenv( "PMW_VCPU_STALLPC_STACK" )))
@@ -1134,6 +1139,8 @@ struct vcpu_thread
     uint64_t            stall_exits;   /* PMW_VCPU_STALLPC: exits at the reporter's previous tick */
     unsigned int        stall_ticks;   /* PMW_VCPU_STALLPC: ticks in a row without an exit */
     atomic_int          sample_req;    /* PMW_VCPU_SAMPLE_MS: the next KICK exit records this thread's pc */
+    unsigned int        rips_slot;     /* PMW_VCPU_RIPS: its rips_slots index + 1, 0 before its first sample */
+    unsigned int        rips_gen;      /* PMW_VCPU_RIPS: rips_name_gen when its name was last looked up */
     atomic_int          signal_kick;   /* a signal handler kicked: that KICK is never the diagnostics' to absorb */
     UINT                tid;
     struct list         prio_entry;    /* PMW_VCPU_PROF: in prio_threads while prio_listed */
@@ -1607,7 +1614,7 @@ static pthread_mutex_t sample_lock = PTHREAD_MUTEX_INITIALIZER;
  * per-thread state, whose first qword is the current block's header (written at every block entry); the header's first
  * u32 is the offset to the block tail, which holds the block's host size and then its guest rip. Only trusted when pc
  * lies inside that block; 0 otherwise. Reads go through vm_read_overwrite, so a stale pointer cannot fault. */
-static ULONG64 sample_guest_rip( const struct syscall_frame *frame )
+static ULONG64 sample_guest_rip( const struct syscall_frame *frame, ULONG64 *hdr_ret, ULONG64 *size_ret )
 {
     ULONG64 hdr = 0, tail_size[2];
     UINT off = 0;
@@ -1619,18 +1626,36 @@ static ULONG64 sample_guest_rip( const struct syscall_frame *frame )
     if (vm_read_overwrite( mach_task_self(), (vm_address_t)hdr, 4, (vm_address_t)&off, &got ) || !off) return 0;
     if (vm_read_overwrite( mach_task_self(), (vm_address_t)(hdr + off), 16, (vm_address_t)tail_size, &got )) return 0;
     if (frame->pc >= hdr + tail_size[0]) return 0;
+    *hdr_ret = hdr;
+    *size_ret = tail_size[0];
     return tail_size[1];
 }
 
-static void sample_record( const struct syscall_frame *frame )
+static void rips_name_lookup( UINT tid, char *name );
+static void rips_record_locked( struct vcpu_thread *vt, ULONG64 pc, BOOL sim, ULONG64 rip, ULONG64 hdr,
+                                ULONG64 size, const char *name );
+static _Atomic unsigned int rips_name_gen = 1;
+
+static void sample_record( struct vcpu_thread *vt, const struct syscall_frame *frame )
 {
     CHPE_V2_CPU_AREA_INFO *chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo;
     BOOL sim = chpe && chpe->InSimulation;
-    ULONG64 rip = sim ? sample_guest_rip( frame ) : 0;
+    ULONG64 hdr = 0, size = 0;
+    ULONG64 rip = sim ? sample_guest_rip( frame, &hdr, &size ) : 0;
     ULONG64 page = frame->pc >> 12;
-    unsigned int i, h = (unsigned int)((page * 0x9e3779b97f4a7c15ull) >> 52);
+    unsigned int i, h = (unsigned int)((page * 0x9e3779b97f4a7c15ull) >> 52), gen = 0;
+    char name[64];
+    BOOL renamed = FALSE;
 
+    /* PMW_VCPU_RIPS: (re)read this thread's name only after some thread was named, not per sample */
+    if (vcpu_rips && (gen = atomic_load( &rips_name_gen )) != vt->rips_gen)
+    {
+        rips_name_lookup( vt->tid, name );
+        vt->rips_gen = gen;
+        renamed = TRUE;
+    }
     pthread_mutex_lock( &sample_lock );
+    if (vcpu_rips) rips_record_locked( vt, frame->pc, sim, rip, hdr, size, renamed ? name : NULL );
     sample_total++;
     if (sim) sample_sim++;
     for (i = 0; i < 64; i++, h = (h + 1) % SAMPLE_BUCKETS)
@@ -1648,6 +1673,833 @@ static void sample_record( const struct syscall_frame *frame )
     }
     if (i == 64) sample_dropped++;
     pthread_mutex_unlock( &sample_lock );
+}
+
+/* PMW_VCPU_RIPS=<seconds> (diagnostic, default off; needs PMW_VCPU_PROF and PMW_VCPU_SAMPLE_MS): the same samples also
+ * go into cumulative per-thread tables, and every <seconds> (10 is the intended value) a [VCPU-RIPS] block on stderr
+ * reports them from the start (or the last reset), never per interval: a game that ends in NtTerminateProcess(-1)
+ * leaves its last report behind. Samples are keyed by the thread's name (what SetThreadDescription set, see
+ * vcpu_prof_note_thread_name; "tid <hex>" if none), threads of one name merged. Each sample is one of: (a) inside a
+ * FEX JIT block (sample_guest_rip found the block): counted per guest block rip, with a histogram of the host offset
+ * inside the block (pc - block header) in 16-byte buckets; (b) inside the emulator but not in a block (FEX's own code
+ * in libarm64ecfex.dll, or the JIT cache outside a block: dispatcher, stubs); (c) anything else (native ARM64EC code,
+ * Wine, drivers). (b) and (c) are counted per host pc in 16-byte buckets and named module+offset at report time, from
+ * the PEB loader list (PE modules, the guest x64 ones too) or dladdr (unix libraries), never in the kick path. Each
+ * thread with >= 2% of the samples gets its top 64 blocks and top 32 (b) and (c) buckets.
+ *
+ * PMW_VCPU_SAMPLE_DUMP=<path>: the top 32 blocks overall are also written once each (first copy kept) to
+ * <path>.<pid>, a text file, one record per block:
+ *   BLOCK rip=<hex> mod=<module+offset> samples=<n> hdr=<hex> host_size=<n> guest_len=<n> host_len=<n>
+ *   GUEST <guest_len bytes from rip, hex>
+ *   HOST <host_len bytes from hdr, hex>
+ *   END
+ * The host bytes are taken at report time, only once the block at hdr still holds that rip and size (else the block
+ * is retried at the next report); all reads go through vm_read_overwrite. guest_len < 512 means unmapped memory
+ * followed.
+ *
+ * Reset (the counters, not the dump file): kill -INFO <pid> (SIGINFO, only if nothing else handles it), or touching
+ * the file named by PMW_VCPU_RIPS_RESET_FILE (checked every 100 ms by mtime). A "RESET" line with the wall clock marks
+ * it. */
+#define RIPS_SLOTS   1024           /* (tid, name) pairs over the process's life; the last one takes the overflow */
+#define RIPS_NAME    64
+#define RIPS_NAMES   4096
+#define RIPS_BLOCKS  (1u << 16)
+#define RIPS_CELLS   (1u << 18)
+#define RIPS_PROBE   64
+#define RIPS_DUMPED  4096
+enum { RIPS_HIST, RIPS_PC_SIM, RIPS_PC };
+
+struct rips_slot { UINT tid; unsigned int total, jit, pc_sim, pc_other; char name[RIPS_NAME]; };
+struct rips_block { ULONG64 rip, hdr; unsigned int size, count, hdrs, slot; };
+struct rips_cell { ULONG64 a; unsigned int b, count, slot, type; };
+
+static struct rips_slot *rips_slots;      /* all under sample_lock */
+static unsigned int rips_nslots;
+static struct rips_block *rips_blocks;
+static struct rips_cell *rips_cells;
+static unsigned int rips_total, rips_dropped;
+static struct { UINT tid; char name[RIPS_NAME]; } rips_names[RIPS_NAMES];  /* under rips_name_lock */
+static unsigned int rips_nnames;
+static pthread_mutex_t rips_name_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile sig_atomic_t rips_reset_signal;
+static const char *rips_reset_file;
+static FILE *rips_dump_file;
+
+/* NtSetInformationThread( ThreadNameInformation ) succeeded on handle */
+void vcpu_prof_note_thread_name( HANDLE handle, const UNICODE_STRING *name )
+{
+    THREAD_BASIC_INFORMATION info;
+    char nameA[RIPS_NAME];
+    unsigned int i, len;
+    sigset_t old;
+    UINT tid;
+
+    if (!vcpu_rips) return;
+    if (NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL )) return;
+    if (HandleToULong( info.ClientId.UniqueProcess ) != GetCurrentProcessId()) return;
+    tid = HandleToULong( info.ClientId.UniqueThread );
+    len = ntdll_wcstoumbs( name->Buffer, name->Length / sizeof(WCHAR), nameA, sizeof(nameA) - 1, FALSE );
+    nameA[min( len, sizeof(nameA) - 1 )] = 0;
+    block_all_signals( &old );
+    pthread_mutex_lock( &rips_name_lock );
+    for (i = 0; i < rips_nnames; i++) if (rips_names[i].tid == tid) break;
+    if (i == rips_nnames)
+    {
+        if (rips_nnames < RIPS_NAMES) rips_nnames++;
+        else i = tid % RIPS_NAMES;  /* full: overwrite one */
+    }
+    rips_names[i].tid = tid;
+    strcpy( rips_names[i].name, nameA );
+    pthread_mutex_unlock( &rips_name_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    atomic_fetch_add( &rips_name_gen, 1 );
+}
+
+/* a new vCPU thread: a recycled tid must not inherit the name of the thread that had it */
+static void rips_name_forget( UINT tid )
+{
+    unsigned int i;
+
+    pthread_mutex_lock( &rips_name_lock );
+    for (i = 0; i < rips_nnames; i++) if (rips_names[i].tid == tid) rips_names[i].name[0] = 0;
+    pthread_mutex_unlock( &rips_name_lock );
+}
+
+static void rips_name_lookup( UINT tid, char *name )
+{
+    unsigned int i;
+
+    name[0] = 0;
+    pthread_mutex_lock( &rips_name_lock );
+    for (i = 0; i < rips_nnames; i++) if (rips_names[i].tid == tid) { strcpy( name, rips_names[i].name ); break; }
+    pthread_mutex_unlock( &rips_name_lock );
+}
+
+static inline unsigned int rips_hash( ULONG64 a, unsigned int b, unsigned int slot, unsigned int bits )
+{
+    return (unsigned int)(((a ^ ((ULONG64)b << 40) ^ ((ULONG64)slot << 52)) * 0x9e3779b97f4a7c15ull) >> (64 - bits));
+}
+
+/* a sample of vt, under sample_lock: bounded (two probes of at most RIPS_PROBE entries) */
+static void rips_record_locked( struct vcpu_thread *vt, ULONG64 pc, BOOL sim, ULONG64 rip, ULONG64 hdr,
+                                ULONG64 size, const char *name )
+{
+    unsigned int idx = vt->rips_slot, i, h;
+    struct rips_slot *s;
+
+    /* a renamed thread starts a new slot, so that samples stay with the name they were taken under */
+    if (name && idx && idx < RIPS_SLOTS && strcmp( rips_slots[idx - 1].name, name ) && rips_slots[idx - 1].total)
+        idx = 0;
+    if (!idx)
+    {
+        if (rips_nslots < RIPS_SLOTS - 1) idx = ++rips_nslots;
+        else
+        {
+            idx = RIPS_SLOTS;
+            strcpy( rips_slots[idx - 1].name, "(slots exhausted)" );
+        }
+        vt->rips_slot = idx;
+        rips_slots[idx - 1].tid = vt->tid;
+    }
+    s = &rips_slots[idx - 1];
+    if (name && idx < RIPS_SLOTS) snprintf( s->name, sizeof(s->name), "%s", name );
+    s->total++;
+    rips_total++;
+    if (rip)
+    {
+        struct rips_block *b;
+
+        s->jit++;
+        h = rips_hash( rip, 0, idx, 16 );
+        for (i = 0; i < RIPS_PROBE; i++, h = (h + 1) % RIPS_BLOCKS)
+        {
+            b = &rips_blocks[h];
+            if (b->count && (b->rip != rip || b->slot != idx)) continue;
+            if (!b->count) { b->rip = rip; b->slot = idx; b->hdrs = 1; }
+            else if (b->hdr != hdr) b->hdrs++;
+            b->hdr = hdr;
+            b->size = (unsigned int)min( size, 0xffffffffull );
+            b->count++;
+            break;
+        }
+        if (i == RIPS_PROBE) rips_dropped++;
+    }
+    else if (sim) s->pc_sim++;
+    else s->pc_other++;
+    {
+        ULONG64 a = rip ? rip : pc & ~15ull;
+        unsigned int bucket = rip ? (unsigned int)min( (pc - hdr) >> 4, 0xffffffffull ) : 0;
+        unsigned int type = rip ? RIPS_HIST : sim ? RIPS_PC_SIM : RIPS_PC;
+        struct rips_cell *c;
+
+        h = rips_hash( a, bucket * 4 + type, idx, 18 );
+        for (i = 0; i < RIPS_PROBE; i++, h = (h + 1) % RIPS_CELLS)
+        {
+            c = &rips_cells[h];
+            if (c->count && (c->a != a || c->b != bucket || c->slot != idx || c->type != type)) continue;
+            if (!c->count) { c->a = a; c->b = bucket; c->slot = idx; c->type = type; }
+            c->count++;
+            break;
+        }
+        if (i == RIPS_PROBE) rips_dropped++;
+    }
+}
+
+/* modules for module+offset: the PEB loader list (read with vm_read_overwrite: it changes under us), then dladdr */
+struct rips_module { ULONG64 base, size; char name[RIPS_NAME]; };
+static struct rips_module rips_mods[2048];
+static unsigned int rips_nmods;
+
+static BOOL rips_read( ULONG64 addr, void *buf, size_t len )
+{
+    vm_size_t got = 0;
+    return !vm_read_overwrite( mach_task_self(), (vm_address_t)addr, len, (vm_address_t)buf, &got ) && got == len;
+}
+
+/* reads up to len bytes page by page: the length up to the first unreadable page */
+static unsigned int rips_read_partial( ULONG64 addr, unsigned char *buf, unsigned int len )
+{
+    unsigned int done = 0, chunk;
+
+    while (done < len)
+    {
+        chunk = min( len - done, 0x1000 - (unsigned int)((addr + done) & 0xfff) );
+        if (!rips_read( addr + done, buf + done, chunk )) break;
+        done += chunk;
+    }
+    return done;
+}
+
+static void rips_wstr( const UNICODE_STRING *us, char *buf, unsigned int size )
+{
+    WCHAR w[260];
+    unsigned int n = min( us->Length / sizeof(WCHAR), ARRAY_SIZE(w) ), i;
+
+    buf[0] = 0;
+    if (!us->Buffer || !n || !rips_read( (ULONG64)us->Buffer, w, n * sizeof(WCHAR) )) return;
+    for (i = 0; i < n && i + 1 < size; i++) buf[i] = w[i] && w[i] < 0x80 ? (char)w[i] : '?';
+    buf[i] = 0;
+}
+
+static int rips_mod_cmp( const void *a, const void *b )
+{
+    ULONG64 x = ((const struct rips_module *)a)->base, y = ((const struct rips_module *)b)->base;
+    return x < y ? -1 : x > y;
+}
+
+static void rips_modules_refresh( char *fex_path, unsigned int fex_size, ULONG64 *fex_base )
+{
+    PEB p;
+    PEB_LDR_DATA ldr;
+    LDR_DATA_TABLE_ENTRY e;
+    ULONG64 head, cur;
+    unsigned int iter;
+
+    rips_nmods = 0;
+    if (!peb || !rips_read( (ULONG64)peb, &p, sizeof(p) ) || !p.LdrData) return;
+    if (!rips_read( (ULONG64)p.LdrData, &ldr, sizeof(ldr) )) return;
+    head = (ULONG64)p.LdrData + offsetof( PEB_LDR_DATA, InLoadOrderModuleList );
+    cur = (ULONG64)ldr.InLoadOrderModuleList.Flink;
+    for (iter = 0; cur && cur != head && iter < 4096 && rips_nmods < ARRAY_SIZE(rips_mods); iter++)
+    {
+        struct rips_module *m = &rips_mods[rips_nmods];
+
+        if (!rips_read( cur, &e, sizeof(e) )) break;  /* InLoadOrderLinks is the entry's first member */
+        cur = (ULONG64)e.InLoadOrderLinks.Flink;
+        if (!e.DllBase || !e.SizeOfImage) continue;
+        m->base = (ULONG64)e.DllBase;
+        m->size = e.SizeOfImage;
+        rips_wstr( &e.BaseDllName, m->name, sizeof(m->name) );
+        if (!m->name[0]) strcpy( m->name, "?" );
+        if (fex_path && strcasestr( m->name, "arm64ecfex" ))
+        {
+            rips_wstr( &e.FullDllName, fex_path, fex_size );
+            *fex_base = m->base;
+        }
+        rips_nmods++;
+    }
+    qsort( rips_mods, rips_nmods, sizeof(rips_mods[0]), rips_mod_cmp );
+}
+
+static const struct rips_module *rips_module_of( ULONG64 addr )
+{
+    unsigned int lo = 0, hi = rips_nmods;
+
+    while (lo < hi)
+    {
+        unsigned int mid = (lo + hi) / 2;
+        if (addr < rips_mods[mid].base) hi = mid;
+        else if (addr >= rips_mods[mid].base + rips_mods[mid].size) lo = mid + 1;
+        else return &rips_mods[mid];
+    }
+    return NULL;
+}
+
+/* module+offset (PE: offset = RVA); a unix library adds the nearest exported symbol */
+static void rips_name_addr( ULONG64 addr, char *buf, unsigned int size )
+{
+    const struct rips_module *m = rips_module_of( addr );
+    Dl_info info;
+
+    if (m)
+    {
+        snprintf( buf, size, "%s+%#llx", m->name, (unsigned long long)(addr - m->base) );
+        return;
+    }
+    if (dladdr( (void *)addr, &info ) && info.dli_fname)
+    {
+        const char *base = strrchr( info.dli_fname, '/' );
+        base = base ? base + 1 : info.dli_fname;
+        if (info.dli_sname)
+            snprintf( buf, size, "%s+%#llx(%s+%#llx)", base, (unsigned long long)(addr - (ULONG64)info.dli_fbase),
+                      info.dli_sname, (unsigned long long)(addr - (ULONG64)info.dli_saddr) );
+        else
+            snprintf( buf, size, "%s+%#llx", base, (unsigned long long)(addr - (ULONG64)info.dli_fbase) );
+        return;
+    }
+    snprintf( buf, size, "?%#llx", (unsigned long long)addr );
+}
+
+static BOOL rips_is_fex( ULONG64 addr )
+{
+    const struct rips_module *m = rips_module_of( addr );
+    return m && strcasestr( m->name, "arm64ecfex" );
+}
+
+/* report-time copies, sorted and merged per thread group */
+static struct rips_slot *rips_cslots;
+static struct rips_block *rips_cblocks, *rips_tblocks;
+static struct rips_cell *rips_ccells, *rips_tcells;
+static int *rips_group_of;  /* slot index -> group */
+static ULONG64 rips_dumped[RIPS_DUMPED];
+static unsigned int rips_ndumped;
+
+struct rips_group { const char *name; unsigned int total, jit, pc_sim, pc_other, threads; char tids[48]; };
+
+static int rips_block_rip_cmp( const void *a, const void *b )
+{
+    ULONG64 x = ((const struct rips_block *)a)->rip, y = ((const struct rips_block *)b)->rip;
+    return x < y ? -1 : x > y;
+}
+
+static int rips_block_count_cmp( const void *a, const void *b )
+{
+    unsigned int x = ((const struct rips_block *)a)->count, y = ((const struct rips_block *)b)->count;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static int rips_cell_key_cmp( const void *a, const void *b )
+{
+    const struct rips_cell *x = a, *y = b;
+    if (x->a != y->a) return x->a < y->a ? -1 : 1;
+    if (x->b != y->b) return x->b < y->b ? -1 : 1;
+    return 0;
+}
+
+static int rips_cell_count_cmp( const void *a, const void *b )
+{
+    unsigned int x = ((const struct rips_cell *)a)->count, y = ((const struct rips_cell *)b)->count;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+static int rips_group_cmp( const void *a, const void *b )
+{
+    unsigned int x = ((const struct rips_group *)a)->total, y = ((const struct rips_group *)b)->total;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+/* the blocks of group g (or of all, g < 0) merged by rip, most samples first; the hdr and size of the entry with
+ * the most samples are kept */
+static unsigned int rips_merge_blocks( unsigned int nblocks, int g )
+{
+    unsigned int i, n = 0, m = 0;
+
+    for (i = 0; i < nblocks; i++)
+        if (g < 0 || rips_group_of[rips_cblocks[i].slot - 1] == g) rips_tblocks[n++] = rips_cblocks[i];
+    qsort( rips_tblocks, n, sizeof(rips_tblocks[0]), rips_block_rip_cmp );
+    for (i = 0; i < n; i++)
+    {
+        if (m && rips_tblocks[m - 1].rip == rips_tblocks[i].rip)
+        {
+            struct rips_block *t = &rips_tblocks[m - 1];
+            if (rips_tblocks[i].count > t->count) { t->hdr = rips_tblocks[i].hdr; t->size = rips_tblocks[i].size; }
+            t->count += rips_tblocks[i].count;
+            t->hdrs += rips_tblocks[i].hdrs;
+            continue;
+        }
+        rips_tblocks[m++] = rips_tblocks[i];
+    }
+    qsort( rips_tblocks, m, sizeof(rips_tblocks[0]), rips_block_count_cmp );
+    return m;
+}
+
+/* the cells of group g whose type matches (RIPS_PC_SIM and RIPS_PC go together), merged by (a, b), sorted by key;
+ * the merged cell's type is RIPS_PC_SIM if any of its samples was inside the emulator */
+static unsigned int rips_merge_cells( unsigned int ncells, int g, BOOL hist )
+{
+    unsigned int i, n = 0, m = 0;
+
+    for (i = 0; i < ncells; i++)
+    {
+        const struct rips_cell *c = &rips_ccells[i];
+        if (rips_group_of[c->slot - 1] != g || (c->type == RIPS_HIST) != hist) continue;
+        rips_tcells[n++] = *c;
+    }
+    qsort( rips_tcells, n, sizeof(rips_tcells[0]), rips_cell_key_cmp );
+    for (i = 0; i < n; i++)
+    {
+        if (m && !rips_cell_key_cmp( &rips_tcells[m - 1], &rips_tcells[i] ))
+        {
+            rips_tcells[m - 1].count += rips_tcells[i].count;
+            if (rips_tcells[i].type == RIPS_PC_SIM) rips_tcells[m - 1].type = RIPS_PC_SIM;
+            continue;
+        }
+        rips_tcells[m++] = rips_tcells[i];
+    }
+    return m;
+}
+
+static void rips_hex( FILE *f, const char *tag, const unsigned char *p, unsigned int len )
+{
+    static const char digits[] = "0123456789abcdef";
+    char buf[1024];
+    unsigned int i, n = 0;
+
+    fputs( tag, f );
+    for (i = 0; i < len; i++)
+    {
+        buf[n++] = digits[p[i] >> 4];
+        buf[n++] = digits[p[i] & 15];
+        if (n == sizeof(buf)) { fwrite( buf, 1, n, f ); n = 0; }
+    }
+    fwrite( buf, 1, n, f );
+    fputc( '\n', f );
+}
+
+/* PMW_VCPU_SAMPLE_DUMP: the bytes of one hot block, once; FALSE if its JIT code has moved (retried next report) */
+static BOOL rips_dump_block( const struct rips_block *b )
+{
+    unsigned char guest[512], *host;
+    ULONG64 tail[2];
+    UINT off = 0;
+    unsigned int glen, hlen = 0;
+    char where[160];
+
+    if (!rips_read( b->hdr, &off, 4 ) || !off || !rips_read( b->hdr + off, tail, sizeof(tail) )) return FALSE;
+    if (tail[1] != b->rip || tail[0] != b->size || !b->size || b->size > 0x100000) return FALSE;
+    if (!(host = malloc( b->size ))) return FALSE;
+    if (rips_read( b->hdr, host, b->size )) hlen = b->size;
+    glen = rips_read_partial( b->rip, guest, sizeof(guest) );
+    rips_name_addr( b->rip, where, sizeof(where) );
+    fprintf( rips_dump_file, "BLOCK rip=%#llx mod=%s samples=%u hdr=%#llx host_size=%u guest_len=%u host_len=%u\n",
+             (unsigned long long)b->rip, where, b->count, (unsigned long long)b->hdr, b->size, glen, hlen );
+    rips_hex( rips_dump_file, "GUEST ", guest, glen );
+    rips_hex( rips_dump_file, "HOST ", host, hlen );
+    fputs( "END\n", rips_dump_file );
+    fflush( rips_dump_file );
+    free( host );
+    return TRUE;
+}
+
+static void rips_wallclock( char *buf, unsigned int size )
+{
+    struct timespec ts;
+    struct tm tm;
+    int len;
+
+    clock_gettime( CLOCK_REALTIME, &ts );
+    localtime_r( &ts.tv_sec, &tm );
+    len = (int)strftime( buf, size, "%Y-%m-%d %H:%M:%S", &tm );
+    snprintf( buf + len, size - len, ".%03ld", ts.tv_nsec / 1000000 );
+}
+
+static double rips_now(void)
+{
+    struct timespec ts;
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
+static double rips_t0, rips_reset_t;
+
+static void rips_reset( const char *why )
+{
+    unsigned int i;
+    char wall[64];
+
+    pthread_mutex_lock( &sample_lock );
+    memset( rips_blocks, 0, RIPS_BLOCKS * sizeof(*rips_blocks) );
+    memset( rips_cells, 0, RIPS_CELLS * sizeof(*rips_cells) );
+    for (i = 0; i < RIPS_SLOTS; i++)
+        rips_slots[i].total = rips_slots[i].jit = rips_slots[i].pc_sim = rips_slots[i].pc_other = 0;
+    rips_total = rips_dropped = 0;
+    pthread_mutex_unlock( &sample_lock );
+    rips_reset_t = rips_now();
+    rips_wallclock( wall, sizeof(wall) );
+    fprintf( stderr, "[VCPU-RIPS] pid %d RESET (%s) at %s, %.3f s after start\n", (int)getpid(), why, wall,
+             rips_reset_t - rips_t0 );
+}
+
+static void rips_env_line( const char *where, const char *var )
+{
+    fprintf( stderr, "[VCPU-RIPS] pid %d %s env %s\n", (int)getpid(), where, var );
+}
+
+/* the FEX_* variables of the Windows environment (what FEX's config loader reads), once */
+static void rips_windows_env(void)
+{
+    RTL_USER_PROCESS_PARAMETERS params;
+    PEB p;
+    WCHAR *env;
+    size_t i, n, start;
+    char image[260], var[512];
+
+    if (!peb || !rips_read( (ULONG64)peb, &p, sizeof(p) ) || !p.ProcessParameters) return;
+    if (!rips_read( (ULONG64)p.ProcessParameters, &params, sizeof(params) )) return;
+    rips_wstr( &params.ImagePathName, image, sizeof(image) );
+    fprintf( stderr, "[VCPU-RIPS] pid %d image %s\n", (int)getpid(), image );
+    n = min( params.EnvironmentSize, 0x100000 ) / sizeof(WCHAR);
+    if (!params.Environment || !n || !(env = malloc( n * sizeof(WCHAR) ))) return;
+    n = rips_read_partial( (ULONG64)params.Environment, (unsigned char *)env, n * sizeof(WCHAR) ) / sizeof(WCHAR);
+    for (start = i = 0; i < n; i++)
+    {
+        size_t j, len;
+        if (env[i]) continue;
+        if (i == start) break;  /* the empty string ends the block */
+        len = min( i - start, sizeof(var) - 1 );
+        for (j = 0; j < len; j++) var[j] = env[start + j] < 0x80 ? (char)env[start + j] : '?';
+        var[len] = 0;
+        if (!strncasecmp( var, "FEX_", 4 )) rips_env_line( "windows", var );
+        start = i + 1;
+    }
+    free( env );
+}
+
+static void rips_report(void)
+{
+    static BOOL first = TRUE, fex_logged;
+    static struct rips_group groups[RIPS_SLOTS];
+    unsigned int nslots, nblocks = 0, ncells = 0, total, dropped, ngroups = 0, i, j, k;
+    ULONG64 fex_base = 0;
+    char fex_path[260] = "", where[160], wall[64];
+    char *line;
+    size_t len, line_size = 65536;
+    double now = rips_now();
+
+    if (first)
+    {
+        rips_windows_env();
+        first = FALSE;
+    }
+    pthread_mutex_lock( &sample_lock );
+    nslots = RIPS_SLOTS;
+    memcpy( rips_cslots, rips_slots, RIPS_SLOTS * sizeof(*rips_slots) );
+    for (i = 0; i < RIPS_BLOCKS; i++) if (rips_blocks[i].count) rips_cblocks[nblocks++] = rips_blocks[i];
+    for (i = 0; i < RIPS_CELLS; i++) if (rips_cells[i].count) rips_ccells[ncells++] = rips_cells[i];
+    total = rips_total;
+    dropped = rips_dropped;
+    pthread_mutex_unlock( &sample_lock );
+    if (!total || !(line = malloc( line_size ))) return;
+
+    rips_modules_refresh( fex_path, sizeof(fex_path), &fex_base );
+    if (!fex_logged && fex_base)
+    {
+        const struct rips_module *m = rips_module_of( fex_base );
+        fprintf( stderr, "[VCPU-RIPS] pid %d fex %s base %#llx size %#llx\n", (int)getpid(), fex_path,
+                 (unsigned long long)fex_base, (unsigned long long)(m ? m->size : 0) );
+        fex_logged = TRUE;
+    }
+
+    /* threads by name */
+    for (i = 0; i < nslots; i++)
+    {
+        const struct rips_slot *s = &rips_cslots[i];
+        char tidname[RIPS_NAME];
+        const char *name = s->name;
+
+        rips_group_of[i] = -1;
+        if (!s->total) continue;
+        if (!name[0])
+        {
+            snprintf( tidname, sizeof(tidname), "tid %04x", s->tid );
+            snprintf( rips_cslots[i].name, sizeof(rips_cslots[i].name), "%s", tidname );
+            name = rips_cslots[i].name;
+        }
+        for (j = 0; j < ngroups; j++) if (!strcmp( groups[j].name, name )) break;
+        if (j == ngroups)
+        {
+            memset( &groups[j], 0, sizeof(groups[j]) );
+            groups[j].name = name;
+            ngroups++;
+        }
+        rips_group_of[i] = j;
+        groups[j].total += s->total;
+        groups[j].jit += s->jit;
+        groups[j].pc_sim += s->pc_sim;
+        groups[j].pc_other += s->pc_other;
+        len = strlen( groups[j].tids );
+        if (len < sizeof(groups[j].tids) - 8)
+            snprintf( groups[j].tids + len, sizeof(groups[j].tids) - len, "%s%04x", len ? "," : "", s->tid );
+        groups[j].threads++;
+    }
+    /* order the groups, keeping rips_group_of in step */
+    {
+        static int order[RIPS_SLOTS];
+        static struct rips_group sorted[RIPS_SLOTS];
+
+        memcpy( sorted, groups, ngroups * sizeof(groups[0]) );
+        qsort( sorted, ngroups, sizeof(sorted[0]), rips_group_cmp );
+        for (j = 0; j < ngroups; j++)
+            for (k = 0; k < ngroups; k++) if (sorted[k].name == groups[j].name) { order[j] = k; break; }
+        for (i = 0; i < nslots; i++) if (rips_group_of[i] >= 0) rips_group_of[i] = order[rips_group_of[i]];
+        memcpy( groups, sorted, ngroups * sizeof(groups[0]) );
+    }
+
+    rips_wallclock( wall, sizeof(wall) );
+    {
+        unsigned int jit = 0, sim = 0, other = 0;
+        for (j = 0; j < ngroups; j++) { jit += groups[j].jit; sim += groups[j].pc_sim; other += groups[j].pc_other; }
+        fprintf( stderr, "[VCPU-RIPS] pid %d === %s, %.1f s since %s: %u samples every %u ms (jit %.1f%%, emulator "
+                 "outside blocks %.1f%%, not in the emulator %.1f%%), %u thread names, %u blocks, %u not counted ===\n",
+                 (int)getpid(), wall, now - rips_reset_t, rips_reset_t > rips_t0 ? "reset" : "start", total,
+                 vcpu_sample_ms, 100.0 * jit / total, 100.0 * sim / total, 100.0 * other / total, ngroups, nblocks,
+                 dropped );
+    }
+
+    for (j = 0; j < ngroups; j++)
+    {
+        const struct rips_group *gr = &groups[j];
+        unsigned int nb, nc, fex_n = 0, cache_n = 0, other_n = 0, shown;
+
+        if (gr->total * 50 < total) break;  /* sorted: the rest are below 2% */
+        fprintf( stderr, "[VCPU-RIPS] pid %d thread \"%s\" (%u threads: %s) %u samples %.1f%% | (a) jit %u %.1f%% | "
+                 "(b+c) outside blocks: in the emulator %u %.1f%%, not %u %.1f%%\n", (int)getpid(), gr->name,
+                 gr->threads, gr->tids, gr->total, 100.0 * gr->total / total, gr->jit, 100.0 * gr->jit / gr->total,
+                 gr->pc_sim, 100.0 * gr->pc_sim / gr->total, gr->pc_other, 100.0 * gr->pc_other / gr->total );
+
+        /* (a) the top 64 blocks, with their host offset histograms */
+        nb = rips_merge_blocks( nblocks, j );
+        nc = rips_merge_cells( ncells, j, TRUE );
+        for (i = 0; i < nb && i < 64; i++)
+        {
+            const struct rips_block *b = &rips_tblocks[i];
+            unsigned int lo = 0, hi = nc;
+            struct rips_cell key = { b->rip, 0 };
+
+            while (lo < hi)  /* the first histogram cell of this rip */
+            {
+                unsigned int mid = (lo + hi) / 2;
+                if (rips_cell_key_cmp( &rips_tcells[mid], &key ) < 0) lo = mid + 1;
+                else hi = mid;
+            }
+            rips_name_addr( b->rip, where, sizeof(where) );
+            len = snprintf( line, line_size, "  (a) #%u rip %#llx %s n %u %.2f%% host_size %u hdrs %u hdr %#llx off16:",
+                            i + 1, (unsigned long long)b->rip, where, b->count, 100.0 * b->count / gr->total,
+                            b->size, b->hdrs, (unsigned long long)b->hdr );
+            for (k = lo; k < nc && rips_tcells[k].a == b->rip && len < line_size - 32; k++)
+                len += snprintf( line + len, line_size - len, " %x:%u", rips_tcells[k].b * 16, rips_tcells[k].count );
+            fprintf( stderr, "[VCPU-RIPS] pid %d %s\n", (int)getpid(), line );
+        }
+
+        /* (b) and (c): host pcs outside blocks */
+        nc = rips_merge_cells( ncells, j, FALSE );
+        for (i = 0; i < nc; i++)
+        {
+            if (rips_is_fex( rips_tcells[i].a )) { fex_n += rips_tcells[i].count; rips_tcells[i].b = 1; }
+            else if (rips_tcells[i].type == RIPS_PC_SIM && !rips_module_of( rips_tcells[i].a ))
+            {
+                cache_n += rips_tcells[i].count;  /* the JIT cache outside a block: dispatcher, stubs */
+                rips_tcells[i].b = 2;
+            }
+            else { other_n += rips_tcells[i].count; rips_tcells[i].b = 3; }
+        }
+        qsort( rips_tcells, nc, sizeof(rips_tcells[0]), rips_cell_count_cmp );
+        fprintf( stderr, "[VCPU-RIPS] pid %d   (b) in libarm64ecfex.dll %u %.1f%%, in the JIT cache outside a block "
+                 "%u %.1f%% | (c) other %u %.1f%%\n", (int)getpid(), fex_n, 100.0 * fex_n / gr->total, cache_n,
+                 100.0 * cache_n / gr->total, other_n, 100.0 * other_n / gr->total );
+        for (k = 1; k <= 3; k++)
+        {
+            const char *tag = k == 1 ? "(b) fex" : k == 2 ? "(b) cache" : "(c)";
+
+            len = 0;
+            for (i = shown = 0; i < nc && shown < 32; i++)
+            {
+                if (rips_tcells[i].b != k) continue;
+                if (k == 2) snprintf( where, sizeof(where), "jitcache?%#llx", (unsigned long long)rips_tcells[i].a );
+                else rips_name_addr( rips_tcells[i].a, where, sizeof(where) );
+                len += snprintf( line + len, line_size - len, " %s:%u%s", where, rips_tcells[i].count,
+                                 rips_tcells[i].type == RIPS_PC_SIM ? "e" : "" );
+                if (++shown % 8 == 0)
+                {
+                    fprintf( stderr, "[VCPU-RIPS] pid %d   %s%s\n", (int)getpid(), tag, line );
+                    len = 0;
+                }
+            }
+            if (len) fprintf( stderr, "[VCPU-RIPS] pid %d   %s%s\n", (int)getpid(), tag, line );
+        }
+        /* (c) per module */
+        {
+            static struct { char name[RIPS_NAME]; unsigned int count; } mods[64];
+            unsigned int nm = 0;
+
+            for (i = 0; i < nc; i++)
+            {
+                const struct rips_module *m;
+                char *plus;
+
+                if (rips_tcells[i].b != 3) continue;
+                if ((m = rips_module_of( rips_tcells[i].a ))) snprintf( where, sizeof(where), "%s", m->name );
+                else
+                {
+                    rips_name_addr( rips_tcells[i].a, where, sizeof(where) );
+                    if ((plus = strchr( where, '+' ))) *plus = 0;
+                    else if (where[0] == '?') strcpy( where, "?" );
+                }
+                for (k = 0; k < nm; k++) if (!strcmp( mods[k].name, where )) break;
+                if (k == nm)
+                {
+                    if (nm == ARRAY_SIZE(mods)) continue;
+                    snprintf( mods[nm].name, sizeof(mods[nm].name), "%s", where );
+                    mods[nm++].count = 0;
+                }
+                mods[k].count += rips_tcells[i].count;
+            }
+            len = 0;
+            for (k = 0; k < nm; k++)
+                len += snprintf( line + len, line_size - len, " %s:%u", mods[k].name, mods[k].count );
+            if (nm) fprintf( stderr, "[VCPU-RIPS] pid %d   (c) by module%s\n", (int)getpid(), line );
+        }
+    }
+    {
+        unsigned int rest = 0, rest_n = 0;
+        for (; j < ngroups; j++) { rest += groups[j].total; rest_n++; }
+        if (rest_n) fprintf( stderr, "[VCPU-RIPS] pid %d below 2%%: %u thread names, %u samples %.1f%%\n",
+                             (int)getpid(), rest_n, rest, 100.0 * rest / total );
+    }
+
+    /* the top 32 blocks over all threads */
+    {
+        unsigned int nb = rips_merge_blocks( nblocks, -1 ), pending = 0;
+
+        len = 0;
+        for (i = 0; i < nb && i < 32; i++)
+        {
+            const struct rips_block *b = &rips_tblocks[i];
+
+            len += snprintf( line + len, line_size - len, " %#llx:%u", (unsigned long long)b->rip, b->count );
+            if (!rips_dump_file) continue;
+            for (k = 0; k < rips_ndumped; k++) if (rips_dumped[k] == b->rip) break;
+            if (k < rips_ndumped || rips_ndumped == RIPS_DUMPED) continue;
+            if (rips_dump_block( b )) rips_dumped[rips_ndumped++] = b->rip;
+            else pending++;
+        }
+        fprintf( stderr, "[VCPU-RIPS] pid %d top 32 blocks:%s\n", (int)getpid(), line );
+        if (rips_dump_file)
+            fprintf( stderr, "[VCPU-RIPS] pid %d dump: %u blocks written, %u of the top 32 waiting (code moved)\n",
+                     (int)getpid(), rips_ndumped, pending );
+    }
+    free( line );
+}
+
+static void rips_signal( int sig )
+{
+    rips_reset_signal = 1;
+}
+
+/* the sampler thread, after each round of kicks */
+static void rips_tick(void)
+{
+    static double next_report, next_check;
+    static struct timespec last_mtime;
+    static BOOL checked, existed;
+    double now = rips_now();
+
+    if (rips_reset_signal)
+    {
+        rips_reset_signal = 0;
+        rips_reset( "SIGINFO" );
+    }
+    if (rips_reset_file && now >= next_check)
+    {
+        struct stat st;
+        BOOL exists = !stat( rips_reset_file, &st );
+
+        next_check = now + 0.1;
+
+        /* a reset when the file appears or its mtime changes (touch), not when it goes away */
+        if (checked && exists && (!existed || st.st_mtimespec.tv_sec != last_mtime.tv_sec ||
+                                  st.st_mtimespec.tv_nsec != last_mtime.tv_nsec))
+            rips_reset( rips_reset_file );
+        checked = TRUE;
+        existed = exists;
+        if (exists) last_mtime = st.st_mtimespec;
+    }
+    if (!next_report) next_report = now + vcpu_rips;
+    if (now >= next_report)
+    {
+        next_report = now + vcpu_rips;
+        rips_report();
+    }
+}
+
+static void rips_start(void)
+{
+    static const char * const fex_vars[] =
+    {
+        "FEX_TSOENABLED", "FEX_VECTORTSOENABLED", "FEX_MEMCPYSETTSOENABLED", "FEX_HALFBARRIERTSOENABLED",
+        "FEX_STRICTINPROCESSSPLITLOCKS", "FEX_PAUSEMODE", "FEX_DISKCACHE", "FEX_MISALIGNEDATOMICCHECK",
+        "FEX_MULTIBLOCK", "FEX_SMCCHECKS",
+    };
+    extern char **environ;
+    const char *env;
+    char **e;
+    unsigned int i;
+    struct sigaction sa;
+
+    if (!(env = getenv( "PMW_VCPU_RIPS" )) || atoi( env ) <= 0) return;
+    rips_slots = calloc( RIPS_SLOTS, sizeof(*rips_slots) );
+    rips_cslots = calloc( RIPS_SLOTS, sizeof(*rips_cslots) );
+    rips_group_of = calloc( RIPS_SLOTS, sizeof(*rips_group_of) );
+    rips_blocks = calloc( RIPS_BLOCKS, sizeof(*rips_blocks) );
+    rips_cblocks = calloc( RIPS_BLOCKS, sizeof(*rips_cblocks) );
+    rips_tblocks = calloc( RIPS_BLOCKS, sizeof(*rips_tblocks) );
+    rips_cells = calloc( RIPS_CELLS, sizeof(*rips_cells) );
+    rips_ccells = calloc( RIPS_CELLS, sizeof(*rips_ccells) );
+    rips_tcells = calloc( RIPS_CELLS, sizeof(*rips_tcells) );
+    if (!rips_slots || !rips_cslots || !rips_group_of || !rips_blocks || !rips_cblocks || !rips_tblocks ||
+        !rips_cells || !rips_ccells || !rips_tcells)
+        return;
+    rips_t0 = rips_reset_t = rips_now();
+    rips_reset_file = getenv( "PMW_VCPU_RIPS_RESET_FILE" );
+    if ((env = getenv( "PMW_VCPU_SAMPLE_DUMP" )) && *env)
+    {
+        char path[1024];
+
+        snprintf( path, sizeof(path), "%s.%d", env, (int)getpid() );
+        if ((rips_dump_file = fopen( path, "w" )))
+            fprintf( rips_dump_file, "# PMW_VCPU_SAMPLE_DUMP v1 pid %d: BLOCK line, GUEST <hex> (guest_len bytes from "
+                     "rip), HOST <hex> (host_len bytes from hdr = the JIT block header), END\n", (int)getpid() );
+        else fprintf( stderr, "[VCPU-RIPS] pid %d cannot open %s\n", (int)getpid(), path );
+    }
+    sigaction( SIGINFO, NULL, &sa );
+    if (sa.sa_handler == SIG_DFL || sa.sa_handler == SIG_IGN)
+    {
+        memset( &sa, 0, sizeof(sa) );
+        sa.sa_handler = rips_signal;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset( &sa.sa_mask );
+        sigaction( SIGINFO, &sa, NULL );
+    }
+    else
+        fprintf( stderr, "[VCPU-RIPS] pid %d SIGINFO is taken: reset by PMW_VCPU_RIPS_RESET_FILE only\n", (int)getpid() );
+    vcpu_rips = atoi( getenv( "PMW_VCPU_RIPS" ));
+    fprintf( stderr, "[VCPU-RIPS] pid %d on: report every %u s, sampling every %u ms, dump %s, reset file %s\n",
+             (int)getpid(), vcpu_rips, vcpu_sample_ms, rips_dump_file ? "on" : "off",
+             rips_reset_file ? rips_reset_file : "(none)" );
+    for (i = 0; i < ARRAY_SIZE(fex_vars); i++)
+        if (!getenv( fex_vars[i] ))
+            fprintf( stderr, "[VCPU-RIPS] pid %d unix env %s unset\n", (int)getpid(), fex_vars[i] );
+    for (e = environ; e && *e; e++) if (!strncmp( *e, "FEX_", 4 )) rips_env_line( "unix", *e );
 }
 
 static int sample_cmp( const void *a, const void *b )
@@ -1728,6 +2580,7 @@ static void *sample_thread( void *arg )
             vel1_kick_remote( &vt->vcpu );
         }
         pthread_mutex_unlock( &stall_lock );
+        if (vcpu_rips) rips_tick();
     }
     return NULL;
 }
@@ -2714,7 +3567,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
 
             if (vcpu_sample_ms && atomic_exchange( &vt->sample_req, 0 ))
             {
-                sample_record( frame );
+                sample_record( vt, frame );
                 mine = TRUE;
             }
             if (vcpu_stallpc && atomic_exchange( &vt->stall_dump, 0 ))
@@ -2849,6 +3702,7 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     vcpu_note_vcpu_up();
     pthread_setspecific( vcpu_key, vt );
     vt->tid = GetCurrentThreadId();
+    if (vcpu_rips) rips_name_forget( vt->tid );
     if (vcpu_stallpc || vcpu_sample_ms)
     {
         pthread_mutex_lock( &stall_lock );

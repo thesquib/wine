@@ -73,6 +73,7 @@ extern unsigned int vcpu_prof_interval;
 extern void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks );
 extern void vcpu_prof_sync_size( size_t bytes, int per_page );
 extern void vcpu_prof_note_priority( HANDLE handle );
+extern void vcpu_prof_note_thread_name( HANDLE handle, const UNICODE_STRING *name );
 static inline uint64_t vcpu_prof_now(void)
 {
     uint64_t v;
@@ -84,6 +85,7 @@ static inline uint64_t vcpu_prof_now(void)
 static inline void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks ) {}
 static inline void vcpu_prof_sync_size( size_t bytes, int per_page ) {}
 static inline void vcpu_prof_note_priority( HANDLE handle ) {}
+static inline void vcpu_prof_note_thread_name( HANDLE handle, const UNICODE_STRING *name ) {}
 static inline uint64_t vcpu_prof_now(void) { return 0; }
 #endif
 
