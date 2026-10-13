@@ -35,6 +35,11 @@
 # include <sys/sysctl.h>
 #endif
 
+#ifdef __APPLE__
+# include <pthread.h>
+# include <mach/mach.h>
+# include <mach/thread_policy.h>
+#endif
 #include "object.h"
 #include "file.h"
 #include "thread.h"
@@ -247,6 +252,29 @@ static void init_limits(void)
 #endif
 }
 
+#ifdef __APPLE__
+/* PROTON_DARWIN (PMW_SERVER_QOS, default on; =0 leaves the default): every wineserver request is a round trip that
+ * the caller waits for in read(); the request loop runs on this thread, which macOS otherwise schedules at the QoS
+ * of whatever launched the server (Steam, a script) and may park on an efficiency core or coalesce its wakeups.
+ * Clair Obscur's render thread (2026-10-13) spent ~5% of its time in read() waiting for failing NtOpenSection
+ * replies alone. Only msync's message thread got the latency tiers (msync.c). Give the request loop the
+ * user-interactive QoS class and latency/throughput tier 0; it stays timeshare, so it cannot starve anything. */
+static void set_main_loop_qos(void)
+{
+    const char *env = getenv( "PMW_SERVER_QOS" );
+    mach_port_t thread = pthread_mach_thread_np( pthread_self() );
+    int latency_qos = LATENCY_QOS_TIER_0, throughput_qos = THROUGHPUT_QOS_TIER_0;
+
+    if (env && env[0] == '0') return;
+    if (pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 ))
+        fprintf( stderr, "wineserver: PMW_SERVER_QOS: could not set the QoS class\n" );
+    thread_policy_set( thread, THREAD_LATENCY_QOS_POLICY, (thread_policy_t)&latency_qos,
+                       THREAD_LATENCY_QOS_POLICY_COUNT );
+    thread_policy_set( thread, THREAD_THROUGHPUT_QOS_POLICY, (thread_policy_t)&throughput_qos,
+                       THREAD_THROUGHPUT_QOS_POLICY_COUNT );
+}
+#endif
+
 int main( int argc, char *argv[] )
 {
     setvbuf( stderr, NULL, _IOLBF, 0 );
@@ -282,6 +310,9 @@ int main( int argc, char *argv[] )
     init_directories( load_intl_file() );
     init_threading();
     init_registry();
+#ifdef __APPLE__
+    set_main_loop_qos();
+#endif
     main_loop();
     return 0;
 }
