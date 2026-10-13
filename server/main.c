@@ -253,19 +253,22 @@ static void init_limits(void)
 }
 
 #ifdef __APPLE__
-/* PROTON_DARWIN (PMW_SERVER_QOS, default on; =0 leaves the default): every wineserver request is a round trip that
+/* PROTON_DARWIN (PMW_SERVER_QOS=1, opt-in; default off): every wineserver request is a round trip that
  * the caller waits for in read(); the request loop runs on this thread, which macOS otherwise schedules at the QoS
  * of whatever launched the server (Steam, a script) and may park on an efficiency core or coalesce its wakeups.
  * Clair Obscur's render thread (2026-10-13) spent ~5% of its time in read() waiting for failing NtOpenSection
  * replies alone. Only msync's message thread got the latency tiers (msync.c). Give the request loop the
- * user-interactive QoS class and latency/throughput tier 0; it stays timeshare, so it cannot starve anything. */
+ * user-interactive QoS class and latency/throughput tier 0; it stays timeshare, so it cannot starve anything.
+ * Off by default: in 2026-10-13 loadbench A/B runs (3 x on/off, alternating) the class could not be set (EPERM, the
+ * request loop stays at QoS class 0) and the tiers alone made no measurable difference; round-trip times were
+ * bimodal (~15 or ~20 us per open+close) in both arms. */
 static void set_main_loop_qos(void)
 {
     const char *env = getenv( "PMW_SERVER_QOS" );
     mach_port_t thread = pthread_mach_thread_np( pthread_self() );
     int latency_qos = LATENCY_QOS_TIER_0, throughput_qos = THROUGHPUT_QOS_TIER_0;
 
-    if (env && env[0] == '0') return;
+    if (!env || env[0] != '1') return;
     if (pthread_set_qos_class_self_np( QOS_CLASS_USER_INTERACTIVE, 0 ))
         fprintf( stderr, "wineserver: PMW_SERVER_QOS: could not set the QoS class\n" );
     thread_policy_set( thread, THREAD_LATENCY_QOS_POLICY, (thread_policy_t)&latency_qos,
@@ -279,7 +282,7 @@ static void check_main_loop_qos(void)
     const char *env = getenv( "PMW_SERVER_QOS" );
     qos_class_t qos = qos_class_self();
 
-    if (env && env[0] == '0') return;
+    if (!env || env[0] != '1') return;
     if (qos != QOS_CLASS_USER_INTERACTIVE)
         fprintf( stderr, "wineserver: PMW_SERVER_QOS: request loop runs at QoS class %#x\n", (unsigned int)qos );
 }
