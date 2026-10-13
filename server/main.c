@@ -273,6 +273,16 @@ static void set_main_loop_qos(void)
     thread_policy_set( thread, THREAD_THROUGHPUT_QOS_POLICY, (thread_policy_t)&throughput_qos,
                        THREAD_THROUGHPUT_QOS_POLICY_COUNT );
 }
+
+static void check_main_loop_qos(void)
+{
+    const char *env = getenv( "PMW_SERVER_QOS" );
+    qos_class_t qos = qos_class_self();
+
+    if (env && env[0] == '0') return;
+    if (qos != QOS_CLASS_USER_INTERACTIVE)
+        fprintf( stderr, "wineserver: PMW_SERVER_QOS: request loop runs at QoS class %#x\n", (unsigned int)qos );
+}
 #endif
 
 int main( int argc, char *argv[] )
@@ -295,6 +305,9 @@ int main( int argc, char *argv[] )
     msync_init_shm();
 #endif
     open_master_socket();
+#ifdef __APPLE__
+    set_main_loop_qos();  /* after the daemon fork, before init_threading's setpriority (which makes it EPERM) */
+#endif
 
     if (do_fsync())
         fsync_init();
@@ -311,7 +324,7 @@ int main( int argc, char *argv[] )
     init_threading();
     init_registry();
 #ifdef __APPLE__
-    set_main_loop_qos();
+    check_main_loop_qos();
 #endif
     main_loop();
     return 0;
