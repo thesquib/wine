@@ -89,6 +89,11 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
  * alignment fault in native image code is emulated on the host right at the exit (vcpu_try_acqrel) instead of being
  * raised to FEX's handler. Wants FEX's hardware-TSO (EL1) DLL; the image gate keeps FEX's JIT faults on their path */
 static int vcpu_acqrel;
+/* PMW_VCPU_SIGFAST (read once in vcpu_init_process; =0 off, the old behaviour): a SYSCALL / UNIX_CALL exit with no
+ * kick left pending sets the in_syscall mark and dispatches without the vcpu_block_signals / vcpu_unblock_signals
+ * pair (two sigprocmask syscalls per exit). =2 also checks, with a mask query per exit, that no signal of the set is
+ * blocked on that path, and reports the first offender. The argument is at vcpu_loop's fast path. */
+static int vcpu_sigfast;
 /* what the hook did with each data-abort alignment fault, by vcpu_acqrel_result, plus the faults it saw and the
  * ones without a valid FAR (FnV), as running totals; PMW_VCPU_PROF prints their deltas */
 static _Atomic uint64_t acqrel_result[VCPU_AR_COUNT], acqrel_seen, acqrel_fnv;
@@ -1844,6 +1849,27 @@ static void vcpu_unblock_signals(void)
     pthread_sigmask( SIG_UNBLOCK, &set, NULL );
 }
 
+/* PMW_VCPU_SIGFAST=2: the fast path relies on the set being unblocked at every exit; report (once per process) and
+ * repair a thread where it is not */
+static void vcpu_sigfast_check(void)
+{
+    static _Atomic int reported;
+    sigset_t set = server_block_set, cur;
+    int sig;
+
+    sigaddset( &set, SIGQUIT );
+    pthread_sigmask( SIG_BLOCK, NULL, &cur );
+    for (sig = 1; sig < NSIG; sig++)
+    {
+        if (!sigismember( &set, sig ) || !sigismember( &cur, sig )) continue;
+        if (!atomic_exchange( &reported, 1 ))
+            fprintf( stderr, "wine: vCPU mode: PMW_VCPU_SIGFAST check: signal %d blocked at a fast exit on thread "
+                     "%04x\n", sig, (UINT)GetCurrentThreadId() );
+        vcpu_unblock_signals();
+        return;
+    }
+}
+
 static void vcpu_dump_exit( const char *what, struct vcpu_thread *vt, const vel1_exit *e,
                             const struct syscall_frame *frame )
 {
@@ -2619,6 +2645,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
     vel1_exit e;
     vel1_exit_kind kind;
     ULONG64 ret;
+    BOOL fast;
     int jmp;
 
     level->prev = vt->level;
@@ -2697,27 +2724,54 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             if (mine && !atomic_load( &vt->signal_kick )) continue;
         }
 
-        /* from here to the dispatch (or the register write-back after a fault or kick) this is signal-handler work:
-         * run it with what the handlers block, as they would */
-        vcpu_block_signals( NULL );
-        atomic_store( &vt->in_syscall, 1 );
-        atomic_signal_fence( memory_order_seq_cst );
-        /* a KICK exit already consumed its kick; any exit may carry one left pending (D15) */
-        if (vel1_kick_take( &vt->vcpu ) || kind == VEL1_EXIT_KICK)
+        /* PMW_VCPU_SIGFAST: a syscall or unix call with no host request pending needs no handler-style section.
+         * Why it is race-free (one thread; the handlers that care are usr1_handler and quit_handler, both through
+         * vcpu_signal_kick, which reads in_syscall and only then sets quit / kick_pending; same-thread ordering via
+         * the signal fences on both sides):
+         *  - the frame is complete here (vcpu_frame_from_*_exit above), so in_syscall may be set: from that store
+         *    on, a signal takes the host path against the frame, exactly as during the dispatch, where signals were
+         *    already unblocked in the old code too;
+         *  - a signal that ran before the store left kick_pending (and quit) set, and the loads after the store see
+         *    it: then the old section below runs unchanged (block, take, suspend / abort). So no kick is lost
+         *    across a blocking dispatch (D15), and vcpu_suspend / abort_thread still run with the handlers' mask;
+         *  - nothing between the store and the dispatch touches state a handler reads (no hv_* call, hv_depth 0,
+         *    level->dispatching still FALSE as in the old unblocked window before the dispatch);
+         *  - every vel1_run starts with the set unblocked (vcpu_store_full unblocks; vcpu_return leaves the mask the
+         *    dispatch had; the acqrel path restores its own; the callback loop runs from an unblocked dispatch), so
+         *    the explicit unblock before the dispatch is a no-op here. =2 checks that per exit.
+         * KICK, faults and traps keep the section: they write the vCPU back from the frame (vcpu_store_full). */
+        fast = FALSE;
+        if (vcpu_sigfast && (kind == VEL1_EXIT_SYSCALL || kind == VEL1_EXIT_UNIX_CALL))
         {
-            vt->kicks++;
-            atomic_store( &vt->signal_kick, 0 );
-            if (!atomic_load( &vt->quit ))
-                vcpu_suspend( frame, kind == VEL1_EXIT_SYSCALL || kind == VEL1_EXIT_UNIX_CALL );
+            atomic_store( &vt->in_syscall, 1 );
+            atomic_signal_fence( memory_order_seq_cst );
+            fast = !vel1_kick_pending( &vt->vcpu ) && !atomic_load( &vt->quit );
+            if (fast && vcpu_sigfast > 1) vcpu_sigfast_check();
         }
-        if (atomic_load( &vt->quit )) abort_thread( 0 );
+        if (!fast)
+        {
+            /* from here to the dispatch (or the register write-back after a fault or kick) this is signal-handler
+             * work: run it with what the handlers block, as they would */
+            vcpu_block_signals( NULL );
+            atomic_store( &vt->in_syscall, 1 );
+            atomic_signal_fence( memory_order_seq_cst );
+            /* a KICK exit already consumed its kick; any exit may carry one left pending (D15) */
+            if (vel1_kick_take( &vt->vcpu ) || kind == VEL1_EXIT_KICK)
+            {
+                vt->kicks++;
+                atomic_store( &vt->signal_kick, 0 );
+                if (!atomic_load( &vt->quit ))
+                    vcpu_suspend( frame, kind == VEL1_EXIT_SYSCALL || kind == VEL1_EXIT_UNIX_CALL );
+            }
+            if (atomic_load( &vt->quit )) abort_thread( 0 );
+        }
 
         switch (kind)
         {
         case VEL1_EXIT_SYSCALL:
             vt->syscalls++;
             level->kind = kind;
-            vcpu_unblock_signals();  /* syscalls run with signals deliverable, as in the EL0 mode */
+            if (!fast) vcpu_unblock_signals();  /* syscalls run with signals deliverable, as in the EL0 mode */
             level->dispatching = TRUE;
             ret = vcpu_dispatch_syscall( frame, &e );
             level->dispatching = FALSE;
@@ -2725,7 +2779,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         case VEL1_EXIT_UNIX_CALL:
             vt->unix_calls++;
             level->kind = kind;
-            vcpu_unblock_signals();
+            if (!fast) vcpu_unblock_signals();
             level->dispatching = TRUE;
             ret = ((const unixlib_entry_t *)e.regs.x[0])[e.regs.x[1]]( (void *)e.regs.x[2] );
             level->dispatching = FALSE;
@@ -3077,6 +3131,10 @@ void vcpu_init_process(void)
     vcpu_acqrel = vcpu_mode == 1 && (env = getenv( "PMW_VCPU_ACQREL" )) && atoi( env ) > 0;
     fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_ACQREL=%d (host emulation of misaligned ldar/ldapr/stlr in "
              "image code %s)\n", (int)getpid(), vcpu_acqrel, vcpu_acqrel ? "on" : "off" );
+
+    vcpu_sigfast = (env = getenv( "PMW_VCPU_SIGFAST" )) ? atoi( env ) : 0;
+    fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_SIGFAST=%d (no sigprocmask pair on syscall / unix-call exits "
+             "%s)\n", (int)getpid(), vcpu_sigfast, vcpu_sigfast ? "on" : "off" );
 
     init_sys_page();
     init_kuser();
