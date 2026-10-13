@@ -696,6 +696,76 @@ static WINE_MODREF *find_fileid_module( const struct file_id *id )
 }
 
 
+/* PROTON_DARWIN (PMW_LDR_HANDLE_CACHE, default on; =0 turns it off): GetModuleHandle with an absolute path of a dll
+ * that is not loaded opens the file, asks for its file id, creates and queries an image section, reads the headers
+ * and closes both handles: 9 syscalls, 5 of them wineserver round trips. Windows answers from the module list. On
+ * the vCPU route every syscall is a VM exit and each round trip waits on the wineserver; Clair Obscur's render thread
+ * (2026-10-13, d3d9/ddraw/d3d8 probed by full path every frame, no view ever mapped) spent about half its time there.
+ * The answer depends only on the file the path names and on the module list, so it is remembered per path until a
+ * module is added or removed (module_list_gen), and a miss stops after the file id check (no section). */
+static unsigned int module_list_gen;
+static int handle_cache_enabled = -1;
+static BOOL handle_query_only;  /* loader_section held: open_dll_file only checks the file id */
+#define HANDLE_CACHE_SIZE 16
+static struct
+{
+    WCHAR *name;
+    WINE_MODREF *wm;  /* NULL: not loaded */
+    unsigned int gen;
+} handle_cache[HANDLE_CACHE_SIZE];
+static unsigned int handle_cache_next;
+
+static BOOL use_handle_cache( const WCHAR *name )
+{
+    if (handle_cache_enabled == -1)
+    {
+        WCHAR val[8];
+        handle_cache_enabled = !(get_env( L"PMW_LDR_HANDLE_CACHE", val, sizeof(val) ) && val[0] == '0');
+    }
+    if (!handle_cache_enabled) return FALSE;
+    /* a single candidate file, independent of the search path, the current directory and activation contexts */
+    switch (RtlDetermineDosPathNameType_U( name ))
+    {
+    case RtlPathTypeDriveAbsolute:
+    case RtlPathTypeUncAbsolute:
+    case RtlPathTypeLocalDevice:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+/* The loader_section must be locked while calling this function */
+static BOOL handle_cache_lookup( const WCHAR *name, WINE_MODREF **wm )
+{
+    unsigned int i;
+
+    for (i = 0; i < HANDLE_CACHE_SIZE; i++)
+    {
+        if (!handle_cache[i].name || handle_cache[i].gen != module_list_gen) continue;
+        if (_wcsicmp( handle_cache[i].name, name )) continue;
+        *wm = handle_cache[i].wm;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* The loader_section must be locked while calling this function */
+static void handle_cache_store( const WCHAR *name, WINE_MODREF *wm )
+{
+    unsigned int i = handle_cache_next++ % HANDLE_CACHE_SIZE;
+    SIZE_T size = (wcslen( name ) + 1) * sizeof(WCHAR);
+    WCHAR *copy = RtlAllocateHeap( GetProcessHeap(), 0, size );
+
+    if (!copy) return;
+    memcpy( copy, name, size );
+    RtlFreeHeap( GetProcessHeap(), 0, handle_cache[i].name );
+    handle_cache[i].name = copy;
+    handle_cache[i].wm = wm;
+    handle_cache[i].gen = module_list_gen;
+}
+
+
 /******************************************************************************
  *	get_apiset_entry
  */
@@ -1668,6 +1738,7 @@ static WINE_MODREF *alloc_module( HMODULE hModule, const UNICODE_STRING *nt_name
             wm->ldr.EntryPoint = (char *)hModule + nt->OptionalHeader.AddressOfEntryPoint;
     }
 
+    module_list_gen++;
     InsertTailList(&NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList,
                    &wm->ldr.InLoadOrderLinks);
     InsertTailList(&NtCurrentTeb()->Peb->LdrData->InMemoryOrderModuleList,
@@ -2432,6 +2503,7 @@ static NTSTATUS build_module( LPCWSTR load_path, const UNICODE_STRING *nt_name, 
         if (status != STATUS_SUCCESS)
         {
             /* the module has only be inserted in the load & memory order lists */
+            module_list_gen++;
             RemoveEntryList(&wm->ldr.InLoadOrderLinks);
             RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
             RemoveEntryList(&wm->ldr.HashLinks);
@@ -2858,6 +2930,12 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
             NtClose( handle );
             return STATUS_SUCCESS;
         }
+    }
+
+    if (handle_query_only)  /* GetModuleHandle of an absolute path: not loaded, a section would only be closed */
+    {
+        NtClose( handle );
+        return STATUS_DLL_NOT_FOUND;
     }
 
     size.QuadPart = 0;
@@ -3729,11 +3807,11 @@ NTSTATUS WINAPI LdrGetDllHandleEx( ULONG flags, LPCWSTR load_path, ULONG *dll_ch
     SECTION_IMAGE_INFORMATION image_info;
     UNICODE_STRING nt_name;
     struct file_id id;
-    BOOL redirected;
+    BOOL redirected, cacheable;
     NTSTATUS status;
     WINE_MODREF *wm;
     WCHAR *dllname;
-    HANDLE mapping;
+    HANDLE mapping = 0;
 
     TRACE( "flags %#lx, load_path %p, dll_characteristics %p, name %p, base %p.\n",
             flags, load_path, dll_characteristics, name, base );
@@ -3751,12 +3829,26 @@ NTSTATUS WINAPI LdrGetDllHandleEx( ULONG flags, LPCWSTR load_path, ULONG *dll_ch
 
     RtlEnterCriticalSection( &loader_section );
 
-    status = find_dll_file( load_path, dllname ? dllname : name->Buffer,
-                            &nt_name, &wm, &mapping, &image_info, &id, &redirected, TRUE );
+    cacheable = use_handle_cache( dllname ? dllname : name->Buffer );
+    if (cacheable && handle_cache_lookup( dllname ? dllname : name->Buffer, &wm ))
+    {
+        nt_name.Buffer = NULL;
+        status = STATUS_SUCCESS;
+    }
+    else
+    {
+        handle_query_only = cacheable;
+        status = find_dll_file( load_path, dllname ? dllname : name->Buffer,
+                                &nt_name, &wm, &mapping, &image_info, &id, &redirected, TRUE );
+        handle_query_only = FALSE;
+        /* not transient failures such as a sharing violation */
+        if (cacheable && (wm || status == STATUS_DLL_NOT_FOUND))
+            handle_cache_store( dllname ? dllname : name->Buffer, wm );
+    }
     if (wm) *base = wm->ldr.DllBase;
     else
     {
-        if (status == STATUS_SUCCESS) NtClose( mapping );
+        if (status == STATUS_SUCCESS && mapping) NtClose( mapping );
         status = STATUS_DLL_NOT_FOUND;
     }
     RtlFreeUnicodeString( &nt_name );
@@ -4207,6 +4299,7 @@ static void free_modref( WINE_MODREF *wm )
     SINGLE_LIST_ENTRY *entry;
     LDR_DEPENDENCY *dep;
 
+    module_list_gen++;
     RemoveEntryList(&wm->ldr.InLoadOrderLinks);
     RemoveEntryList(&wm->ldr.InMemoryOrderLinks);
     RemoveEntryList(&wm->ldr.HashLinks);
