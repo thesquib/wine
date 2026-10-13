@@ -89,7 +89,8 @@ int vcpu_shared_sections;  /* PMW_VCPU_SHARED_SECTIONS (default on, =0 off): shm
  * alignment fault in native image code is emulated on the host right at the exit (vcpu_try_acqrel) instead of being
  * raised to FEX's handler. Wants FEX's hardware-TSO (EL1) DLL; the image gate keeps FEX's JIT faults on their path */
 static int vcpu_acqrel;
-/* PMW_VCPU_SIGFAST (read once in vcpu_init_process; =0 off, the old behaviour): a SYSCALL / UNIX_CALL exit with no
+/* PMW_VCPU_SIGFAST (read once in vcpu_init_process; default 1 since 2026-10-13: loadbench sig A/B, arm64 + x64,
+ * no new failures; =0 off, the old behaviour): a SYSCALL / UNIX_CALL exit with no
  * kick left pending sets the in_syscall mark and dispatches without the vcpu_block_signals / vcpu_unblock_signals
  * pair (two sigprocmask syscalls per exit). =2 also checks, with a mask query per exit, that no signal of the set is
  * blocked on that path, and reports the first offender. The argument is at vcpu_loop's fast path. */
@@ -3132,7 +3133,7 @@ void vcpu_init_process(void)
     fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_ACQREL=%d (host emulation of misaligned ldar/ldapr/stlr in "
              "image code %s)\n", (int)getpid(), vcpu_acqrel, vcpu_acqrel ? "on" : "off" );
 
-    vcpu_sigfast = (env = getenv( "PMW_VCPU_SIGFAST" )) ? atoi( env ) : 0;
+    vcpu_sigfast = (env = getenv( "PMW_VCPU_SIGFAST" )) ? atoi( env ) : 1;
     fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_SIGFAST=%d (no sigprocmask pair on syscall / unix-call exits "
              "%s)\n", (int)getpid(), vcpu_sigfast, vcpu_sigfast ? "on" : "off" );
 
