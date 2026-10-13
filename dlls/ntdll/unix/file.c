@@ -3679,6 +3679,110 @@ static NTSTATUS resolve_reparse_point( int fd, int root_fd, OBJECT_ATTRIBUTES *a
         int unix_len, int pos, UINT disposition, BOOL open_reparse, BOOL is_unix, unsigned int reparse_count );
 
 
+/* PROTON_DARWIN (PMW_NEG_LOOKUP, default on; =0 turns it off): a path whose last element does not exist costs a
+ * component-by-component walk after the whole-path stat fails: a stat per element, and for the missing one a stat
+ * and a case-sensitivity query (getattrlistat) for the name and again for its reparse-point twin "name?". Clair
+ * Obscur's render thread (app 0.3.22 host sample, 2026-10-13) spent ~7% of its time in NtOpenFile misses of this
+ * kind (LoadLibrary of a missing dll searching the load path, every frame). That answer depends only on the
+ * directory the name would be in, so it is remembered with the directory's identity and change times (device,
+ * inode, mtime, ctime: any entry added, removed or renamed changes them) and given again for as long as a stat of
+ * that directory shows them unchanged: two syscalls instead of six or more. Only for absolute lookups of an existing
+ * file (FILE_OPEN, FILE_OVERWRITE), where a missing last element is the final answer, and only when the directory
+ * path itself resolves exactly. The directory is stat'ed before the walk, so an entry added during it either is
+ * found by the walk or changes the times. */
+#define NEG_LOOKUP_SIZE 64
+static int neg_lookup_enabled = -1;
+static pthread_mutex_t neg_lookup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct
+{
+    char *path;
+    unsigned int hash;
+    dev_t dev;
+    ino_t ino;
+    struct timespec mtime, ctime;
+} neg_lookup[NEG_LOOKUP_SIZE];
+static unsigned int neg_lookup_next;
+
+static unsigned int neg_lookup_hash( const char *path )
+{
+    unsigned int hash = 2166136261u;
+    while (*path) hash = (hash ^ (unsigned char)*path++) * 16777619u;
+    return hash;
+}
+
+static BOOL neg_lookup_same_dir( unsigned int i, const struct stat *st )
+{
+#ifdef __APPLE__
+    const struct timespec *mtime = &st->st_mtimespec, *ctime = &st->st_ctimespec;
+#else
+    const struct timespec *mtime = &st->st_mtim, *ctime = &st->st_ctim;
+#endif
+    return neg_lookup[i].dev == st->st_dev && neg_lookup[i].ino == st->st_ino &&
+           neg_lookup[i].mtime.tv_sec == mtime->tv_sec && neg_lookup[i].mtime.tv_nsec == mtime->tv_nsec &&
+           neg_lookup[i].ctime.tv_sec == ctime->tv_sec && neg_lookup[i].ctime.tv_nsec == ctime->tv_nsec;
+}
+
+/* 1: known missing; 0: not known, *dir_st is the directory; -1: not usable */
+static int neg_lookup_check( char *path, struct stat *dir_st, unsigned int *hash )
+{
+    char *slash = strrchr( path, '/' );
+    unsigned int i;
+    int ret = 0;
+
+    if (neg_lookup_enabled == -1)
+    {
+        const char *env = getenv( "PMW_NEG_LOOKUP" );
+        neg_lookup_enabled = !(env && env[0] == '0');
+    }
+    if (!neg_lookup_enabled || !slash || slash == path || !slash[1]) return -1;
+    *slash = 0;
+    i = fstatat( AT_FDCWD, path, dir_st, 0 );
+    *slash = '/';
+    if (i || !S_ISDIR( dir_st->st_mode )) return -1;
+
+    *hash = neg_lookup_hash( path );
+    mutex_lock( &neg_lookup_mutex );
+    for (i = 0; i < NEG_LOOKUP_SIZE; i++)
+    {
+        if (!neg_lookup[i].path || neg_lookup[i].hash != *hash || strcmp( neg_lookup[i].path, path )) continue;
+        ret = neg_lookup_same_dir( i, dir_st );
+        break;
+    }
+    mutex_unlock( &neg_lookup_mutex );
+    return ret;
+}
+
+static void neg_lookup_store( const char *path, unsigned int hash, const struct stat *dir_st )
+{
+    char *copy = strdup( path );
+    unsigned int i, slot = NEG_LOOKUP_SIZE;
+
+    if (!copy) return;
+    mutex_lock( &neg_lookup_mutex );
+    for (i = 0; i < NEG_LOOKUP_SIZE; i++)
+        if (neg_lookup[i].path && neg_lookup[i].hash == hash && !strcmp( neg_lookup[i].path, path )) slot = i;
+    if (slot == NEG_LOOKUP_SIZE) slot = neg_lookup_next++ % NEG_LOOKUP_SIZE;
+    free( neg_lookup[slot].path );
+    neg_lookup[slot].path = copy;
+    neg_lookup[slot].hash = hash;
+    neg_lookup[slot].dev = dir_st->st_dev;
+    neg_lookup[slot].ino = dir_st->st_ino;
+#ifdef __APPLE__
+    neg_lookup[slot].mtime = dir_st->st_mtimespec;
+    neg_lookup[slot].ctime = dir_st->st_ctimespec;
+#else
+    neg_lookup[slot].mtime = dir_st->st_mtim;
+    neg_lookup[slot].ctime = dir_st->st_ctim;
+#endif
+    mutex_unlock( &neg_lookup_mutex );
+}
+
+
+static NTSTATUS lookup_unix_name_walk( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name,
+                                       unsigned int nt_pos, char **buffer, int unix_len, int pos,
+                                       UINT disposition, BOOL open_reparse, BOOL is_unix,
+                                       unsigned int reparse_count, const WCHAR *name, unsigned int name_len );
+
 /******************************************************************************
  *           lookup_unix_name
  *
@@ -3693,8 +3797,9 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
     unsigned int name_len = (attr->ObjectName->Length / sizeof(WCHAR)) - nt_pos;
     NTSTATUS status;
     int ret;
-    struct stat st;
-    char *unix_name = *buffer;
+    struct stat st, neg_dir_st;
+    char *unix_name = *buffer, *neg_path = NULL;
+    unsigned int neg_hash = 0;
     const WCHAR *ptr, *end;
 
     /* check syntax of individual components */
@@ -3735,12 +3840,47 @@ static NTSTATUS lookup_unix_name( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_
             if (disposition == FILE_CREATE) return STATUS_OBJECT_NAME_COLLISION;
             return STATUS_SUCCESS;
         }
+        /* PMW_NEG_LOOKUP: see neg_lookup_check */
+        if (errno == ENOENT && root_fd == AT_FDCWD && !is_unix && !reparse_count && name_len &&
+            name[name_len - 1] != '\\' && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE))
+        {
+            switch (neg_lookup_check( unix_name, &neg_dir_st, &neg_hash ))
+            {
+            case 1:
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            case 0:
+                neg_path = strdup( unix_name );
+                break;
+            }
+        }
     }
 
     if (!name_len)  /* empty name -> drive root doesn't exist */
         return STATUS_OBJECT_PATH_NOT_FOUND;
     if (is_unix && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE))
         return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    if (neg_path)
+    {
+        status = lookup_unix_name_walk( root_fd, attr, nt_name, nt_pos, buffer, unix_len, pos, disposition,
+                                        open_reparse, is_unix, reparse_count, name, name_len );
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND) neg_lookup_store( neg_path, neg_hash, &neg_dir_st );
+        free( neg_path );
+        return status;
+    }
+    return lookup_unix_name_walk( root_fd, attr, nt_name, nt_pos, buffer, unix_len, pos, disposition,
+                                  open_reparse, is_unix, reparse_count, name, name_len );
+}
+
+/* the component by component part of lookup_unix_name */
+static NTSTATUS lookup_unix_name_walk( int root_fd, OBJECT_ATTRIBUTES *attr, UNICODE_STRING *nt_name,
+                                       unsigned int nt_pos, char **buffer, int unix_len, int pos,
+                                       UINT disposition, BOOL open_reparse, BOOL is_unix,
+                                       unsigned int reparse_count, const WCHAR *name, unsigned int name_len )
+{
+    NTSTATUS status;
+    int ret;
+    char *unix_name = *buffer;
 
     /* now do it component by component */
 
