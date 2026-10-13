@@ -2958,6 +2958,91 @@ static NTSTATUS open_dll_file( UNICODE_STRING *nt_name, WINE_MODREF **pwm, HANDL
 }
 
 
+/* PROTON_DARWIN (PMW_LDR_KNOWNDLLS_CACHE, default on; =0 turns it off): LoadLibrary of a relative name that is
+ * not loaded asks the wineserver for \KnownDlls\<name> (NtOpenSection) before searching the load path, a round trip
+ * that fails for every dll that is not a known dll, including every dll that does not exist. Clair Obscur's render
+ * thread (app 0.3.22 host sample, 2026-10-13) spent ~6% of its time in such failing NtOpenSection calls, next to
+ * ~7% of load-path NtOpenFile misses: a LoadLibrary of a missing dll every frame (the Steam overlay probes
+ * optional dlls). wineboot fills \KnownDlls once at prefix start and nothing changes it while a prefix runs (on
+ * Windows it is fixed at boot), so the names are read once, on the first lookup, and a name that is not among them
+ * skips the round trip. A directory without sections (not filled yet) or unreadable is not trusted (read again
+ * next time); a name that is not a section in it (KnownDllPath) only costs the old round trip. */
+static WCHAR **known_dll_names;
+static unsigned int known_dll_count;
+static int known_dll_cache = -1;
+
+/* The loader_section must be locked while calling this function */
+static BOOL known_dll_listed( const WCHAR *libname )
+{
+    DIRECTORY_BASIC_INFORMATION *info;
+    const ULONG size = 0x8000;
+    ULONG context = 0, ret_size, i;
+    unsigned int count = 0, capacity = 0, sections = 0;
+    WCHAR **names = NULL;
+    BOOLEAN restart = TRUE;
+    NTSTATUS status;
+
+    if (known_dll_cache == -1)
+    {
+        WCHAR val[8];
+        known_dll_cache = !(get_env( L"PMW_LDR_KNOWNDLLS_CACHE", val, sizeof(val) ) && val[0] == '0');
+    }
+    if (!known_dll_cache || !libname) return TRUE;
+
+    if (!known_dll_names)
+    {
+        if (!(info = RtlAllocateHeap( GetProcessHeap(), 0, size ))) return TRUE;
+        for (;;)
+        {
+            status = NtQueryDirectoryObject( known_dlls_ntdir, info, size, FALSE, restart, &context, &ret_size );
+            if (status && status != STATUS_MORE_ENTRIES) break;
+            restart = FALSE;
+            for (i = 0; info[i].ObjectName.Buffer; i++)
+            {
+                WCHAR **new_names, *copy;
+
+                if (count == capacity)
+                {
+                    capacity = capacity ? capacity * 2 : 64;
+                    if (names) new_names = RtlReAllocateHeap( GetProcessHeap(), 0, names, capacity * sizeof(*names) );
+                    else new_names = RtlAllocateHeap( GetProcessHeap(), 0, capacity * sizeof(*names) );
+                    if (!new_names)
+                    {
+                        status = STATUS_NO_MEMORY;
+                        break;
+                    }
+                    names = new_names;
+                }
+                if (!(copy = RtlAllocateHeap( GetProcessHeap(), 0, info[i].ObjectName.Length + sizeof(WCHAR) )))
+                {
+                    status = STATUS_NO_MEMORY;
+                    break;
+                }
+                memcpy( copy, info[i].ObjectName.Buffer, info[i].ObjectName.Length );
+                copy[info[i].ObjectName.Length / sizeof(WCHAR)] = 0;
+                names[count++] = copy;
+                if (!wcscmp( info[i].ObjectTypeName.Buffer, L"Section" )) sections++;
+            }
+            if (status != STATUS_MORE_ENTRIES) break;
+        }
+        RtlFreeHeap( GetProcessHeap(), 0, info );
+        if ((status && status != STATUS_NO_MORE_ENTRIES) || !sections)
+        {
+            while (count) RtlFreeHeap( GetProcessHeap(), 0, names[--count] );
+            RtlFreeHeap( GetProcessHeap(), 0, names );
+            return TRUE;  /* not trusted: ask the server */
+        }
+        known_dll_names = names;
+        known_dll_count = count;
+        TRACE( "%u known dlls\n", count );
+    }
+
+    for (i = 0; i < known_dll_count; i++)
+        if (!_wcsicmp( known_dll_names[i], libname )) return TRUE;
+    return FALSE;
+}
+
+
 /***********************************************************************
  *	open_known_dll
  *
@@ -2974,6 +3059,7 @@ static NTSTATUS open_known_dll( const WCHAR *libname, UNICODE_STRING *nt_name, W
 #if !defined(__arm64ec__) && !defined(__aarch64__)
     if (libname && !_wcsicmp( libname, L"ucrtbase.dll" )) return STATUS_DLL_NOT_FOUND;
 #endif
+    if (!known_dll_listed( libname )) return STATUS_OBJECT_NAME_NOT_FOUND;
     RtlInitUnicodeString( &str, libname );
     InitializeObjectAttributes( &attr, &str, OBJ_CASE_INSENSITIVE, known_dlls_ntdir, NULL );
     if ((status = NtOpenSection( mapping, MAXIMUM_ALLOWED, &attr ))) return status;
