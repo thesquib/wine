@@ -4850,7 +4850,7 @@ static NTSTATUS ext_glBufferStorage( void *args )
     struct glBufferStorage_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glBufferStorage) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glBufferStorage( params->target, params->size, params->data, params->flags );
+    wrap_glBufferStorage( params->teb, params->target, params->size, params->data, params->flags );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -7087,7 +7087,7 @@ static NTSTATUS ext_glDeleteBuffers( void *args )
     struct glDeleteBuffers_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glDeleteBuffers) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glDeleteBuffers( params->n, params->buffers );
+    wrap_glDeleteBuffers( params->teb, params->n, params->buffers );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -8644,7 +8644,7 @@ static NTSTATUS ext_glFlushMappedBufferRange( void *args )
     struct glFlushMappedBufferRange_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glFlushMappedBufferRange) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glFlushMappedBufferRange( params->target, params->offset, params->length );
+    wrap_glFlushMappedBufferRange( params->teb, params->target, params->offset, params->length );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -8664,7 +8664,7 @@ static NTSTATUS ext_glFlushMappedNamedBufferRange( void *args )
     struct glFlushMappedNamedBufferRange_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glFlushMappedNamedBufferRange) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glFlushMappedNamedBufferRange( params->buffer, params->offset, params->length );
+    wrap_glFlushMappedNamedBufferRange( params->teb, params->buffer, params->offset, params->length );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -8674,7 +8674,7 @@ static NTSTATUS ext_glFlushMappedNamedBufferRangeEXT( void *args )
     struct glFlushMappedNamedBufferRangeEXT_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glFlushMappedNamedBufferRangeEXT) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glFlushMappedNamedBufferRangeEXT( params->buffer, params->offset, params->length );
+    wrap_glFlushMappedNamedBufferRangeEXT( params->teb, params->buffer, params->offset, params->length );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15033,7 +15033,7 @@ static NTSTATUS ext_glMapBuffer( void *args )
     struct glMapBuffer_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapBuffer) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapBuffer( params->target, params->access );
+    params->ret = wrap_glMapBuffer( params->teb, params->target, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15043,7 +15043,7 @@ static NTSTATUS ext_glMapBufferARB( void *args )
     struct glMapBufferARB_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapBufferARB) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapBufferARB( params->target, params->access );
+    params->ret = wrap_glMapBufferARB( params->teb, params->target, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15053,7 +15053,7 @@ static NTSTATUS ext_glMapBufferRange( void *args )
     struct glMapBufferRange_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapBufferRange) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapBufferRange( params->target, params->offset, params->length, params->access );
+    params->ret = wrap_glMapBufferRange( params->teb, params->target, params->offset, params->length, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15093,7 +15093,7 @@ static NTSTATUS ext_glMapNamedBuffer( void *args )
     struct glMapNamedBuffer_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapNamedBuffer) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapNamedBuffer( params->buffer, params->access );
+    params->ret = wrap_glMapNamedBuffer( params->teb, params->buffer, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15103,7 +15103,7 @@ static NTSTATUS ext_glMapNamedBufferEXT( void *args )
     struct glMapNamedBufferEXT_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapNamedBufferEXT) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapNamedBufferEXT( params->buffer, params->access );
+    params->ret = wrap_glMapNamedBufferEXT( params->teb, params->buffer, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15113,7 +15113,7 @@ static NTSTATUS ext_glMapNamedBufferRange( void *args )
     struct glMapNamedBufferRange_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapNamedBufferRange) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapNamedBufferRange( params->buffer, params->offset, params->length, params->access );
+    params->ret = wrap_glMapNamedBufferRange( params->teb, params->buffer, params->offset, params->length, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -15123,7 +15123,7 @@ static NTSTATUS ext_glMapNamedBufferRangeEXT( void *args )
     struct glMapNamedBufferRangeEXT_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glMapNamedBufferRangeEXT) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glMapNamedBufferRangeEXT( params->buffer, params->offset, params->length, params->access );
+    params->ret = wrap_glMapNamedBufferRangeEXT( params->teb, params->buffer, params->offset, params->length, params->access );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -17714,7 +17714,7 @@ static NTSTATUS ext_glNamedBufferStorage( void *args )
     struct glNamedBufferStorage_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glNamedBufferStorage) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glNamedBufferStorage( params->buffer, params->size, params->data, params->flags );
+    wrap_glNamedBufferStorage( params->teb, params->buffer, params->size, params->data, params->flags );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -17724,7 +17724,7 @@ static NTSTATUS ext_glNamedBufferStorageEXT( void *args )
     struct glNamedBufferStorageEXT_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glNamedBufferStorageEXT) return STATUS_NOT_IMPLEMENTED;
-    funcs->p_glNamedBufferStorageEXT( params->buffer, params->size, params->data, params->flags );
+    wrap_glNamedBufferStorageEXT( params->teb, params->buffer, params->size, params->data, params->flags );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -26112,7 +26112,7 @@ static NTSTATUS ext_glUnmapBuffer( void *args )
     struct glUnmapBuffer_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glUnmapBuffer) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glUnmapBuffer( params->target );
+    params->ret = wrap_glUnmapBuffer( params->teb, params->target );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -26122,7 +26122,7 @@ static NTSTATUS ext_glUnmapBufferARB( void *args )
     struct glUnmapBufferARB_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glUnmapBufferARB) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glUnmapBufferARB( params->target );
+    params->ret = wrap_glUnmapBufferARB( params->teb, params->target );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -26132,7 +26132,7 @@ static NTSTATUS ext_glUnmapNamedBuffer( void *args )
     struct glUnmapNamedBuffer_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glUnmapNamedBuffer) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glUnmapNamedBuffer( params->buffer );
+    params->ret = wrap_glUnmapNamedBuffer( params->teb, params->buffer );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -26142,7 +26142,7 @@ static NTSTATUS ext_glUnmapNamedBufferEXT( void *args )
     struct glUnmapNamedBufferEXT_params *params = args;
     const struct opengl_funcs *funcs = params->teb->glTable;
     if (!funcs->p_glUnmapNamedBufferEXT) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_glUnmapNamedBufferEXT( params->buffer );
+    params->ret = wrap_glUnmapNamedBufferEXT( params->teb, params->buffer );
     set_context_attribute( params->teb, -1 /* unsupported */, NULL, 0 );
     return STATUS_SUCCESS;
 }
@@ -30575,16 +30575,14 @@ static NTSTATUS ext_wglGetExtensionsStringARB( void *args )
     struct wglGetExtensionsStringARB_params *params = args;
     const struct opengl_funcs *funcs = get_dc_funcs( params->hdc );
     if (!funcs || !funcs->p_wglGetExtensionsStringARB) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_wglGetExtensionsStringARB( params->hdc );
+    params->ret = wrap_wglGetExtensionsStringARB( params->teb, params->hdc );
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS ext_wglGetExtensionsStringEXT( void *args )
 {
     struct wglGetExtensionsStringEXT_params *params = args;
-    const struct opengl_funcs *funcs = params->teb->glTable;
-    if (!funcs->p_wglGetExtensionsStringEXT) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_wglGetExtensionsStringEXT();
+    params->ret = wrap_wglGetExtensionsStringEXT( params->teb );
     return STATUS_SUCCESS;
 }
 
@@ -30645,9 +30643,7 @@ static NTSTATUS ext_wglQueryCurrentRendererIntegerWINE( void *args )
 static NTSTATUS ext_wglQueryCurrentRendererStringWINE( void *args )
 {
     struct wglQueryCurrentRendererStringWINE_params *params = args;
-    const struct opengl_funcs *funcs = params->teb->glTable;
-    if (!funcs->p_wglQueryCurrentRendererStringWINE) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_wglQueryCurrentRendererStringWINE( params->attribute );
+    params->ret = wrap_wglQueryCurrentRendererStringWINE( params->teb, params->attribute );
     return STATUS_SUCCESS;
 }
 
@@ -30674,7 +30670,7 @@ static NTSTATUS ext_wglQueryRendererStringWINE( void *args )
     struct wglQueryRendererStringWINE_params *params = args;
     const struct opengl_funcs *funcs = get_dc_funcs( params->dc );
     if (!funcs || !funcs->p_wglQueryRendererStringWINE) return STATUS_NOT_IMPLEMENTED;
-    params->ret = funcs->p_wglQueryRendererStringWINE( params->dc, params->renderer, params->attribute );
+    params->ret = wrap_wglQueryRendererStringWINE( params->teb, params->dc, params->renderer, params->attribute );
     return STATUS_SUCCESS;
 }
 
@@ -87023,10 +87019,11 @@ static NTSTATUS wow64_ext_wglGetExtensionsStringARB( void *args )
         PTR32 hdc;
         PTR32 ret;
     } *params = args;
+    TEB *teb = get_teb64( params->teb );
     const char *ret;
     const struct opengl_funcs *funcs = get_dc_funcs( ULongToPtr(params->hdc) );
     if (!funcs || !funcs->p_wglGetExtensionsStringARB) return STATUS_NOT_IMPLEMENTED;
-    ret = funcs->p_wglGetExtensionsStringARB( ULongToPtr(params->hdc) );
+    ret = wrap_wglGetExtensionsStringARB( teb, ULongToPtr(params->hdc) );
     return return_wow64_string( ret, &params->ret );
 }
 
@@ -87039,9 +87036,7 @@ static NTSTATUS wow64_ext_wglGetExtensionsStringEXT( void *args )
     } *params = args;
     TEB *teb = get_teb64( params->teb );
     const char *ret;
-    const struct opengl_funcs *funcs = teb->glTable;
-    if (!funcs->p_wglGetExtensionsStringEXT) return STATUS_NOT_IMPLEMENTED;
-    ret = funcs->p_wglGetExtensionsStringEXT();
+    ret = wrap_wglGetExtensionsStringEXT( teb );
     return return_wow64_string( ret, &params->ret );
 }
 
@@ -87155,9 +87150,7 @@ static NTSTATUS wow64_ext_wglQueryCurrentRendererStringWINE( void *args )
     } *params = args;
     TEB *teb = get_teb64( params->teb );
     const GLchar *ret;
-    const struct opengl_funcs *funcs = teb->glTable;
-    if (!funcs->p_wglQueryCurrentRendererStringWINE) return STATUS_NOT_IMPLEMENTED;
-    ret = funcs->p_wglQueryCurrentRendererStringWINE( params->attribute );
+    ret = wrap_wglQueryCurrentRendererStringWINE( teb, params->attribute );
     return return_wow64_string( ret, &params->ret );
 }
 
@@ -87205,10 +87198,11 @@ static NTSTATUS wow64_ext_wglQueryRendererStringWINE( void *args )
         GLenum attribute;
         PTR32 ret;
     } *params = args;
+    TEB *teb = get_teb64( params->teb );
     const GLchar *ret;
     const struct opengl_funcs *funcs = get_dc_funcs( ULongToPtr(params->dc) );
     if (!funcs || !funcs->p_wglQueryRendererStringWINE) return STATUS_NOT_IMPLEMENTED;
-    ret = funcs->p_wglQueryRendererStringWINE( ULongToPtr(params->dc), params->renderer, params->attribute );
+    ret = wrap_wglQueryRendererStringWINE( teb, ULongToPtr(params->dc), params->renderer, params->attribute );
     return return_wow64_string( ret, &params->ret );
 }
 
