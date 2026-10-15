@@ -45,5 +45,6 @@ extern NTSTATUS msync_release_mutex_obj( int obj, LONG *prev_count );
 extern NTSTATUS msync_query_mutex_obj( int obj, MUTANT_BASIC_INFORMATION *info );
 extern NTSTATUS msync_wait_objs( const DWORD count, const int *objs, BOOLEAN wait_any,
                                  int alert_obj, const LARGE_INTEGER *timeout );
+extern void msync_waitdump_obj( int obj, char *buf, size_t size );
 
 #endif /* __APPLE__ */

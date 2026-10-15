@@ -74,6 +74,8 @@ extern void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks );
 extern void vcpu_prof_sync_size( size_t bytes, int per_page );
 extern void vcpu_prof_note_priority( HANDLE handle );
 extern void vcpu_prof_note_thread_name( HANDLE handle, const UNICODE_STRING *name );
+extern int vcpu_waitdump;  /* PMW_VCPU_WAITDUMP, see waitdump_start */
+extern void vcpu_waitdump_handle( HANDLE handle, char *buf, size_t size );  /* sync.c */
 static inline uint64_t vcpu_prof_now(void)
 {
     uint64_t v;
@@ -86,6 +88,7 @@ static inline void vcpu_prof_add( enum vcpu_prof_id id, uint64_t ticks ) {}
 static inline void vcpu_prof_sync_size( size_t bytes, int per_page ) {}
 static inline void vcpu_prof_note_priority( HANDLE handle ) {}
 static inline void vcpu_prof_note_thread_name( HANDLE handle, const UNICODE_STRING *name ) {}
+#define vcpu_waitdump 0
 static inline uint64_t vcpu_prof_now(void) { return 0; }
 #endif
 

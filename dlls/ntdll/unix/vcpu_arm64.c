@@ -654,6 +654,7 @@ static unsigned int vcpu_sample_ms;  /* PMW_VCPU_SAMPLE_MS, see sample_thread */
 static unsigned int vcpu_rips;  /* PMW_VCPU_RIPS, see rips_report */
 static void sample_report(void);
 static void prio_report( double cpu_s );  /* the CPU time per Windows base priority, below */
+static void waitdump_start(void);  /* PMW_VCPU_WAITDUMP, below */
 static void *sample_thread( void *arg );
 static void rips_start(void);
 static void stall_parse_dumps( const char *env );
@@ -1103,6 +1104,18 @@ static void prof_start(void)
     pthread_sigmask( SIG_SETMASK, &old, NULL );
 }
 
+/* PMW_VCPU_WAITDUMP: one host call (syscall or unix call) a thread is inside, recorded at its exit */
+#define WD_DEPTH 4
+struct wd_entry
+{
+    struct vcpu_level  *level;         /* the level it returns to */
+    uint64_t            t0;            /* prof_now() at the exit */
+    ULONG64             args[6];       /* x0-x5: syscall arguments; unix call: table, code, params */
+    ULONG64             pc, lr, sp, fp;/* the guest's native registers at the exit */
+    UINT                id;            /* syscall id */
+    BOOL                unix_call;
+};
+
 struct vcpu_thread
 {
     vel1_vcpu           vcpu;          /* host-only memory (D12); the thread finds it through vcpu_key */
@@ -1149,6 +1162,10 @@ struct vcpu_thread
     pthread_t           prio_pthread;  /* PMW_VCPU_PROF: for pthread_get_qos_class_np */
     int                 prio_base;     /* PMW_VCPU_PROF: the server's base_priority (THREAD_PRIORITY_*), or PRIO_UNKNOWN */
     uint64_t            prio_cpu_ns;   /* PMW_VCPU_PROF: user+system time at the previous report */
+    struct wd_entry     wd[WD_DEPTH];  /* PMW_VCPU_WAITDUMP: the host calls the thread is inside, outermost first */
+    _Atomic unsigned int wd_depth;     /* PMW_VCPU_WAITDUMP: how many (only the first WD_DEPTH are recorded) */
+    _Atomic unsigned int wd_seq;       /* PMW_VCPU_WAITDUMP: bumped by every push and pop */
+    TEB                *teb;           /* the thread's TEB, for diagnostics threads */
 };
 
 static pthread_key_t vcpu_key;
@@ -1734,7 +1751,7 @@ void vcpu_prof_note_thread_name( HANDLE handle, const UNICODE_STRING *name )
     sigset_t old;
     UINT tid;
 
-    if (!vcpu_rips) return;
+    if (!vcpu_rips && !vcpu_waitdump) return;
     if (NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL )) return;
     if (HandleToULong( info.ClientId.UniqueProcess ) != GetCurrentProcessId()) return;
     tid = HandleToULong( info.ClientId.UniqueThread );
@@ -2563,6 +2580,966 @@ static void sample_report(void)
             fprintf( stderr, "[VCPU-SAMPLE] pid %d %s\n", (int)getpid(), line );
         }
     }
+}
+
+/***********************************************************************
+ * PMW_VCPU_WAITDUMP=1 (diagnostic, default off; independent of PMW_VCPU_PROF): what every thread is waiting on
+ *
+ * Each Windows thread records the host call it is inside at every syscall / unix-call exit (wd_push, popped when the
+ * call returns, nested callbacks stacked, WD_DEPTH deep): the id, x0-x5, the time and the native registers. On a
+ * trigger a host thread writes one [VCPU-WAIT] block per thread, read-only (vm_read_overwrite for every pointer, no
+ * hv_* call, no server call, no kick): the call and how long it has been in it, the wait's arguments (handles with
+ * what the in-process sync cache and msync's shared memory say about them: type, signaled, mutex owner, semaphore
+ * count; timeouts), the guest's x86 state (WoW64: the i386 registers FEX saved at the syscall, from its thread state,
+ * else the WoW64 CPU area; x64 under ARM64EC: ChpeV2CpuAreaInfo->ContextAmd64), an EBP/RBP chain and a stack scan for
+ * return addresses named module+offset (PEB loader lists: the 32-bit one for i386 code), and critical sections found
+ * on the stack (or as a wait address / keyed-event key) with their owner thread. A summary names owner cycles.
+ *
+ * Triggers: kill -INFO <pid> (SIGINFO; shared with PMW_VCPU_RIPS's reset when that is on: both happen), touching
+ * <prefix>-<pid> or <prefix>-all (prefix PMW_VCPU_WAITDUMP_FILE, default /tmp/pmw-waitdump; checked every 100 ms by
+ * mtime: a file that appears or changes), and PMW_VCPU_WAITDUMP_EVERY=<seconds> (periodic).
+ * PMW_VCPU_WAITDUMP_LONG_MS=<ms>: also log every host call that took at least that long when it returns, from the
+ * thread itself, with its status and the guest caller ([VCPU-WAIT] LONG ...), at most 20 a second.
+ * PMW_VCPU_WAITDUMP_STACK=<bytes>: stack scanned per thread (default 2048). PMW_VCPU_WAITDUMP_OUT=<path>: each dump
+ * is also appended to <path>.<pid>. Output goes to stderr in one write per dump.
+ */
+int vcpu_waitdump;
+static uint64_t wd_long_ticks;
+static unsigned int wd_every, wd_stack_bytes = 2048;
+static double wd_hz = 24e6;
+static int wd_pid;
+static volatile sig_atomic_t wd_signal_flag;
+static void (*wd_prev_sigh)( int );
+static char wd_file_pid[512], wd_file_all[512];
+static const char *wd_out;
+static pthread_mutex_t wd_lock = PTHREAD_MUTEX_INITIALIZER;  /* the module tables, the output file, rate limit */
+
+#define WDP( f, fmt, ... ) fprintf( f, "[VCPU-WAIT] %d " fmt "\n", wd_pid, ##__VA_ARGS__ )
+
+static void wd_push( struct vcpu_thread *vt, struct vcpu_level *level, BOOL unix_call, const vel1_exit *e,
+                     const struct syscall_frame *frame )
+{
+    unsigned int d = atomic_load_explicit( &vt->wd_depth, memory_order_relaxed );
+
+    if (d < WD_DEPTH)
+    {
+        struct wd_entry *w = &vt->wd[d];
+
+        w->level = level;
+        w->t0 = prof_now();
+        memcpy( w->args, e->regs.x, sizeof(w->args) );
+        w->pc = frame->pc;
+        w->lr = frame->lr;
+        w->sp = frame->sp;
+        w->fp = frame->fp;
+        w->id = unix_call ? 0 : frame->syscall_id;
+        w->unix_call = unix_call;
+    }
+    atomic_fetch_add_explicit( &vt->wd_seq, 1, memory_order_release );
+    atomic_store_explicit( &vt->wd_depth, d + 1, memory_order_release );
+}
+
+static void wd_long_report( struct vcpu_thread *vt, const struct wd_entry *w, ULONG64 ret, uint64_t ticks );
+
+static void wd_pop( struct vcpu_thread *vt, struct vcpu_level *level, ULONG64 ret )
+{
+    unsigned int d = atomic_load_explicit( &vt->wd_depth, memory_order_relaxed );
+
+    /* an inner level's entry that never came back here (not expected) goes with it */
+    while (d > 1 && d <= WD_DEPTH && vt->wd[d - 1].level != level) d--;
+    if (!d) return;
+    if (wd_long_ticks && d <= WD_DEPTH)
+    {
+        uint64_t ticks = prof_now() - vt->wd[d - 1].t0;
+        if (ticks >= wd_long_ticks) wd_long_report( vt, &vt->wd[d - 1], ret, ticks );
+    }
+    atomic_fetch_add_explicit( &vt->wd_seq, 1, memory_order_release );
+    atomic_store_explicit( &vt->wd_depth, d - 1, memory_order_release );
+}
+
+/* module tables: the 64-bit PEB loader list, and in a WoW64 process the 32-bit one (addresses as the 32-bit code
+ * sees them); under wd_lock */
+struct wd_mod { ULONG64 base, size; char name[48]; };
+static struct wd_mod wd_mods64[2048], wd_mods32[2048];
+static unsigned int wd_nmods64, wd_nmods32;
+static ULONG64 wd_base32;  /* WoW64: the host address of 32-bit address 0 (BASE), 0 otherwise */
+
+static int wd_mod_cmp( const void *a, const void *b )
+{
+    ULONG64 x = ((const struct wd_mod *)a)->base, y = ((const struct wd_mod *)b)->base;
+    return x < y ? -1 : x > y;
+}
+
+static const struct wd_mod *wd_mod_of( const struct wd_mod *mods, unsigned int n, ULONG64 addr )
+{
+    unsigned int lo = 0, hi = n;
+
+    while (lo < hi)
+    {
+        unsigned int mid = (lo + hi) / 2;
+        if (addr < mods[mid].base) hi = mid;
+        else if (addr >= mods[mid].base + mods[mid].size) lo = mid + 1;
+        else return &mods[mid];
+    }
+    return NULL;
+}
+
+/* a 32-bit guest address as the host reads it */
+static inline ULONG64 wd_host32( ULONG p )
+{
+    return wd_base32 + p;
+}
+
+/* a 64-bit guest address as the host reads it: in a WoW64 process anything below 4 GiB is the low twin of BASE + p */
+static inline ULONG64 wd_host64( ULONG64 addr )
+{
+    return (wd_base32 && addr < ((ULONG64)1 << 32)) ? wd_base32 + addr : addr;
+}
+
+static void wd_mods_refresh( TEB *any_teb )
+{
+    PEB p;
+    PEB_LDR_DATA ldr;
+    LDR_DATA_TABLE_ENTRY e;
+    ULONG64 head, cur;
+    unsigned int iter;
+    LONG off = 0;
+
+    wd_nmods64 = wd_nmods32 = 0;
+    wd_base32 = 0;
+    if (peb && rips_read( (ULONG64)peb, &p, sizeof(p) ) && p.LdrData &&
+        rips_read( (ULONG64)p.LdrData, &ldr, sizeof(ldr) ))
+    {
+        head = (ULONG64)p.LdrData + offsetof( PEB_LDR_DATA, InLoadOrderModuleList );
+        cur = (ULONG64)ldr.InLoadOrderModuleList.Flink;
+        for (iter = 0; cur && cur != head && iter < 4096 && wd_nmods64 < ARRAY_SIZE(wd_mods64); iter++)
+        {
+            struct wd_mod *m = &wd_mods64[wd_nmods64];
+
+            if (!rips_read( cur, &e, sizeof(e) )) break;
+            cur = (ULONG64)e.InLoadOrderLinks.Flink;
+            if (!e.DllBase || !e.SizeOfImage) continue;
+            m->base = (ULONG64)e.DllBase;
+            m->size = e.SizeOfImage;
+            rips_wstr( &e.BaseDllName, m->name, sizeof(m->name) );
+            if (!m->name[0]) strcpy( m->name, "?" );
+            wd_nmods64++;
+        }
+        qsort( wd_mods64, wd_nmods64, sizeof(wd_mods64[0]), wd_mod_cmp );
+    }
+
+    if (is_wow64() && any_teb && rips_read( (ULONG64)&any_teb->WowTebOffset, &off, sizeof(off) ) && off)
+    {
+        ULONG64 teb32 = (ULONG64)any_teb + off;
+        ULONG peb32 = 0, ldr32 = 0;
+        struct { ULONG next, prev; } links;
+        PEB_LDR_DATA32 l32;
+        unsigned char ent[0x34];
+
+        wd_base32 = teb32 & ~(ULONG64)0xffffffff;
+        if (!rips_read( teb32 + offsetof( TEB32, Peb ), &peb32, sizeof(peb32) ) || !peb32) return;
+        if (!rips_read( wd_host32( peb32 ) + offsetof( PEB32, LdrData ), &ldr32, sizeof(ldr32) ) || !ldr32) return;
+        if (!rips_read( wd_host32( ldr32 ), &l32, sizeof(l32) )) return;
+        head = ldr32 + offsetof( PEB_LDR_DATA32, InLoadOrderModuleList );
+        cur = l32.InLoadOrderModuleList.Flink;
+        for (iter = 0; cur && cur != head && iter < 4096 && wd_nmods32 < ARRAY_SIZE(wd_mods32); iter++)
+        {
+            /* LDR_DATA_TABLE_ENTRY32: InLoadOrderLinks at 0, DllBase 0x18, SizeOfImage 0x20, BaseDllName 0x2c */
+            struct wd_mod *m = &wd_mods32[wd_nmods32];
+            ULONG base, size, buf32;
+            USHORT len;
+            WCHAR w[48];
+            unsigned int i, n;
+
+            if (!rips_read( wd_host32( (ULONG)cur ), ent, sizeof(ent) )) break;
+            memcpy( &links, ent, sizeof(links) );
+            cur = links.next;
+            memcpy( &base, ent + 0x18, 4 );
+            memcpy( &size, ent + 0x20, 4 );
+            memcpy( &len, ent + 0x2c, 2 );
+            memcpy( &buf32, ent + 0x30, 4 );
+            if (!base || !size) continue;
+            m->base = base;
+            m->size = size;
+            n = min( len / sizeof(WCHAR), ARRAY_SIZE(w) - 1 );
+            if (!buf32 || !n || !rips_read( wd_host32( buf32 ), w, n * sizeof(WCHAR) )) n = 0;
+            for (i = 0; i < n && i + 1 < sizeof(m->name); i++) m->name[i] = w[i] && w[i] < 0x80 ? (char)w[i] : '?';
+            m->name[i] = 0;
+            if (!m->name[0]) strcpy( m->name, "?" );
+            wd_nmods32++;
+        }
+        qsort( wd_mods32, wd_nmods32, sizeof(wd_mods32[0]), wd_mod_cmp );
+    }
+}
+
+/* host / 64-bit address: PE module+RVA, else a unix library (+ nearest exported symbol) */
+static void wd_name64( ULONG64 addr, char *buf, unsigned int size )
+{
+    const struct wd_mod *m = wd_mod_of( wd_mods64, wd_nmods64, addr );
+    Dl_info info;
+
+    if (m) snprintf( buf, size, "%s+%#llx", m->name, (unsigned long long)(addr - m->base) );
+    else if (dladdr( (void *)addr, &info ) && info.dli_fname)
+    {
+        const char *base = strrchr( info.dli_fname, '/' );
+        base = base ? base + 1 : info.dli_fname;
+        if (info.dli_sname)
+            snprintf( buf, size, "%s+%#llx(%s+%#llx)", base, (unsigned long long)(addr - (ULONG64)info.dli_fbase),
+                      info.dli_sname, (unsigned long long)(addr - (ULONG64)info.dli_saddr) );
+        else snprintf( buf, size, "%s+%#llx", base, (unsigned long long)(addr - (ULONG64)info.dli_fbase) );
+    }
+    else snprintf( buf, size, "?" );
+}
+
+static BOOL wd_name32( ULONG addr, char *buf, unsigned int size )
+{
+    const struct wd_mod *m = wd_mod_of( wd_mods32, wd_nmods32, addr );
+
+    if (m) snprintf( buf, size, "%s+%#llx", m->name, (unsigned long long)(addr - m->base) );
+    else snprintf( buf, size, "?" );
+    return m != NULL;
+}
+
+/* the threads of the dump, for owner names */
+struct wd_tid { UINT tid; char name[RIPS_NAME]; };
+
+static const char *wd_tid_name( const struct wd_tid *tids, unsigned int n, UINT tid, BOOL *known )
+{
+    unsigned int i;
+
+    for (i = 0; i < n; i++)
+        if (tids[i].tid == tid)
+        {
+            if (known) *known = TRUE;
+            return tids[i].name;
+        }
+    if (known) *known = FALSE;
+    return "";
+}
+
+/* a critical section at host address cs (32-bit layout for WoW64 code): plausibly locked, owned by a thread of this
+ * process, or confirmed by its DebugInfo back-pointer (Wine keeps the name in Spare[0]) */
+struct wd_cs { ULONG64 guest; UINT owner; LONG lock_count, recursion; BOOL debug_ok; char name[64]; };
+
+static BOOL wd_cs_at( ULONG64 guest, BOOL is32, const struct wd_tid *tids, unsigned int ntids, struct wd_cs *cs )
+{
+    ULONG64 host = is32 ? wd_host32( (ULONG)guest ) : wd_host64( guest ), debug, owner, name_ptr = 0, back = 0;
+    LONG lock_count, recursion;
+    BOOL known;
+
+    if (is32)
+    {
+        ULONG c[6];  /* DebugInfo, LockCount, RecursionCount, OwningThread, LockSemaphore, SpinCount */
+        if (!rips_read( host, c, sizeof(c) )) return FALSE;
+        debug = c[0] == 0xffffffff ? 0 : c[0];
+        lock_count = (LONG)c[1];
+        recursion = (LONG)c[2];
+        owner = c[3];
+    }
+    else
+    {
+        struct { ULONG64 debug; LONG lock_count, recursion; ULONG64 owner, sem, spin; } c;
+        if (!rips_read( host, &c, sizeof(c) )) return FALSE;
+        debug = c.debug == ~(ULONG64)0 ? 0 : c.debug;
+        lock_count = c.lock_count;
+        recursion = c.recursion;
+        owner = c.owner;
+    }
+    if (lock_count < 0 || lock_count > 0xffff || recursion < 1 || recursion > 0xffff) return FALSE;
+    if (!owner || owner > 0xfffff || (owner & 3)) return FALSE;
+    memset( cs, 0, sizeof(*cs) );
+    cs->guest = guest;
+    cs->owner = owner;
+    cs->lock_count = lock_count;
+    cs->recursion = recursion;
+    if (debug)
+    {
+        /* RTL_CRITICAL_SECTION_DEBUG: CriticalSection at 4 / 8, Wine's name (Spare[0]) at 24 / 40 */
+        if (is32)
+        {
+            ULONG b = 0, n = 0;
+            if (rips_read( wd_host32( (ULONG)debug ) + 4, &b, 4 ) && b == (ULONG)guest)
+            {
+                cs->debug_ok = TRUE;
+                if (rips_read( wd_host32( (ULONG)debug ) + 24, &n, 4 ) && n) name_ptr = wd_host32( n );
+            }
+        }
+        else if (rips_read( wd_host64( debug ) + 8, &back, 8 ) && back == guest)
+        {
+            cs->debug_ok = TRUE;
+            if (rips_read( wd_host64( debug ) + 40, &name_ptr, 8 ) && name_ptr) name_ptr = wd_host64( name_ptr );
+        }
+        if (name_ptr)
+        {
+            unsigned int got = rips_read_partial( name_ptr, (unsigned char *)cs->name, sizeof(cs->name) - 1 ), i;
+            cs->name[got] = 0;
+            for (i = 0; cs->name[i]; i++) if ((unsigned char)cs->name[i] < 0x20 || (unsigned char)cs->name[i] >= 0x7f) break;
+            cs->name[i] = 0;
+        }
+    }
+    wd_tid_name( tids, ntids, owner, &known );
+    return known || cs->debug_ok;
+}
+
+static void wd_cs_print( FILE *f, const struct wd_cs *cs, UINT self, const char *how, const struct wd_tid *tids,
+                         unsigned int ntids )
+{
+    BOOL known;
+    const char *oname = wd_tid_name( tids, ntids, cs->owner, &known );
+
+    WDP( f, "    critical section %#llx (%s): owner %04x%s%s%s%s, recursion %d, lock count %d (%d waiting)%s%s%s%s",
+         (unsigned long long)cs->guest, how, cs->owner, known ? "" : " (not a thread of this process)",
+         oname[0] ? " \"" : "", oname, oname[0] ? "\"" : "", cs->recursion, cs->lock_count, cs->lock_count,
+         cs->debug_ok ? ", debuginfo ok" : "", cs->name[0] ? " \"" : "", cs->name, cs->name[0] ? "\"" : "" );
+    if (cs->owner == self) WDP( f, "      (held by this thread)" );
+}
+
+static void wd_timeout( char *buf, unsigned int size, ULONG64 ptr )
+{
+    LONGLONG t;
+
+    if (!ptr) snprintf( buf, size, "infinite" );
+    else if (!rips_read( wd_host64( ptr ), &t, sizeof(t) )) snprintf( buf, size, "unreadable (%#llx)", (unsigned long long)ptr );
+    else if (t == (LONGLONG)((ULONGLONG)1 << 63)) snprintf( buf, size, "infinite (min)" );
+    else if (t < 0) snprintf( buf, size, "%.3f s relative", -t / 1e7 );
+    else if (!t) snprintf( buf, size, "0 (poll)" );
+    else snprintf( buf, size, "absolute %lld", (long long)t );
+}
+
+static void wd_handle( FILE *f, const char *what, ULONG64 h )
+{
+    char desc[256];
+
+    vcpu_waitdump_handle( (HANDLE)(ULONG_PTR)h, desc, sizeof(desc) );
+    WDP( f, "    %s %#llx: %s", what, (unsigned long long)h, desc );
+}
+
+static void wd_add_cs( ULONG64 *cand, unsigned int *n, unsigned int max, ULONG64 a )
+{
+    unsigned int i;
+    for (i = 0; i < *n; i++) if (cand[i] == a) return;
+    if (*n < max) cand[(*n)++] = a;
+}
+
+/* the call's name, and for waits their arguments; adds wait addresses / keys to cand (critical section candidates) */
+static void wd_call_name( const struct wd_entry *w, char *buf, unsigned int size )
+{
+    const char *name;
+
+    if (w->unix_call)
+    {
+        Dl_info info;
+        const char *mod = "?", *slash;
+        ULONG64 fn = 0;
+        char fname[160] = "";
+
+        if (dladdr( (void *)w->args[0], &info ) && info.dli_fname)
+            mod = (slash = strrchr( info.dli_fname, '/' )) ? slash + 1 : info.dli_fname;
+        if (rips_read( w->args[0] + w->args[1] * sizeof(void *), &fn, sizeof(fn) ) && fn) wd_name64( fn, fname, sizeof(fname) );
+        snprintf( buf, size, "unix call %s#%llu (%s)", mod, (unsigned long long)w->args[1], fname );
+        return;
+    }
+    if ((name = ntdll_syscall_name( w->id )) && name[0]) snprintf( buf, size, "%s", name );
+    else snprintf( buf, size, "syscall %04x", w->id );
+}
+
+static void wd_call_args( FILE *f, const struct wd_entry *w, ULONG64 *cand, unsigned int *ncand, unsigned int max )
+{
+    const char *name = w->unix_call ? NULL : ntdll_syscall_name( w->id );
+    const ULONG64 *a = w->args;
+    char t[64];
+    unsigned int i;
+
+    if (!name) return;
+    if (!strcmp( name, "NtWaitForSingleObject" ))
+    {
+        wd_timeout( t, sizeof(t), a[2] );
+        WDP( f, "    alertable %u, timeout %s", (UINT)a[1] & 0xff, t );
+        wd_handle( f, "handle", a[0] );
+    }
+    else if (!strcmp( name, "NtWaitForMultipleObjects" ))
+    {
+        ULONG64 h[64];
+        unsigned int n = min( (UINT)a[0], 64u );
+
+        wd_timeout( t, sizeof(t), a[4] );
+        WDP( f, "    %u handles, wait %s, alertable %u, timeout %s", (UINT)a[0], (UINT)a[2] ? "any" : "all",
+             (UINT)a[3] & 0xff, t );
+        if (n && rips_read( wd_host64( a[1] ), h, n * sizeof(h[0]) ))
+            for (i = 0; i < n; i++) wd_handle( f, "handle", h[i] );
+    }
+    else if (!strcmp( name, "NtUserMsgWaitForMultipleObjectsEx" ))
+    {
+        ULONG64 h[64];
+        unsigned int n = min( (UINT)a[0], 64u );
+
+        if ((UINT)a[2] == ~0u) snprintf( t, sizeof(t), "infinite" );
+        else snprintf( t, sizeof(t), "%u ms", (UINT)a[2] );
+        WDP( f, "    %u handles, timeout %s, wake mask %#x, flags %#x", (UINT)a[0], t, (UINT)a[3], (UINT)a[4] );
+        if (n && rips_read( wd_host64( a[1] ), h, n * sizeof(h[0]) ))
+            for (i = 0; i < n; i++) wd_handle( f, "handle", h[i] );
+    }
+    else if (!strcmp( name, "NtDelayExecution" ))
+    {
+        wd_timeout( t, sizeof(t), a[1] );
+        WDP( f, "    alertable %u, timeout %s", (UINT)a[0] & 0xff, t );
+    }
+    else if (!strcmp( name, "NtSignalAndWaitForSingleObject" ))
+    {
+        wd_timeout( t, sizeof(t), a[3] );
+        WDP( f, "    alertable %u, timeout %s", (UINT)a[2] & 0xff, t );
+        wd_handle( f, "signal", a[0] );
+        wd_handle( f, "wait on", a[1] );
+    }
+    else if (!strcmp( name, "NtRemoveIoCompletion" ))
+    {
+        wd_timeout( t, sizeof(t), a[4] );
+        WDP( f, "    timeout %s", t );
+        wd_handle( f, "port", a[0] );
+    }
+    else if (!strcmp( name, "NtRemoveIoCompletionEx" ))
+    {
+        wd_timeout( t, sizeof(t), a[4] );
+        WDP( f, "    count %u, alertable %u, timeout %s", (UINT)a[2], (UINT)a[5] & 0xff, t );
+        wd_handle( f, "port", a[0] );
+    }
+    else if (!strcmp( name, "NtWaitForAlertByThreadId" ))
+    {
+        wd_timeout( t, sizeof(t), a[1] );
+        WDP( f, "    address %#llx, timeout %s%s", (unsigned long long)a[0], t,
+             a[0] ? "" : " (RtlWaitOnAddress: critical section, SRW lock, condition variable, WaitOnAddress)" );
+        if (a[0]) wd_add_cs( cand, ncand, max, a[0] );
+    }
+    else if (!strcmp( name, "NtWaitForKeyedEvent" ) || !strcmp( name, "NtReleaseKeyedEvent" ))
+    {
+        wd_timeout( t, sizeof(t), a[3] );
+        WDP( f, "    key %#llx, alertable %u, timeout %s", (unsigned long long)a[1], (UINT)a[2] & 0xff, t );
+        wd_handle( f, "keyed event", a[0] );
+        if (a[1]) wd_add_cs( cand, ncand, max, a[1] );
+    }
+    else if (!strcmp( name, "NtUserGetMessage" ))
+        WDP( f, "    hwnd %#llx, filter %#x-%#x", (unsigned long long)a[1], (UINT)a[2], (UINT)a[3] );
+    else if (prof_is_wait( name ))
+        WDP( f, "    args %#llx %#llx %#llx %#llx %#llx %#llx", (unsigned long long)a[0], (unsigned long long)a[1],
+             (unsigned long long)a[2], (unsigned long long)a[3], (unsigned long long)a[4], (unsigned long long)a[5] );
+}
+
+/* the guest's own (x86) state and stack; cand gets critical-section candidates found on the stack */
+static void wd_guest( FILE *f, struct vcpu_thread *vt, const struct wd_entry *w, BOOL brief, BOOL scan_cs,
+                      const struct wd_tid *tids, unsigned int ntids, struct wd_cs *cs_out, unsigned int *ncs_out )
+{
+    static TEB teb;  /* under wd_lock */
+    ULONG64 cand[64];
+    unsigned int ncand = 0, i, hits = 0, max_hits = brief ? 8 : 24;
+    char name[160], line[512];
+    int len;
+
+    if (!vt->teb || !rips_read( (ULONG64)vt->teb, &teb, sizeof(teb) )) return;
+    if (is_wow64() && teb.WowTebOffset)
+    {
+        ULONG64 teb32 = (ULONG64)vt->teb + teb.WowTebOffset, its = 0, fr = 0, regs[17];
+        NT_TIB32 tib;
+        ULONG eip = 0, esp = 0, ebp = 0, eax = 0, stack[1024], word;
+        const char *src = NULL;
+        unsigned int nwords;
+
+        if (!rips_read( teb32, &tib, sizeof(tib) )) return;
+        /* FEX's WoW64 module: TlsSlots[WOW64_TLS_MAX_NUMBER - 3] is its InternalThreadState, whose first member is
+         * CurrentFrame; CpuStateFrame.State: rip at 24, gregs[16] at 32 (FEXCore/Core/CoreState.h). Written at
+         * every syscall (the bop), so exact for a thread parked in one. */
+        its = (ULONG64)teb.TlsSlots[WOW64_TLS_MAX_NUMBER - 3];
+        if (its && rips_read( wd_host64( its ), &fr, 8 ) && fr && rips_read( wd_host64( fr ) + 24, regs, sizeof(regs) ))
+        {
+            esp = (ULONG)regs[1 + 4];
+            if (esp > tib.StackLimit && esp <= tib.StackBase)
+            {
+                eip = (ULONG)regs[0];
+                ebp = (ULONG)regs[1 + 5];
+                eax = (ULONG)regs[1 + 0];
+                src = w ? "FEX state at the syscall" : "FEX state, last sync (the thread runs)";
+            }
+        }
+        if (!src && teb.TlsSlots[WOW64_TLS_CPURESERVED])
+        {
+            WOW64_CONTEXT ctx;  /* after the 4-byte WOW64_CPURESERVED header */
+            if (rips_read( wd_host64( (ULONG64)teb.TlsSlots[WOW64_TLS_CPURESERVED] ) + 4, &ctx, sizeof(ctx) ) &&
+                ctx.Esp > tib.StackLimit && ctx.Esp <= tib.StackBase)
+            {
+                eip = ctx.Eip;
+                esp = ctx.Esp;
+                ebp = ctx.Ebp;
+                eax = ctx.Eax;
+                src = "WoW64 CPU area (may be stale)";
+            }
+        }
+        if (!src)
+        {
+            WDP( f, "  x86: no usable state (stack %08x-%08x)", tib.StackLimit, tib.StackBase );
+            return;
+        }
+        nwords = min( (min( wd_stack_bytes, tib.StackBase - esp )) / 4, (unsigned int)ARRAY_SIZE(stack) );
+        nwords = rips_read_partial( wd_host32( esp ), (unsigned char *)stack, nwords * 4 ) / 4;
+        wd_name32( eip, name, sizeof(name) );
+        WDP( f, "  x86 (%s): eip %08x %s esp %08x ebp %08x eax %08x, stack %08x-%08x", src, eip, name, esp, ebp, eax,
+             tib.StackLimit, tib.StackBase );
+        if (nwords >= 2)
+        {
+            char n1[160];
+            wd_name32( stack[0], name, sizeof(name) );
+            wd_name32( stack[1], n1, sizeof(n1) );
+            WDP( f, "  x86 [esp] %08x %s, [esp+4] %08x %s", stack[0], name, stack[1], n1 );
+        }
+        /* EBP chain */
+        len = 0;
+        line[0] = 0;
+        for (i = 0, word = ebp; i < (brief ? 6u : 16u) && word > esp && word < tib.StackBase - 8; i++)
+        {
+            ULONG pair[2];
+            if (!rips_read( wd_host32( word ), pair, sizeof(pair) )) break;
+            wd_name32( pair[1], name, sizeof(name) );
+            len += snprintf( line + len, sizeof(line) - len, " %08x=%s", pair[1], name );
+            if (len >= (int)sizeof(line) - 1 || pair[0] <= word) break;
+            word = pair[0];
+        }
+        if (line[0]) WDP( f, "  x86 ebp chain:%s", line );
+        /* stack scan: words inside a 32-bit module (return addresses, or code pointers) */
+        for (i = 0; i < nwords && hits < max_hits; i++)
+        {
+            if (!wd_name32( stack[i], name, sizeof(name) )) continue;
+            if (!hits++) WDP( f, "  x86 stack scan (words in 32-bit modules):" );
+            WDP( f, "    esp+0x%03x %08x %s", i * 4, stack[i], name );
+        }
+        if (!brief && nwords)
+        {
+            for (i = 0; i < min( nwords, 32u ); i += 8)
+            {
+                unsigned int j;
+                len = 0;
+                for (j = i; j < i + 8 && j < nwords; j++) len += snprintf( line + len, sizeof(line) - len, " %08x", stack[j] );
+                WDP( f, "  x86 raw esp+0x%03x:%s", i * 4, line );
+            }
+        }
+        if (scan_cs)
+            for (i = 0; i < min( nwords, 128u ); i++)
+            {
+                ULONG v = stack[i];
+                if (v < 0x10000 || (v & 3)) continue;
+                wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), v );
+                wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), v - 0x10 );  /* &LockSemaphore: the RtlWaitOnAddress word */
+            }
+        if (w && !w->unix_call)
+        {
+            /* a 32-bit wait address / key comes widened (BASE + p) */
+            const char *sname = ntdll_syscall_name( w->id );
+            ULONG64 a = 0;
+            if (sname && !strcmp( sname, "NtWaitForAlertByThreadId" )) a = w->args[0];
+            if (sname && !strcmp( sname, "NtWaitForKeyedEvent" )) a = w->args[1];
+            if (a && wd_base32 && a - wd_base32 < ((ULONG64)1 << 32)) wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), a - wd_base32 );
+        }
+        for (i = 0; scan_cs && i < ncand && *ncs_out < 4; i++)
+            if (wd_cs_at( cand[i], TRUE, tids, ntids, &cs_out[*ncs_out] )) ++*ncs_out;
+        return;
+    }
+    else
+    {
+        CHPE_V2_CPU_AREA_INFO chpe;
+        ARM64EC_NT_CONTEXT ctx;
+        BOOL have = FALSE;
+        ULONG64 sp = w ? w->sp : 0, base = (ULONG64)teb.Tib.StackBase, limit = (ULONG64)teb.Tib.StackLimit, end;
+        ULONG64 *stack;
+        unsigned int nwords;
+
+        if (teb.ChpeV2CpuAreaInfo && rips_read( (ULONG64)teb.ChpeV2CpuAreaInfo, &chpe, sizeof(chpe) ) &&
+            chpe.ContextAmd64 && rips_read( (ULONG64)chpe.ContextAmd64, &ctx, sizeof(ctx) ))
+            have = TRUE;
+        if (have && !ctx.Pc)
+        {
+            /* the emulator saves it on its own exits only (exceptions, suspends), not on calls into native code */
+            have = FALSE;
+            WDP( f, "  x64: ContextAmd64 holds no saved state (in simulation %u): the x64 frames are in the stack scan",
+                 chpe.InSimulation );
+        }
+        if (have)
+        {
+            wd_name64( ctx.Pc, name, sizeof(name) );
+            WDP( f, "  x64 (ContextAmd64, last saved by the emulator; in simulation %u): rip %#llx %s rsp %#llx rbp %#llx",
+                 chpe.InSimulation, (unsigned long long)ctx.Pc, name, (unsigned long long)ctx.Sp,
+                 (unsigned long long)ctx.Fp );
+            if (!sp || (ctx.Sp > limit && ctx.Sp < base && ctx.Sp < sp)) sp = ctx.Sp;
+            /* RBP chain */
+            len = 0;
+            line[0] = 0;
+            for (i = 0, end = ctx.Fp; i < (brief ? 6u : 16u) && end > limit && end < base - 16; i++)
+            {
+                ULONG64 pair[2];
+                if (!rips_read( end, pair, sizeof(pair) )) break;
+                wd_name64( pair[1], name, sizeof(name) );
+                len += snprintf( line + len, sizeof(line) - len, " %#llx=%s", (unsigned long long)pair[1], name );
+                if (len >= (int)sizeof(line) - 1 || pair[0] <= end) break;
+                end = pair[0];
+            }
+            if (line[0]) WDP( f, "  x64 rbp chain:%s", line );
+        }
+        if (!sp || sp <= limit || sp >= base) return;
+        /* from the native sp up past the x64 rsp, so the scan covers the emulated frames too */
+        end = sp + wd_stack_bytes;
+        if (have && ctx.Sp > sp && ctx.Sp < base) end = max( end, ctx.Sp + wd_stack_bytes );
+        end = min( min( end, base ), sp + 0x10000 );
+        nwords = (unsigned int)((end - sp) / 8);
+        if (!(stack = malloc( nwords * 8 ))) return;
+        nwords = rips_read_partial( sp, (unsigned char *)stack, nwords * 8 ) / 8;
+        for (i = 0; i < nwords && hits < max_hits; i++)
+        {
+            if (!wd_mod_of( wd_mods64, wd_nmods64, stack[i] )) continue;
+            wd_name64( stack[i], name, sizeof(name) );
+            if (!hits++) WDP( f, "  stack scan from sp %#llx (words in PE modules):", (unsigned long long)sp );
+            WDP( f, "    sp+0x%04x %#llx %s", i * 8, (unsigned long long)stack[i], name );
+        }
+        if (scan_cs)
+        {
+            for (i = 0; i < min( nwords, 256u ); i++)
+            {
+                ULONG64 v = stack[i];
+                if (v < 0x10000 || v >> 47 || (v & 7)) continue;
+                wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), v );
+                wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), v - 0x18 );  /* &LockSemaphore */
+            }
+            if (w && !w->unix_call)
+            {
+                const char *sname = ntdll_syscall_name( w->id );
+                if (sname && !strcmp( sname, "NtWaitForAlertByThreadId" ) && w->args[0]) wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), w->args[0] );
+                if (sname && !strcmp( sname, "NtWaitForKeyedEvent" ) && w->args[1]) wd_add_cs( cand, &ncand, ARRAY_SIZE(cand), w->args[1] );
+            }
+            for (i = 0; i < ncand && *ncs_out < 4; i++)
+                if (wd_cs_at( cand[i], FALSE, tids, ntids, &cs_out[*ncs_out] )) ++*ncs_out;
+        }
+        free( stack );
+    }
+}
+
+/* one thread's block; returns the owner of the first critical section on its stack that another thread holds, if
+ * the thread is in a wait (an edge of the wait-for graph), else 0 */
+static UINT wd_thread_block( FILE *f, struct vcpu_thread *vt, uint64_t now, const struct wd_tid *tids,
+                             unsigned int ntids, const char *tname, int *state )
+{
+    struct wd_entry ent[WD_DEPTH];
+    unsigned int depth, seq, n, i, ncs = 0, ncand = 0;
+    struct vcpu_level *cur_level = __atomic_load_n( &vt->level, __ATOMIC_RELAXED );
+    struct wd_cs cs[4];
+    ULONG64 cand[8];
+    char name[160], lr[160];
+    const struct wd_entry *top;
+    BOOL waiting, changed;
+    int bk = atomic_load( &vt->block_kind );
+    UINT edge = 0;
+
+    seq = atomic_load_explicit( &vt->wd_seq, memory_order_acquire );
+    depth = atomic_load_explicit( &vt->wd_depth, memory_order_acquire );
+    n = min( depth, (unsigned int)WD_DEPTH );
+    memcpy( ent, vt->wd, n * sizeof(ent[0]) );
+    changed = atomic_load_explicit( &vt->wd_seq, memory_order_acquire ) != seq;
+
+    if (!n)
+    {
+        BOOL in_guest = vel1_in_guest( &vt->vcpu );
+        *state = in_guest ? 2 : 3;
+        WDP( f, "thread %04x \"%s\": %s%s", vt->tid, tname,
+             in_guest ? "RUNNING in the guest" : "in the host between exits (not inside a syscall or unix call)",
+             changed ? " (changed while read)" : "" );
+        if (in_guest) wd_guest( f, vt, NULL, TRUE, FALSE, tids, ntids, cs, &ncs );
+        return 0;
+    }
+    top = &ent[n - 1];
+    wd_call_name( top, name, sizeof(name) );
+    waiting = !top->unix_call && prof_sys_blocks( top->id );
+    if (cur_level != top->level)
+    {
+        *state = 2;
+        WDP( f, "thread %04x \"%s\": IN GUEST, a user callback inside %s (%.3f s)%s", vt->tid, tname, name,
+             (now - top->t0) / wd_hz, changed ? " (changed while read)" : "" );
+    }
+    else
+    {
+        *state = waiting ? 0 : 1;
+        WDP( f, "thread %04x \"%s\": %s %s for %.3f s%s%s%s", vt->tid, tname, waiting ? "WAIT" : "IN HOST", name,
+             (now - top->t0) / wd_hz, bk ? (bk == VCPU_BLOCK_PIPE ? " [block point: pipe]" : " [block point: futex]") : "",
+             depth > WD_DEPTH ? " (nested deeper than recorded)" : "", changed ? " (changed while read)" : "" );
+    }
+    for (i = 0; i + 1 < n; i++)
+    {
+        char outer[160];
+        wd_call_name( &ent[i], outer, sizeof(outer) );
+        WDP( f, "  inside (outer level %u): %s for %.3f s", i, outer, (now - ent[i].t0) / wd_hz );
+    }
+    wd_call_args( f, top, cand, &ncand, ARRAY_SIZE(cand) );
+    wd_name64( top->pc, name, sizeof(name) );
+    wd_name64( top->lr, lr, sizeof(lr) );
+    WDP( f, "  native: pc %#llx %s lr %#llx %s sp %#llx", (unsigned long long)top->pc, name,
+         (unsigned long long)top->lr, lr, (unsigned long long)top->sp );
+    wd_guest( f, vt, cur_level == top->level ? top : NULL, FALSE, cur_level == top->level, tids, ntids, cs, &ncs );
+    /* the wait address / key itself, in a 64-bit process (WoW64 ones are handled with the 32-bit stack) */
+    for (i = 0; !wd_base32 && i < ncand && ncs < 4; i++)
+    {
+        unsigned int j;
+        BOOL dup = FALSE;
+        for (j = 0; j < ncs; j++) if (cs[j].guest == cand[i]) dup = TRUE;
+        if (!dup && wd_cs_at( cand[i], FALSE, tids, ntids, &cs[ncs] )) ncs++;
+    }
+    for (i = 0; i < ncs; i++)
+    {
+        wd_cs_print( f, &cs[i], vt->tid, cs[i].owner == vt->tid ? "on the stack" : "on the stack, held by another thread",
+                     tids, ntids );
+        if (!edge && waiting && cur_level == top->level && cs[i].owner != vt->tid) edge = cs[i].owner;
+    }
+    return edge;
+}
+
+static void wd_emit( char *buf, size_t len )
+{
+    fwrite( buf, 1, len, stderr );
+    fflush( stderr );
+    if (wd_out)
+    {
+        char path[1024];
+        FILE *out;
+
+        snprintf( path, sizeof(path), "%s.%d", wd_out, wd_pid );
+        if ((out = fopen( path, "a" )))
+        {
+            fwrite( buf, 1, len, out );
+            fclose( out );
+        }
+    }
+}
+
+#define WD_MAX_THREADS 1024
+
+static void wd_dump( const char *why )
+{
+    static struct vcpu_thread *vts[WD_MAX_THREADS];
+    static struct wd_tid tids[WD_MAX_THREADS];
+    static UINT edges[WD_MAX_THREADS];
+    static int states[WD_MAX_THREADS];
+    struct vcpu_thread *vt;
+    unsigned int n = 0, i, counts[4] = { 0 }, cycles = 0;
+    char *buf = NULL, wall[64];
+    size_t len = 0;
+    uint64_t now, t_start = prof_now();
+    FILE *f;
+    sigset_t old;
+
+    if (!(f = open_memstream( &buf, &len ))) return;
+    rips_wallclock( wall, sizeof(wall) );
+    block_all_signals( &old );
+    pthread_mutex_lock( &stall_lock );
+    pthread_mutex_lock( &wd_lock );
+    LIST_FOR_EACH_ENTRY( vt, &stall_threads, struct vcpu_thread, stall_entry )
+    {
+        if (n == WD_MAX_THREADS) break;
+        vts[n] = vt;
+        tids[n].tid = vt->tid;
+        rips_name_lookup( vt->tid, tids[n].name );
+        n++;
+    }
+    wd_mods_refresh( n ? vts[0]->teb : NULL );
+    now = prof_now();
+    WDP( f, "==== dump (%s) %s: %u threads, %s, %u 64-bit modules, %u 32-bit modules", why, wall, n,
+         wd_base32 ? "WoW64 (i386 guest)" : "64-bit", wd_nmods64, wd_nmods32 );
+    for (i = 0; i < n; i++)
+    {
+        edges[i] = wd_thread_block( f, vts[i], now, tids, n, tids[i].name, &states[i] );
+        counts[states[i]]++;
+    }
+    WDP( f, "summary: %u threads: %u in waits, %u in other host calls, %u in the guest, %u between exits", n,
+         counts[0], counts[1], counts[2], counts[3] );
+    /* cycles in "waits on a critical section held by": walk from each thread, at most n steps */
+    for (i = 0; i < n; i++)
+    {
+        unsigned int cur = i, steps, j;
+        char path[512];
+        int plen;
+
+        if (!edges[i]) continue;
+        plen = snprintf( path, sizeof(path), "%04x", tids[i].tid );
+        for (steps = 0; steps < n; steps++)
+        {
+            for (j = 0; j < n; j++) if (tids[j].tid == edges[cur]) break;
+            if (j == n || !edges[j]) break;
+            plen += snprintf( path + plen, sizeof(path) - plen, " -> %04x", tids[j].tid );
+            if (j == i)
+            {
+                /* report each cycle once, from its lowest tid */
+                unsigned int k = i, lowest = tids[i].tid;
+                do
+                {
+                    unsigned int m;
+                    for (m = 0; m < n; m++) if (tids[m].tid == edges[k]) break;
+                    k = m;
+                    if (tids[k].tid < lowest) lowest = tids[k].tid;
+                } while (k != i);
+                if (lowest == tids[i].tid)
+                {
+                    WDP( f, "DEADLOCK? critical-section cycle (waiter -> owner): %s", path );
+                    cycles++;
+                }
+                break;
+            }
+            if (plen >= (int)sizeof(path) - 16) break;
+            cur = j;
+        }
+    }
+    if (!cycles) WDP( f, "no critical-section owner cycle found" );
+    WDP( f, "==== end (%.1f ms)", (prof_now() - t_start) / wd_hz * 1e3 );
+    pthread_mutex_unlock( &wd_lock );
+    pthread_mutex_unlock( &stall_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    fclose( f );
+    if (buf) wd_emit( buf, len );
+    free( buf );
+}
+
+/* PMW_VCPU_WAITDUMP_LONG_MS: on the thread itself, as its long host call returns */
+static void wd_long_report( struct vcpu_thread *vt, const struct wd_entry *w, ULONG64 ret, uint64_t ticks )
+{
+    static double window;
+    static unsigned int in_window, suppressed;
+    struct wd_tid self;
+    struct wd_cs cs[4];
+    unsigned int ncs = 0, ncand = 0, i;
+    ULONG64 cand[8];
+    char *buf = NULL, name[160], wall[64];
+    size_t len = 0;
+    double t = prof_now() / wd_hz;
+    FILE *f;
+    sigset_t old;
+
+    block_all_signals( &old );
+    pthread_mutex_lock( &wd_lock );
+    if (t - window >= 1.0)
+    {
+        window = t;
+        in_window = 0;
+    }
+    if (++in_window > 20)
+    {
+        suppressed++;
+        goto done;
+    }
+    if (!(f = open_memstream( &buf, &len ))) goto done;
+    self.tid = vt->tid;
+    rips_name_lookup( vt->tid, self.name );
+    wd_mods_refresh( vt->teb );
+    rips_wallclock( wall, sizeof(wall) );
+    wd_call_name( w, name, sizeof(name) );
+    WDP( f, "LONG %s thread %04x \"%s\": %s took %.3f s, returned %#llx%s", wall, vt->tid, self.name, name,
+         ticks / wd_hz, (unsigned long long)ret, (UINT)ret == STATUS_TIMEOUT ? " (STATUS_TIMEOUT)" : "" );
+    if (suppressed)
+    {
+        WDP( f, "  (%u earlier LONG reports suppressed: more than 20 a second)", suppressed );
+        suppressed = 0;
+    }
+    wd_call_args( f, w, cand, &ncand, ARRAY_SIZE(cand) );
+    wd_guest( f, vt, w, TRUE, TRUE, &self, 1, cs, &ncs );
+    for (i = 0; i < ncs; i++) wd_cs_print( f, &cs[i], vt->tid, "on the stack", &self, 1 );
+    fclose( f );
+    if (buf) wd_emit( buf, len );
+    free( buf );
+done:
+    pthread_mutex_unlock( &wd_lock );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+}
+
+static void wd_sigh( int sig )
+{
+    wd_signal_flag = 1;
+    if (wd_prev_sigh) wd_prev_sigh( sig );
+}
+
+static BOOL wd_file_changed( const char *path, BOOL *existed, struct timespec *mtime )
+{
+    struct stat st;
+    BOOL exists = !stat( path, &st ), ret;
+
+    ret = exists && (!*existed || st.st_mtimespec.tv_sec != mtime->tv_sec || st.st_mtimespec.tv_nsec != mtime->tv_nsec);
+    *existed = exists;
+    if (exists) *mtime = st.st_mtimespec;
+    return ret;
+}
+
+static void *wd_thread( void *arg )
+{
+    struct timespec m_pid = { 0 }, m_all = { 0 };
+    BOOL e_pid = FALSE, e_all = FALSE;
+    double next = wd_every ? prof_now() / wd_hz + wd_every : 0;
+
+    /* files already there at start are the baseline: only a change triggers */
+    wd_file_changed( wd_file_pid, &e_pid, &m_pid );
+    wd_file_changed( wd_file_all, &e_all, &m_all );
+    for (;;)
+    {
+        usleep( 100000 );
+        if (wd_signal_flag)
+        {
+            wd_signal_flag = 0;
+            wd_dump( "SIGINFO" );
+        }
+        if (wd_file_changed( wd_file_pid, &e_pid, &m_pid )) wd_dump( wd_file_pid );
+        if (wd_file_changed( wd_file_all, &e_all, &m_all )) wd_dump( wd_file_all );
+        if (next && prof_now() / wd_hz >= next)
+        {
+            next = prof_now() / wd_hz + wd_every;
+            wd_dump( "periodic" );
+        }
+    }
+    return NULL;
+}
+
+static void waitdump_start(void)
+{
+    const char *env = getenv( "PMW_VCPU_WAITDUMP" ), *prefix;
+    struct sigaction sa;
+    pthread_t thread;
+    sigset_t old;
+    uint64_t freq;
+
+    if (!env || atoi( env ) <= 0) return;
+    __asm__ volatile( "mrs %0, cntfrq_el0" : "=r" (freq) );
+    wd_hz = freq;
+    wd_pid = (int)getpid();
+    if ((env = getenv( "PMW_VCPU_WAITDUMP_LONG_MS" )) && atoi( env ) > 0) wd_long_ticks = (uint64_t)(atoi( env ) * (wd_hz / 1e3));
+    if ((env = getenv( "PMW_VCPU_WAITDUMP_EVERY" )) && atoi( env ) > 0) wd_every = atoi( env );
+    if ((env = getenv( "PMW_VCPU_WAITDUMP_STACK" )) && atoi( env ) > 0)
+        wd_stack_bytes = min( (unsigned int)strtoul( env, NULL, 0 ), 0x10000u ) & ~7u;
+    if ((env = getenv( "PMW_VCPU_WAITDUMP_OUT" )) && *env) wd_out = env;
+    prefix = (env = getenv( "PMW_VCPU_WAITDUMP_FILE" )) && *env ? env : "/tmp/pmw-waitdump";
+    snprintf( wd_file_pid, sizeof(wd_file_pid), "%s-%d", prefix, wd_pid );
+    snprintf( wd_file_all, sizeof(wd_file_all), "%s-all", prefix );
+
+    sigaction( SIGINFO, NULL, &sa );
+    if (sa.sa_handler == SIG_DFL || sa.sa_handler == SIG_IGN || sa.sa_handler == rips_signal)
+    {
+        wd_prev_sigh = sa.sa_handler == rips_signal ? rips_signal : NULL;
+        memset( &sa, 0, sizeof(sa) );
+        sa.sa_handler = wd_sigh;
+        sa.sa_flags = SA_RESTART;
+        sigemptyset( &sa.sa_mask );
+        sigaction( SIGINFO, &sa, NULL );
+        env = wd_prev_sigh ? "on (also resets PMW_VCPU_RIPS)" : "on";
+    }
+    else env = "taken: file trigger only";
+    vcpu_waitdump = 1;  /* before any Windows thread registers */
+    block_all_signals( &old );
+    if (pthread_create( &thread, NULL, wd_thread, NULL ))
+    {
+        pthread_sigmask( SIG_SETMASK, &old, NULL );
+        fprintf( stderr, "[VCPU-WAIT] %d cannot start the trigger thread: SIGINFO / file triggers off\n", wd_pid );
+        return;
+    }
+    pthread_detach( thread );
+    pthread_sigmask( SIG_SETMASK, &old, NULL );
+    fprintf( stderr, "[VCPU-WAIT] %d on: SIGINFO %s; touch %s or %s; periodic %u s; long calls >= %.0f ms; stack %u "
+             "bytes; out %s\n", wd_pid, env, wd_file_pid, wd_file_all, wd_every, wd_long_ticks / (wd_hz / 1e3),
+             wd_stack_bytes, wd_out ? wd_out : "(stderr only)" );
 }
 
 static void *sample_thread( void *arg )
@@ -3526,6 +4503,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         {
         case VEL1_EXIT_SYSCALL:
             vcpu_frame_from_syscall_exit( frame, &e );
+            if (vcpu_waitdump) wd_push( vt, level, FALSE, &e, frame );
             if (prof_interval)
             {
                 vt->prof_charge = prof_sys_bucket( frame->syscall_id );
@@ -3534,6 +4512,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             break;
         case VEL1_EXIT_UNIX_CALL:
             vcpu_frame_from_unix_call_exit( frame, &e );
+            if (vcpu_waitdump) wd_push( vt, level, TRUE, &e, frame );
             if (prof_interval)
             {
                 vt->prof_charge = prof_unix_bucket( (const void *)e.regs.x[0], e.regs.x[1] );
@@ -3647,6 +4626,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         }
 
     syscall_return:
+        if (vcpu_waitdump) wd_pop( vt, level, ret );
         if (level->done)
         {
             vt->level = level->prev;
@@ -3702,8 +4682,9 @@ void DECLSPEC_NORETURN vcpu_thread_start( struct syscall_frame *frame )
     vcpu_note_vcpu_up();
     pthread_setspecific( vcpu_key, vt );
     vt->tid = GetCurrentThreadId();
-    if (vcpu_rips) rips_name_forget( vt->tid );
-    if (vcpu_stallpc || vcpu_sample_ms)
+    if (vcpu_rips || vcpu_waitdump) rips_name_forget( vt->tid );
+    vt->teb = NtCurrentTeb();
+    if (vcpu_stallpc || vcpu_sample_ms || vcpu_waitdump)
     {
         pthread_mutex_lock( &stall_lock );
         list_add_tail( &stall_threads, &vt->stall_entry );
@@ -3878,7 +4859,7 @@ void vcpu_thread_exit(void)
         sigfillset( &all );
         pthread_sigmask( SIG_BLOCK, &all, NULL );
     }
-    if (vcpu_stallpc || vcpu_sample_ms)
+    if (vcpu_stallpc || vcpu_sample_ms || vcpu_waitdump)
     {
         pthread_mutex_lock( &stall_lock );
         list_remove( &vt->stall_entry );
@@ -3994,6 +4975,7 @@ void vcpu_init_process(void)
     init_sys_page();
     init_kuser();
     prof_start();
+    waitdump_start();  /* after prof_start: it shares SIGINFO with PMW_VCPU_RIPS */
     watch_start();
 
     block_all_signals( &old );

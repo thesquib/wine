@@ -34,6 +34,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #ifdef HAVE_SYS_STAT_H
 # include <sys/stat.h>
@@ -668,6 +669,55 @@ static inline void *get_shm( const unsigned int idx )
         return get_shm_slow( idx );
 
     return (void *)((unsigned long)shm_addrs[entry] + offset);
+}
+
+/* PMW_VCPU_WAITDUMP: the shared-memory state of obj as text, read-only, from a diagnostics thread: only a page this
+ * process already mapped (never get_shm_slow, which asks the server), and only if the lock is free right now. */
+void msync_waitdump_obj( int obj, char *buf, size_t size )
+{
+    static const char * const names[] = { "?", "semaphore", "auto-event", "manual-event", "mutex", "auto-server",
+                                          "manual-server" };
+    int entry, offset, v[4];
+    void *addr = NULL;
+    size_t len;
+
+    buf[0] = 0;
+    if (obj <= 0) return;
+    entry = obj >> (vm_kernel_page_shift - 4);
+    offset = (obj << 4) & vm_kernel_page_mask;
+    if (!os_unfair_lock_trylock( &shm_addrs_lock ))
+    {
+        snprintf( buf, size, "(shm busy)" );
+        return;
+    }
+    if (entry < shm_addrs_size && shm_addrs[entry]) addr = (char *)shm_addrs[entry] + offset;
+    os_unfair_lock_unlock( &shm_addrs_lock );
+    if (!addr)
+    {
+        snprintf( buf, size, "(shm page not mapped)" );
+        return;
+    }
+    memcpy( v, addr, sizeof(v) );  /* the 16-byte record: two ints, type + refcount, multiple_waiters */
+    switch (v[2] & 0xffff)
+    {
+    case MSYNC_SEMAPHORE:
+        snprintf( buf, size, "%s count %d max %d", names[1], v[0], v[1] );
+        break;
+    case MSYNC_MUTEX:
+        snprintf( buf, size, "%s owner tid %04x count %d", names[4], v[0], v[1] );
+        break;
+    case MSYNC_AUTO_EVENT:
+    case MSYNC_MANUAL_EVENT:
+    case MSYNC_AUTO_SERVER:
+    case MSYNC_MANUAL_SERVER:
+        snprintf( buf, size, "%s signaled %d", names[v[2] & 0xffff], v[0] );
+        break;
+    default:
+        snprintf( buf, size, "type %d (%08x %08x)", v[2] & 0xffff, v[0], v[1] );
+        break;
+    }
+    len = strlen( buf );
+    if (v[3] && len < size) snprintf( buf + len, size - len, " multiple-waiters" );
 }
 
 void msync_close( int obj )

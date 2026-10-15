@@ -2781,7 +2781,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
         SERVER_END_REQ;
 
         set_native_thread_name( handle, &info->ThreadName );
-        if (!status && vcpu_prof_interval) vcpu_prof_note_thread_name( handle, &info->ThreadName );
+        if (!status && (vcpu_prof_interval || vcpu_waitdump)) vcpu_prof_note_thread_name( handle, &info->ThreadName );
 
         return status;
     }

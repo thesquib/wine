@@ -799,6 +799,36 @@ static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
     return cache;
 }
 
+#if defined(__APPLE__) && defined(__aarch64__)
+/* PMW_VCPU_WAITDUMP: what this process's in-process sync cache knows about handle, as text. Read-only and lock-free
+ * (no reference taken, no server call): it runs on a diagnostics thread while the handle's waiter is parked. Cache
+ * blocks are never freed, so a racing close can only give a stale answer. */
+void vcpu_waitdump_handle( HANDLE handle, char *buf, size_t size )
+{
+    static const char * const types[] = { "unknown", "internal", "event", "mutex", "semaphore" };
+    unsigned int entry, idx;
+    struct inproc_sync *cache;
+    char state[96] = "";
+
+    if (!handle || is_pseudo_handle( handle ))
+    {
+        snprintf( buf, size, "%s", handle ? "pseudo-handle" : "NULL" );
+        return;
+    }
+    idx = inproc_sync_handle_to_index( handle, &entry );
+    if (entry >= INPROC_SYNC_CACHE_ENTRIES || !(cache = ReadPointerAcquire( (void **)&inproc_sync_cache[entry] )) ||
+        !ReadAcquire( &cache[idx].refcount ))
+    {
+        snprintf( buf, size, "not in the in-process sync cache (a server-side wait, or not waited on in-process)" );
+        return;
+    }
+    cache += idx;
+    if (do_msync()) msync_waitdump_obj( cache->fd, state, sizeof(state) );
+    snprintf( buf, size, "%s%s obj %d%s%s", cache->type < ARRAY_SIZE(types) ? types[cache->type] : "?",
+              cache->closed ? " (closed)" : "", cache->fd, state[0] ? ": " : "", state );
+}
+#endif
+
 /* fd_cache_mutex must be held to avoid races with other thread receiving fds */
 static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync )
 {
