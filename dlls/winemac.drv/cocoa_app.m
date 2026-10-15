@@ -2101,14 +2101,30 @@ static NSString* WineLocalizedString(unsigned int stringID)
              * asking for mouse-look. Counting it disassociated the cursor mid-drag:
              * the pointer froze at the grab point while the window followed stale
              * deltas, then snapped back on release. Confirmed 2026-09-06. */
-            BOOL fpsModeActive = self.clippingCursor
-                              || (self.mouseCaptureWindow != nil
-                                  && self.mouseCaptureWindow == targetWindow
-                                  && !self.mouseCaptureIsMoveSize)
-                              || (clientWantsCursorHidden && targetWindow != nil)
-                              || (cursor_clipping_locks_windows
-                                  && [(WineWindow*)targetWindow respondsToSelector:@selector(fullscreen)]
-                                  && [(WineWindow*)targetWindow fullscreen]);
+            BOOL trigClip = self.clippingCursor;
+            BOOL trigCapture = (self.mouseCaptureWindow != nil
+                                && self.mouseCaptureWindow == targetWindow
+                                && !self.mouseCaptureIsMoveSize);
+            BOOL trigHidden = (clientWantsCursorHidden && targetWindow != nil);
+            BOOL trigFullscreen = (cursor_clipping_locks_windows
+                                   && [(WineWindow*)targetWindow respondsToSelector:@selector(fullscreen)]
+                                   && [(WineWindow*)targetWindow fullscreen]);
+            BOOL fpsModeActive = trigClip || trigCapture || trigHidden || trigFullscreen;
+            /* [VISIBLE-CURSOR] A VISIBLE cursor never means mouse-look: on Windows, ClipCursor and SetCapture
+             * confine or route the pointer, they never freeze it. Clip / capture / fullscreen alone entering FPS
+             * mode froze the visible macOS pointer and sent only relative motion, so WM_MOUSEMOVE / button
+             * messages carried a stale position: the Steam overlay (which shows the cursor over a game that
+             * clips it, or over any fullscreen game) got every click at the frozen point and its cursor never
+             * moved (Gauntlet, Half-Life, KCD2; 2026-10-16). With the pointer associated, the clip handler
+             * confines it as upstream does. PMW_FPS_VISIBLE_CURSOR=0 restores the old behaviour; titles that
+             * hide the cursor with a transparent image keep PROTON_FORCE_FPS_MOUSE. */
+            static int visible_leaves_cached = -1;
+            if (visible_leaves_cached < 0) {
+                const char *v = getenv("PMW_FPS_VISIBLE_CURSOR");
+                visible_leaves_cached = (v && v[0] == '0' && v[1] == '\0') ? 0 : 1;
+            }
+            if (visible_leaves_cached && !clientWantsCursorHidden)
+                fpsModeActive = NO;
             /* PROTON_FORCE_FPS_MOUSE=1: force fpsModeActive on any
              * target window, ignoring the [fullscreen] gate. Fix for
              * titles (DOOM Eternal) whose RIDEV_NOLEGACY raw input
@@ -2140,7 +2156,8 @@ static NSString* WineLocalizedString(unsigned int stringID)
             if (fpsModeActive != macdrv_mouse_disassociated) {
                 CGAssociateMouseAndMouseCursorPosition(!fpsModeActive);
                 macdrv_mouse_disassociated = fpsModeActive;
-                fprintf(stderr, "winemac:mouse FPS mode = %d (clippingCursor)\n", fpsModeActive);
+                fprintf(stderr, "winemac:mouse FPS mode = %d (clip %d capture %d hidden %d fullscreen %d)\n",
+                        fpsModeActive, trigClip, trigCapture, trigHidden, trigFullscreen);
             }
             if (gcmouse_enabled())
                 raw_mouse_set_window(fpsModeActive ? targetWindow : nil);
