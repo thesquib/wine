@@ -969,6 +969,11 @@ static BOOL needs_framebuffer_surface( HWND hwnd )
     LONG gamma_serial;
 
     if (!fshack_enabled) return FALSE;
+#ifdef __APPLE__
+    /* macOS: never wrap drawables in framebuffer surfaces (as before EGL was compiled in): Retina windows always differ
+     * from the raw DPI, Apple's CGL contexts cannot run its GLSL 330 blit, and Zink's GL 3.3 lacks the DSA it uses */
+    return FALSE;
+#endif
 
     if (xwayland_nv_cached == -1) xwayland_nv_cached = !!user_driver->pHasWindowManager( "xwayland_glx_nvidia" );
     if (xwayland_nv_cached)
@@ -1435,11 +1440,13 @@ static BOOL egl_init( const struct opengl_driver_funcs **driver_funcs )
     struct opengl_funcs *funcs = &display_funcs;
     const char *extensions, *env;
 
-    if (!(env = getenv( "WINE_USE_EGL" )) || !atoi( env ))
+    if ((!(env = getenv( "WINE_USE_EGL" )) || !atoi( env )) && (!(env = getenv( "PMW_GL_ZINK" )) || !atoi( env )))
     {
         WARN( "EGL support is disabled.\n" );
         return FALSE;
     }
+    /* PMW_GL_ZINK (macOS): Mesa's surfaceless EGL only finds Zink when asked for it */
+    if ((env = getenv( "PMW_GL_ZINK" )) && atoi( env )) setenv( "MESA_LOADER_DRIVER_OVERRIDE", "zink", 0 );
 
     if (!(funcs->egl_handle = dlopen( SONAME_LIBEGL, RTLD_NOW | RTLD_GLOBAL )))
     {

@@ -1614,6 +1614,15 @@ LONG_PTR WINAPI NtUserSetWindowLongPtr( HWND hwnd, INT offset, LONG_PTR newval, 
     return set_window_long( hwnd, offset, sizeof(LONG_PTR), newval, ansi );
 }
 
+/* PMW_GL_ZINK (macOS): GL frames are copied into the window surface with GDI, so GL windows keep their surface and
+ * the server must not cut their client area out of it */
+static BOOL gl_zink_enabled(void)
+{
+    static int zink = -1;
+    if (zink == -1) { const char *env = getenv( "PMW_GL_ZINK" ); zink = env && atoi( env ); }
+    return zink;
+}
+
 BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
 {
     WND *win = get_win_ptr( hwnd );
@@ -1626,7 +1635,7 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
         return FALSE;
     }
     if (!internal) win->pixel_format = format;
-    if (format && !win->clip_clients) changed = win->clip_clients = TRUE;
+    if (format && !win->clip_clients && !gl_zink_enabled()) changed = win->clip_clients = TRUE;
     release_win_ptr( win );
 
     if (changed) update_window_state( hwnd );

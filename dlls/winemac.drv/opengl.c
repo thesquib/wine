@@ -2622,6 +2622,11 @@ UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, co
     }
     funcs = opengl_funcs;
 
+    {
+        const char *env = getenv("PMW_GL_ZINK");
+        if (env && atoi(env)) return macdrv_egl_OpenGLInit(opengl_funcs, driver_funcs);
+    }
+
     opengl_handle = dlopen("/System/Library/Frameworks/OpenGL.framework/OpenGL", RTLD_LAZY|RTLD_LOCAL|RTLD_NOLOAD);
     if (!opengl_handle)
     {

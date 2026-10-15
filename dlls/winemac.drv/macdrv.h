@@ -264,6 +264,7 @@ extern BOOL query_pasteboard_data(HWND hwnd, CFStringRef type);
 extern void macdrv_lost_pasteboard_ownership(HWND hwnd);
 
 extern UINT macdrv_OpenGLInit(UINT version, const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
+extern UINT macdrv_egl_OpenGLInit(const struct opengl_funcs *opengl_funcs, const struct opengl_driver_funcs **driver_funcs);
 extern UINT macdrv_VulkanInit(UINT version, void *vulkan_handle, const struct vulkan_driver_funcs **driver_funcs);
 
 extern CGImageRef create_cgimage_from_icon_bitmaps(HDC hdc, HANDLE icon, HBITMAP hbmColor,

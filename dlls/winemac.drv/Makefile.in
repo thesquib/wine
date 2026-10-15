@@ -34,6 +34,7 @@ SOURCES = \
 	macdrv_main.c \
 	mouse.c \
 	opengl.c \
+	opengl_egl.c \
 	surface.c \
 	systray.c \
 	vulkan.c \
