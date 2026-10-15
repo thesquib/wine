@@ -89,6 +89,15 @@ static inline BOOL is_wow64(void)
 /* a value that only travels in a pointer-typed slot (a flag, a cookie): never widened */
 static inline void *wow64_value( ULONG v ) { return (void *)(ULONG_PTR)v; }
 
+/* PMW (WoW64 lost wake, 2026-10-16): the alert-by-thread-id flag is kept once per thread AND per side. wow64's thunks
+ * tag the 32-bit side's NtWaitForAlertByThreadId (address) and NtAlertThreadByThreadId / NtAlertMultipleThreadByThreadId
+ * (thread ids) with this bit (dlls/wow64/wow64_private.h). A 32-bit RtlWaitOnAddress is queued from its enqueue until
+ * its NtWaitForAlertByThreadId syscall; that syscall first runs through the emulator (FEX libwow64fex: a shared lock on
+ * its code-invalidation mutex for every 32-bit syscall), which can block in the 64-bit ntdll's RtlWaitOnAddress on the
+ * same thread. With one flag per thread that 64-bit wait consumed, or merged with its own wake, the alert meant for the
+ * 32-bit wait, which then slept until its timeout: 5 s critical-section stalls, condition variables forever. */
+#define WOW64_ALERT_CHANNEL ((ULONG_PTR)1 << 62)
+
 #ifdef _WIN64
 /* PMW_VCPU: in a vCPU-mode WoW64 process the 32-bit address space lives at host BASE + p, BASE being what TEB32 aligns
  * down to (0 wherever the 32-bit space sits at its own addresses, so this is then the plain zero extension). Widen an

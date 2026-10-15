@@ -1625,7 +1625,7 @@ NTSTATUS WINAPI wow64_NtWaitForAlertByThreadId( UINT *args )
     const void *address = get_ptr( &args );
     const LARGE_INTEGER *timeout = get_ptr( &args );
 
-    return NtWaitForAlertByThreadId( address, timeout );
+    return NtWaitForAlertByThreadId( (const void *)((ULONG_PTR)address | WOW64_ALERT_CHANNEL), timeout );
 }
 
 

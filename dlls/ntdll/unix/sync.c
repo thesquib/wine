@@ -4242,7 +4242,7 @@ NTSTATUS WINAPI NtQueryInformationAtom( RTL_ATOM atom, ATOM_INFORMATION_CLASS cl
 union tid_alert_entry
 {
 #ifdef USE_FUTEX
-    LONG futex;
+    LONG futex[2];  /* [0] the 64-bit side, [1] the 32-bit side of a WoW64 thread (WOW64_ALERT_CHANNEL) */
 #elif defined(HAVE_KQUEUE)
     int kq;
 #else
@@ -4253,9 +4253,15 @@ union tid_alert_entry
 #define TID_ALERT_BLOCK_SIZE (65536 / sizeof(union tid_alert_entry))
 static union tid_alert_entry *tid_alert_blocks[4096];
 
+/* which alert flag of the thread a tagged thread id or wait address means (WOW64_ALERT_CHANNEL) */
+static inline unsigned int alert_channel( const void *tid_or_address )
+{
+    return ((ULONG_PTR)tid_or_address & WOW64_ALERT_CHANNEL) ? 1 : 0;
+}
+
 static unsigned int handle_to_index( HANDLE handle, unsigned int *block_idx )
 {
-    unsigned int idx = (wine_server_obj_handle(handle) >> 2) - 1;
+    unsigned int idx = (wine_server_obj_handle( (HANDLE)((ULONG_PTR)handle & ~WOW64_ALERT_CHANNEL) ) >> 2) - 1;
     *block_idx = idx / TID_ALERT_BLOCK_SIZE;
     return idx % TID_ALERT_BLOCK_SIZE;
 }
@@ -4378,7 +4384,7 @@ NTSTATUS WINAPI NtAlertThreadByThreadId( HANDLE tid )
 
 #ifdef USE_FUTEX
     {
-        LONG *futex = &entry->futex;
+        LONG *futex = &entry->futex[alert_channel( tid )];
         LONG prev = InterlockedExchange( futex, 1 );
         int rc = 0;
         if (!prev) rc = futex_wake_one( futex );
@@ -4450,7 +4456,7 @@ NTSTATUS WINAPI NtWaitForAlertByThreadId( const void *address, const LARGE_INTEG
 
 #ifdef USE_FUTEX
     {
-        LONG *futex = &entry->futex;
+        LONG *futex = &entry->futex[alert_channel( address )];
         ULONGLONG end;
         BOOL tracked;
         int ret;

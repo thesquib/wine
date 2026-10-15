@@ -93,6 +93,11 @@ static inline void *wow64_value( ULONG v ) { return (void *)(ULONG_PTR)v; }
 #define ULongToPtr(ul) wow64_ptr(ul)
 #define UlongToPtr(ul) wow64_ptr(ul)
 
+/* PMW (WoW64 lost wake, 2026-10-16): tags the 32-bit side's alert-by-thread-id waits and alerts, so that ntdll keeps
+ * them apart from the 64-bit side's (the emulator's own locks, waited on inside a 32-bit syscall). Same value as
+ * dlls/ntdll/unix/unix_private.h, which explains it. */
+#define WOW64_ALERT_CHANNEL ((ULONG_PTR)1 << 62)
+
 static inline ULONG get_ulong( UINT **args ) { return *(*args)++; }
 static inline HANDLE get_handle( UINT **args ) { return LongToHandle( *(*args)++ ); }
 static inline void *get_ptr( UINT **args ) { return ULongToPtr( *(*args)++ ); }

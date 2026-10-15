@@ -3005,10 +3005,13 @@ static void wd_call_args( FILE *f, const struct wd_entry *w, ULONG64 *cand, unsi
     }
     else if (!strcmp( name, "NtWaitForAlertByThreadId" ))
     {
+        ULONG64 addr = a[0] & ~(ULONG64)WOW64_ALERT_CHANNEL;
+
         wd_timeout( t, sizeof(t), a[1] );
-        WDP( f, "    address %#llx, timeout %s%s", (unsigned long long)a[0], t,
-             a[0] ? "" : " (RtlWaitOnAddress: critical section, SRW lock, condition variable, WaitOnAddress)" );
-        if (a[0]) wd_add_cs( cand, ncand, max, a[0] );
+        WDP( f, "    address %#llx%s, timeout %s%s", (unsigned long long)addr,
+             (a[0] & WOW64_ALERT_CHANNEL) ? " (32-bit side)" : "", t,
+             addr ? "" : " (RtlWaitOnAddress: critical section, SRW lock, condition variable, WaitOnAddress)" );
+        if (addr) wd_add_cs( cand, ncand, max, addr );
     }
     else if (!strcmp( name, "NtWaitForKeyedEvent" ) || !strcmp( name, "NtReleaseKeyedEvent" ))
     {

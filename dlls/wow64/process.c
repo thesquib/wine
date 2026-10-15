@@ -287,7 +287,7 @@ NTSTATUS WINAPI wow64_NtAlertMultipleThreadByThreadId( UINT *args )
 
     if (count <= ARRAY_SIZE(handles_buf)) handles = handles_buf;
     else                                  handles = Wow64AllocateTemp( count * sizeof(*handles) );
-    for (i = 0; i < count; ++i) handles[i] = (HANDLE)(ULONG_PTR)handles_ptr[i];
+    for (i = 0; i < count; ++i) handles[i] = (HANDLE)((ULONG_PTR)handles_ptr[i] | WOW64_ALERT_CHANNEL);
 
     return NtAlertMultipleThreadByThreadId( handles, count, unk1, unk2 );
 }
@@ -323,7 +323,7 @@ NTSTATUS WINAPI wow64_NtAlertThreadByThreadId( UINT *args )
 {
     HANDLE tid = get_handle( &args );
 
-    return NtAlertThreadByThreadId( tid );
+    return NtAlertThreadByThreadId( (HANDLE)((ULONG_PTR)tid | WOW64_ALERT_CHANNEL) );
 }
 
 
