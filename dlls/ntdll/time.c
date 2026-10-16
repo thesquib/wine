@@ -399,6 +399,43 @@ BOOL WINAPI DECLSPEC_HOTPATCH RtlQueryPerformanceCounter( LARGE_INTEGER *counter
         counter->QuadPart = cnt / freq * TICKSPERSEC + cnt % freq * TICKSPERSEC / freq;
         return TRUE;
     }
+#elif defined(__i386__)
+    /* PROTON_DARWIN, vCPU mode, 32-bit (WoW64 under FEX): the same computation from RDTSCP. FEX's RDTSCP is the
+     * self-synchronized virtual counter shifted left by the TSC scale (CNTVCTSS_EL0 << scale), and CPUID 0x15 gives
+     * the scale (EBX / EAX = 1 << scale) and the counter frequency (ECX). Plain RDTSC is not used: under FEX it can
+     * read the counter ahead of earlier loads, even after LFENCE (qpctest: up to ~400 ns backwards across threads;
+     * RDTSCP never was). Batman: Arkham Asylum made ~345k exiting QPC calls a second, ~1.2 us each. */
+    if (__atomic_load_n( &user_shared_data->QpcFrequency, __ATOMIC_ACQUIRE ) == TICKSPERSEC)
+    {
+        static ULONG shift, freq;  /* freq 0: not probed yet; ~0u: no usable CPUID 0x15, use the syscall */
+        ULONG64 cnt;
+        ULONG lo, hi, aux;
+
+        if (!__atomic_load_n( &freq, __ATOMIC_ACQUIRE ))
+        {
+            ULONG max, eax, ebx, ecx, edx, s = 0, f = ~0u;
+
+            __asm__ __volatile__( "cpuid" : "=a" (max), "=b" (ebx), "=c" (ecx), "=d" (edx) : "a" (0), "c" (0) );
+            if (max >= 0x15)
+            {
+                __asm__ __volatile__( "cpuid" : "=a" (eax), "=b" (ebx), "=c" (ecx), "=d" (edx) : "a" (0x15), "c" (0) );
+                if (eax && ecx && !(ebx % eax) && !((ebx / eax) & (ebx / eax - 1)))
+                {
+                    while ((1u << s) < ebx / eax) s++;
+                    f = ecx;
+                }
+            }
+            shift = s;
+            __atomic_store_n( &freq, f, __ATOMIC_RELEASE );
+        }
+        if (__atomic_load_n( &freq, __ATOMIC_ACQUIRE ) != ~0u)
+        {
+            __asm__ __volatile__( "rdtscp" : "=a" (lo), "=d" (hi), "=c" (aux) :: "memory" );
+            cnt = (((ULONG64)hi << 32 | lo) >> shift) + __atomic_load_n( &user_shared_data->QpcBias, __ATOMIC_RELAXED );
+            counter->QuadPart = cnt / freq * TICKSPERSEC + cnt % freq * TICKSPERSEC / freq;
+            return TRUE;
+        }
+    }
 #endif
     NtQueryPerformanceCounter( counter, NULL );
     return TRUE;
