@@ -407,6 +407,9 @@ static void *preload_reserve_start;
 static void *preload_reserve_end;
 static BOOL force_exec_prot;  /* whether to force PROT_EXEC on all PROT_READ mmaps */
 static BOOL enable_write_exceptions;  /* raise exception on writes to executable memory */
+/* PROTON_DARWIN native route: macOS refuses write+exec for non-MAP_JIT memory, and 4K PE sections share 16K host
+ * pages. Such host pages are mapped RX and flipped to RW on a write fault and back to RX on an execute fault. */
+static BOOL native_wx;
 
 struct range_entry
 {
@@ -1673,6 +1676,7 @@ static int get_unix_prot( BYTE vprot )
         if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
         if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
         if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+        if (native_wx && (prot & PROT_WRITE) && (prot & PROT_EXEC)) prot &= ~PROT_WRITE;  /* RX first, see native_wx */
     }
     if (!prot) prot = PROT_NONE;
     return prot;
@@ -5254,6 +5258,10 @@ void virtual_init(void)
     pthread_mutexattr_destroy( &attr );
 
     vcpu_init_process();  /* PMW_VCPU: the VM and gmm must exist before the first view */
+    native_wx = native_route;
+#if defined(__APPLE__) && defined(__aarch64__)
+    native_install_service_table( 0, TRUE );  /* ntdll's own table (static in loader.c) */
+#endif
 
 #ifdef __aarch64__
     host_page_size = sysconf( _SC_PAGESIZE );
@@ -6438,6 +6446,15 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
             ret = STATUS_GUARD_PAGE_VIOLATION;
         }
         else ret = grow_thread_stack( ROUND_ADDR( addr, host_page_mask ), &stack_info );
+    }
+    else if (native_wx && (err == EXCEPTION_WRITE_FAULT || err == EXCEPTION_EXECUTE_FAULT) &&
+             (vprot & VPROT_COMMITTED) && (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY)) &&
+             !(vprot & VPROT_WRITEWATCH))
+    {
+        /* W^X flip of the whole host page (see native_wx) */
+        if (!mprotect( page, fault_page_size, err == EXCEPTION_WRITE_FAULT ? PROT_READ | PROT_WRITE
+                                                                          : PROT_READ | PROT_EXEC ))
+            ret = STATUS_SUCCESS;
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {

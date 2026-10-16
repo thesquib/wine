@@ -58,6 +58,9 @@
 # include <sys/resource.h>
 #endif
 #include <limits.h>
+#ifdef __APPLE__
+# include <mach-o/dyld.h>
+#endif
 #ifdef HAVE_SYS_SYSCTL_H
 # include <sys/sysctl.h>
 #endif
@@ -205,6 +208,7 @@ const char *data_dir = NULL;
 const char *build_dir = NULL;
 const char *config_dir = NULL;
 const char *wineloader = NULL;
+int native_route = 0;  /* PROTON_DARWIN: started from the entitled loader (wine-native.app): no vCPUs */
 const char **dll_paths = NULL;
 const char **system_dll_paths = NULL;
 const char *user_name = NULL;
@@ -542,6 +546,22 @@ static void init_paths(void)
         wineloader = build_path( ntdll_dir, "wine" );
     }
 
+#ifdef __APPLE__
+    {
+        const int *flag = dlsym( RTLD_DEFAULT, "wine_main_native_route" );
+        char exe[PATH_MAX];
+        uint32_t size = sizeof(exe);
+        char *real;
+
+        /* children must re-enter the entitled bundle binary, not the vCPU loader next to ntdll.so */
+        if (flag && *flag && !_NSGetExecutablePath( exe, &size ) && (real = realpath( exe, NULL )))
+        {
+            native_route = 1;
+            wineloader = real;
+        }
+    }
+#endif
+
     set_dll_path();
     set_system_dll_path();
     set_home_dir();
@@ -756,6 +776,9 @@ BOOLEAN KeAddSystemServiceTable( ULONG_PTR *funcs, ULONG_PTR *counters, ULONG li
     KeServiceDescriptorTable[index].CounterTable  = counters;
     KeServiceDescriptorTable[index].ServiceLimit  = limit;
     KeServiceDescriptorTable[index].ArgumentTable = arguments;
+#if defined(__APPLE__) && defined(__aarch64__)
+    native_install_service_table( index, TRUE );
+#endif
     return TRUE;
 }
 

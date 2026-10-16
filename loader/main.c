@@ -75,13 +75,17 @@ static struct wine_preload_info preload_info[] =
 #ifdef __x86_64__
     { __wine_reserve,  sizeof(__wine_reserve)  }, /*         0x1000 -    0x200000000: low 8GB */
 #else
-    { (void *)0x1000, 0 },                        /*         0x1000 - end of PAGEZERO, filled in below */
+    { (void *)0x10000, 0 },                       /*        0x10000 - end of PAGEZERO, filled in below (16K aligned) */
 #endif
     { __wine_top_down, sizeof(__wine_top_down) }, /* 0x7ff000000000 - 0x7ff001ff0000: top-down allocations + virtual heap */
     { 0, 0 }                                      /* end of list */
 };
 
 __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = preload_info;
+
+/* PROTON_DARWIN native route: set when PAGEZERO could be replaced by our reservation, which only an executable
+ * with the cross-architecture entitlement may do (wine-native.app). ntdll then runs without vCPUs. */
+__attribute((visibility("default"))) int wine_main_native_route = 0;
 
 static void init_reserved_areas(void)
 {
@@ -106,8 +110,13 @@ static void init_reserved_areas(void)
     for (i = 0; wine_main_preload_info[i].size != 0; i++)
     {
         /* Match how the preloader maps reserved areas: */
-        mmap(wine_main_preload_info[i].addr, wine_main_preload_info[i].size, PROT_NONE,
-             MAP_FIXED | MAP_NORESERVE | MAP_PRIVATE | MAP_ANON, -1, 0);
+        void *ret = mmap(wine_main_preload_info[i].addr, wine_main_preload_info[i].size, PROT_NONE,
+                         MAP_FIXED | MAP_NORESERVE | MAP_PRIVATE | MAP_ANON, -1, 0);
+#ifndef __x86_64__
+        /* fails on the ad-hoc vCPU loader (PAGEZERO is not replaceable), succeeds on the entitled one */
+        if (!i) wine_main_native_route = (ret == wine_main_preload_info[i].addr);
+#endif
+        (void)ret;
     }
 }
 
@@ -202,6 +211,20 @@ static void *try_dlopen( const char *argv0 )
     }
 
     if (!(dir = realpath_dirname( argv0 ))) return NULL;
+
+    /* <arch>-unix/wine-native.app/Contents/MacOS/wine: ntdll.so is next to the bundle */
+    if ((p = remove_tail( dir, ".app/Contents/MacOS" )) && (path = strrchr( p, '/' )))
+    {
+        *path = 0;
+        free( dir );
+        dir = p;
+        p = NULL;
+    }
+    else
+    {
+        free( p );
+        p = NULL;
+    }
 
     if ((p = remove_tail( dir, "/loader" )))
         path = build_path( p, "dlls/ntdll/ntdll.so" );

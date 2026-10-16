@@ -213,6 +213,10 @@ extern const char *data_dir;
 extern const char *build_dir;
 extern const char *config_dir;
 extern const char *wineloader;
+extern int native_route;
+#if defined(__APPLE__) && defined(__aarch64__)
+extern void native_install_service_table( ULONG index, BOOL new_table );
+#endif
 extern const char *user_name;
 extern const char **dll_paths;
 extern const char **system_dll_paths;

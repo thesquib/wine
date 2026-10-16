@@ -4186,6 +4186,7 @@ void __wine_vcpu_add_syscall_shims( ULONG index, const void *const *pairs, unsig
     /* the old map is leaked: another thread may still be reading it */
     atomic_store_explicit( &shim_maps[index], NULL, memory_order_release );
     pthread_mutex_unlock( &shim_map_mutex );
+    native_install_service_table( index, FALSE );
 }
 
 /***********************************************************************
@@ -4274,6 +4275,40 @@ static const void *vcpu_syscall_target( UINT table_index, const SYSTEM_SERVICE_T
     }
     pthread_mutex_unlock( &shim_map_mutex );
     return map->target[num];
+}
+
+/* native route (no vCPUs): the asm syscall dispatcher calls ServiceTable entries directly with Windows-ABI stack
+ * slots, so the installed table holds the Apple-ABI shims in place of their implementations. The implementations
+ * KeAddSystemServiceTable was given are kept here (the old shimmed copy is leaked: another thread may use it). */
+static const ULONG_PTR *native_table_funcs[4];
+
+void native_install_service_table( ULONG index, BOOL new_table )
+{
+    SYSTEM_SERVICE_TABLE *table = &KeServiceDescriptorTable[index];
+    const void *const *pairs;
+    unsigned int j, count;
+    ULONG_PTR i, *targets;
+
+    if (!native_route || index >= ARRAY_SIZE(native_table_funcs)) return;
+    if (new_table) native_table_funcs[index] = table->ServiceTable;
+    if (!native_table_funcs[index]) return;
+    if (!(targets = malloc( table->ServiceLimit * sizeof(*targets) ))) abort_process( 1 );
+    pthread_mutex_lock( &shim_map_mutex );
+    pairs = registered_shims[index];
+    count = registered_shim_count[index];
+    for (i = 0; i < table->ServiceLimit; i++)
+    {
+        const void *func = (const void *)native_table_funcs[index][i];
+
+        targets[i] = (ULONG_PTR)func;
+        if (!index)
+            for (j = 0; j < vcpu_syscall_shim_count; j++)
+                if (vcpu_syscall_shims[j].func == func) targets[i] = (ULONG_PTR)vcpu_syscall_shims[j].shim;
+        for (j = 0; j < count; j++)
+            if (pairs[2 * j] == func) targets[i] = (ULONG_PTR)pairs[2 * j + 1];
+    }
+    pthread_mutex_unlock( &shim_map_mutex );
+    table->ServiceTable = targets;
 }
 
 static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_exit *e )
@@ -4910,6 +4945,12 @@ void vcpu_init_process(void)
 
     memset( &info, 0, sizeof(info) );
     if (!env || !*env || !strcmp( env, "0" )) return;
+    if (native_route)
+    {
+        /* the entitled loader has no hypervisor entitlement: vel1_vm_create would fail anyway */
+        fprintf( stderr, "wine: PMW_VCPU=%s ignored: native route (wine-native.app)\n", env );
+        return;
+    }
     vcpu_mode = strcmp( env, "selftest" ) ? 1 : 2;
     if (pthread_key_create( &vcpu_key, NULL )) vcpu_fatal( "pthread_key_create failed\n" );
 
