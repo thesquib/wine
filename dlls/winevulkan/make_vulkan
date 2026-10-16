@@ -874,7 +874,6 @@ class VkFunction(object):
                     copies.append(body_c)
             extra = " + ".join(extras) if extras else "0"
             ind = "    " if conds else ""
-            body += "#ifdef _WIN64\n"
             body += "    if (vk_batch_enabled)\n"
             body += "    {\n"
             if conds:
@@ -891,15 +890,10 @@ class VkFunction(object):
                 body += "        }\n"
                 body += "        else vk_batch_flush(commandBuffer);  /* a pNext chain: not queued, so replay first */\n"
             body += "    }\n"
-            body += "#endif\n"
         elif self.params and self.params[0].type == "VkCommandBuffer" and not self.params[0].is_pointer():
-            body += "#ifdef _WIN64\n"
             body += "    vk_batch_flush({0});\n".format(self.params[0].name)
-            body += "#endif\n"
         elif self.name == "vkResetCommandPool":
-            body += "#ifdef _WIN64\n"
             body += "    vk_batch_flush_pool(commandPool);\n"
-            body += "#endif\n"
 
         # Call the Unix function.
         if self.is_perf_critical():

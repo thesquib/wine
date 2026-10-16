@@ -1060,9 +1060,26 @@ NTSTATUS vk_batch_execute(void *arg)
     return STATUS_SUCCESS;
 }
 
+/* the 32-bit queue: records and the pointers inside them are 32-bit caller addresses, which each WoW64 thunk
+ * translates itself; only the queue's own address needs wow64_host_ptr here */
 NTSTATUS vk_batch_execute32(void *arg)
 {
-    return STATUS_NOT_SUPPORTED;
+    const struct batch_execute_params *params = arg;
+    const BYTE *p = wow64_host_ptr((ULONG)params->data), *end = p + params->size;
+
+    while (p + sizeof(struct vk_batch_header) <= end)
+    {
+        const struct vk_batch_header *header = (const struct vk_batch_header *)p;
+
+        if (header->size < sizeof(*header) || header->size > end - p || header->code >= unix_batch_execute)
+        {
+            ERR( "corrupt batch record at %p (code %u size %u)\n", p, header->code, header->size );
+            return STATUS_INVALID_PARAMETER;
+        }
+        __wine_unix_call_wow64_funcs[header->code]( (void *)(header + 1) );
+        p += header->size;
+    }
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS vk_is_available_device_function32(void *arg)

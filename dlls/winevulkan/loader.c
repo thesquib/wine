@@ -776,7 +776,8 @@ VkResult WINAPI vkAllocateCommandBuffers(VkDevice device, const VkCommandBufferA
  * thunks (make_vulkan: batch_plan) append a call whose pointers all lead to plain data of known size, copying that
  * data; every other call taking the command buffer, vkEndCommandBuffer included, first replays the queue with one
  * unix call, and vkResetCommandPool / vkFreeCommandBuffers replay what their buffers hold. A command buffer is
- * externally synchronized, so its queue needs no lock. 64-bit only.
+ * externally synchronized, so its queue needs no lock. A 32-bit caller's params structs and copied data already have
+ * the layout the WoW64 thunks read, so the same queue serves both (vk_batch_execute32 replays it).
  */
 #define VK_BATCH_MIN   (64 * 1024)
 /* capped well below the heap's large-block size: a bigger queue buys almost nothing (a replay per ~4,000 calls is
@@ -788,14 +789,12 @@ BOOL vk_batch_enabled;
 
 void vk_batch_flush_slow(VkCommandBuffer buffer)
 {
-#ifdef _WIN64
     struct batch_execute_params params;
 
     params.data = (UINT_PTR)buffer->batch;
     params.size = buffer->batch_used;
     buffer->batch_used = 0;
     UNIX_CALL(batch_execute, &params);
-#endif
 }
 
 void vk_batch_flush_pool(VkCommandPool handle)
@@ -887,11 +886,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, void *reserved)
     {
         case DLL_PROCESS_ATTACH:
         {
-#ifdef _WIN64
             char env[8];
             if (GetEnvironmentVariableA("PMW_VK_BATCH", env, sizeof(env)) && env[0] == '1')
                 vk_batch_enabled = TRUE;
-#endif
             hinstance = hinst;
             DisableThreadLibraryCalls(hinst);
             break;
