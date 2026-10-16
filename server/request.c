@@ -288,8 +288,8 @@ static void send_reply( union generic_reply *reply )
         fatal_protocol_error( current, "reply write: %s\n", strerror( errno ));
 }
 
-/* call a request handler */
-static void call_req_handler( struct thread *thread )
+/* call a request handler; returns 1 if the request was parked (no reply yet, req_data kept) */
+static int call_req_handler( struct thread *thread )
 {
     union generic_reply reply;
     enum request req = thread->req.request_header.req;
@@ -313,6 +313,11 @@ static void call_req_handler( struct thread *thread )
     else
         set_error( STATUS_NOT_IMPLEMENTED );
 
+    if (async_open_parked() && current)
+    {
+        current = NULL;  /* replay_request sends the reply once the worker's open() is done */
+        return 1;
+    }
     if (current)
     {
         if (current->reply_fd)
@@ -329,6 +334,16 @@ static void call_req_handler( struct thread *thread )
         }
     }
     current = NULL;
+    return 0;
+}
+
+/* run a parked request again (see queue_async_open in fd.c); it cannot park twice */
+void replay_request( struct thread *thread )
+{
+    if (thread->state == TERMINATED || !thread->reply_fd) return;  /* cleanup_thread freed req_data */
+    call_req_handler( thread );
+    free( thread->req_data );
+    thread->req_data = NULL;
 }
 
 /* read a request from a thread */
@@ -364,7 +379,7 @@ void read_request( struct thread *thread )
         if (ret <= 0) break;
         if (!(thread->req_toread -= ret))
         {
-            call_req_handler( thread );
+            if (call_req_handler( thread )) return;  /* parked, replay_request frees req_data */
             free( thread->req_data );
             thread->req_data = NULL;
             return;

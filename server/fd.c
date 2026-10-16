@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <poll.h>
+#include <pthread.h>
 #ifdef HAVE_LINUX_MAJOR_H
 #include <linux/major.h>
 #endif
@@ -1964,6 +1965,171 @@ void get_nt_name( struct fd *fd, struct unicode_str *name )
     name->len = fd->nt_namelen;
 }
 
+/* PROTON_DARWIN: async file creates. macOS can stall open(O_CREAT) ~100 ms behind throttled background
+ * I/O (debug.lowpri_throttle_enabled), and on the single server thread that froze every Wine process.
+ * A create_file request whose open() may create a file is parked (no reply), a worker thread does the
+ * open(), then the request is replayed on the main thread and open_fd takes the worker's fd.
+ * shortcut: until the replay, the new file is on disk without its fd in the inode list, so a racing open
+ * by another thread skips the sharing check; fine for temp/cache files, revisit if sharing bugs show up.
+ * PMW_SERVER_SYNC_OPEN=1 turns it off. */
+struct async_open
+{
+    struct list     entry;
+    struct thread  *thread;   /* parked thread (referenced) */
+    char           *name;
+    int             dir_fd;   /* dup of the root dir fd, or AT_FDCWD for an absolute name */
+    int             flags;
+    mode_t          mode;
+    int             unix_fd;  /* worker result, -1 on failure or once taken */
+};
+
+static pthread_mutex_t async_open_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t async_open_cond = PTHREAD_COND_INITIALIZER;
+static struct list async_open_queue = LIST_INIT( async_open_queue );
+static struct list async_open_done = LIST_INIT( async_open_done );
+static int async_open_pipe[2] = { -1, -1 };
+static int async_open_state;  /* 0 not started, 1 running, -1 disabled */
+static int async_open_parked_flag;
+static struct async_open *async_open_replay;  /* request being replayed on the main thread */
+
+static void *async_open_worker( void *arg )
+{
+    sigset_t set;
+
+    sigfillset( &set );
+    pthread_sigmask( SIG_BLOCK, &set, NULL );
+    pthread_mutex_lock( &async_open_mutex );
+    for (;;)
+    {
+        struct async_open *job;
+        char dummy = 0;
+
+        while (list_empty( &async_open_queue )) pthread_cond_wait( &async_open_cond, &async_open_mutex );
+        job = LIST_ENTRY( list_head( &async_open_queue ), struct async_open, entry );
+        list_remove( &job->entry );
+        pthread_mutex_unlock( &async_open_mutex );
+        job->unix_fd = openat( job->dir_fd, job->name, job->flags, job->mode );
+        pthread_mutex_lock( &async_open_mutex );
+        list_add_tail( &async_open_done, &job->entry );
+        write( async_open_pipe[1], &dummy, 1 );
+    }
+    return NULL;
+}
+
+static void async_open_poll_event( struct fd *fd, int event )
+{
+    struct list done = LIST_INIT( done );
+    struct async_open *job, *next;
+    char buf[64];
+
+    while (read( async_open_pipe[0], buf, sizeof(buf) ) > 0);
+    pthread_mutex_lock( &async_open_mutex );
+    list_move_tail( &done, &async_open_done );
+    pthread_mutex_unlock( &async_open_mutex );
+
+    LIST_FOR_EACH_ENTRY_SAFE( job, next, &done, struct async_open, entry )
+    {
+        list_remove( &job->entry );
+        async_open_replay = job;
+        replay_request( job->thread );
+        async_open_replay = NULL;
+        if (job->unix_fd != -1) close( job->unix_fd );  /* not taken: thread died or the replay failed first */
+        if (job->dir_fd != AT_FDCWD) close( job->dir_fd );
+        release_object( job->thread );
+        free( job->name );
+        free( job );
+    }
+}
+
+static const struct fd_ops async_open_fd_ops =
+{
+    NULL,                     /* get_poll_events */
+    async_open_poll_event,    /* poll_event */
+    NULL,                     /* flush */
+    NULL,                     /* get_fd_type */
+    NULL,                     /* ioctl */
+    NULL,                     /* queue_async */
+    NULL                      /* reselect_async */
+};
+
+static int start_async_open(void)
+{
+    const char *env = getenv( "PMW_SERVER_SYNC_OPEN" );
+    struct fd *fd;
+    pthread_attr_t attr;
+    pthread_t worker;
+    int ok;
+
+    async_open_state = -1;
+    if (env && atoi( env )) return 0;
+    if (pipe( async_open_pipe ) == -1) return 0;
+    fcntl( async_open_pipe[0], F_SETFL, O_NONBLOCK );
+    if (!(fd = create_anonymous_fd( &async_open_fd_ops, async_open_pipe[0], NULL, 0 )))
+    {
+        close( async_open_pipe[1] );
+        return 0;
+    }
+    pthread_attr_init( &attr );
+#ifdef __APPLE__
+    pthread_attr_set_qos_class_np( &attr, QOS_CLASS_USER_INTERACTIVE, 0 );
+#endif
+    ok = !pthread_create( &worker, &attr, async_open_worker, NULL );
+    pthread_attr_destroy( &attr );
+    if (!ok)
+    {
+        release_object( fd );
+        close( async_open_pipe[1] );
+        return 0;
+    }
+    make_object_permanent( &fd->obj );
+    set_fd_events( fd, POLLIN );
+    async_open_state = 1;
+    return 1;
+}
+
+/* park the current create_file request and hand its open() to the worker; 0 = open it inline */
+static int queue_async_open( int root_fd, const char *name, int flags, mode_t mode )
+{
+    struct async_open *job;
+
+    if (!current || current->req.request_header.req != REQ_create_file) return 0;
+    if (root_fd == -1 && name[0] != '/') return 0;  /* relative to the cwd, which the main thread moves */
+    if (!async_open_state && !start_async_open()) return 0;
+    if (async_open_state != 1) return 0;
+    if (!(job = malloc( sizeof(*job) ))) return 0;
+    if (!(job->name = strdup( name )))
+    {
+        free( job );
+        return 0;
+    }
+    if (root_fd == -1) job->dir_fd = AT_FDCWD;
+    else if ((job->dir_fd = dup( root_fd )) == -1)
+    {
+        free( job->name );
+        free( job );
+        return 0;
+    }
+    job->thread  = (struct thread *)grab_object( current );
+    job->flags   = flags;
+    job->mode    = mode;
+    job->unix_fd = -1;
+    async_open_parked_flag = 1;
+
+    pthread_mutex_lock( &async_open_mutex );
+    list_add_tail( &async_open_queue, &job->entry );
+    pthread_cond_signal( &async_open_cond );
+    pthread_mutex_unlock( &async_open_mutex );
+    return 1;
+}
+
+/* did the request just handled get parked by queue_async_open? (clears the flag) */
+int async_open_parked(void)
+{
+    int ret = async_open_parked_flag;
+    async_open_parked_flag = 0;
+    return ret;
+}
+
 /* open() wrapper that returns a struct fd with no fd user set */
 unsigned long long pmw_slow_ns(void);
 unsigned long long pmw_now_ns(void);
@@ -2030,7 +2196,18 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     }
     else rw_mode = O_RDONLY;
 
-    if ((fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
+    if (async_open_replay && async_open_replay->unix_fd != -1 && !strcmp( async_open_replay->name, name ))
+    {
+        fd->unix_fd = async_open_replay->unix_fd;  /* the worker's open of this replayed request */
+        async_open_replay->unix_fd = -1;
+    }
+    else if (!async_open_replay && (flags & O_CREAT) &&
+             queue_async_open( root_fd, name, rw_mode | (flags & ~O_TRUNC), *mode ))
+    {
+        set_error( STATUS_PENDING );  /* never replied: the request is replayed when the open is done */
+        goto error;
+    }
+    else if ((fd->unix_fd = open( name, rw_mode | (flags & ~O_TRUNC), *mode )) == -1)
     {
         /* if we tried to open a directory for write access, retry read-only */
         if (errno == EISDIR)
