@@ -302,7 +302,14 @@ static void call_req_handler( struct thread *thread )
     if (debug_level) trace_request();
 
     if (req < REQ_NB_REQUESTS)
+    {
+        extern unsigned long long pmw_slow_ns(void), pmw_now_ns(void);
+        extern void pmw_slow_log( const char *what, unsigned long long ns, int n );
+        unsigned long long t0 = pmw_slow_ns() ? pmw_now_ns() : 0, t1;
+
         req_handlers[req]( &current->req, &reply );
+        if (t0 && (t1 = pmw_now_ns()) - t0 >= pmw_slow_ns()) pmw_slow_log( "request", t1 - t0, req );
+    }
     else
         set_error( STATUS_NOT_IMPLEMENTED );
 

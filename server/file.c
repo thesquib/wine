@@ -369,15 +369,27 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
     access = map_access( access, &file_type.mapping );
 
     /* FIXME: should set error to STATUS_OBJECT_NAME_COLLISION if file existed before */
-    fd = open_fd( root, name, nt_name, flags | O_NONBLOCK, &mode, access, sharing, options );
-    if (!fd) goto done;
+    {
+        extern unsigned long long pmw_slow_ns(void), pmw_now_ns(void);
+        unsigned long long t0 = pmw_slow_ns() ? pmw_now_ns() : 0, t1 = 0, t2;
 
-    if (S_ISDIR(mode))
-        obj = create_dir_obj( fd, access, mode, sd );
-    else if (S_ISCHR(mode) && is_serial_fd( fd ))
-        obj = create_serial( fd );
-    else
-        obj = create_file_obj( fd, access, mode, sd );
+        fd = open_fd( root, name, nt_name, flags | O_NONBLOCK, &mode, access, sharing, options );
+        if (t0) t1 = pmw_now_ns();
+        if (fd)
+        {
+            if (S_ISDIR(mode))
+                obj = create_dir_obj( fd, access, mode, sd );
+            else if (S_ISCHR(mode) && is_serial_fd( fd ))
+                obj = create_serial( fd );
+            else
+                obj = create_file_obj( fd, access, mode, sd );
+        }
+        /* PROTON_DARWIN diagnostic (PMW_SERVER_SLOW_MS): which file, and open vs object setup */
+        if (t0 && (t2 = pmw_now_ns()) - t0 >= pmw_slow_ns())
+            fprintf( stderr, "[SERVER-SLOW] create_file %.1f ms (open_fd %.1f, obj %.1f) flags %x options %x %s%s\n",
+                     (t2 - t0) / 1e6, (t1 - t0) / 1e6, (t2 - t1) / 1e6, flags, options, root ? "<root>/" : "", name );
+        if (!fd) goto done;
+    }
 
     release_object( fd );
 

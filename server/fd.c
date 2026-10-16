@@ -22,6 +22,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <time.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -702,11 +703,43 @@ static inline void remove_epoll_user( struct fd *fd, int user )
     }
 }
 
+/* PROTON_DARWIN diagnostic, PMW_SERVER_SLOW_MS=<ms>: log server stalls (stderr, wall-clock stamped): a request
+ * handler, or one loop pass of event handling, that ran at least that long, and a kevent wait at least that long that
+ * returned events (the server slept while requests were due, or nothing reached it). */
+unsigned long long pmw_slow_ns(void)
+{
+    static long long ns = -1;
+    if (ns < 0)
+    {
+        const char *env = getenv( "PMW_SERVER_SLOW_MS" );
+        ns = env ? atoll( env ) * 1000000ll : 0;
+    }
+    return ns;
+}
+
+unsigned long long pmw_now_ns(void)
+{
+    struct timespec t;
+    clock_gettime( CLOCK_MONOTONIC, &t );
+    return t.tv_sec * 1000000000ull + t.tv_nsec;
+}
+
+void pmw_slow_log( const char *what, unsigned long long ns, int n )
+{
+    struct timeval tv;
+    struct tm tm;
+    gettimeofday( &tv, NULL );
+    localtime_r( &tv.tv_sec, &tm );
+    fprintf( stderr, "[SERVER-SLOW] %d %02d:%02d:%02d.%03d %s %.1f ms (%d)\n", (int)getpid(), tm.tm_hour, tm.tm_min,
+             tm.tm_sec, (int)(tv.tv_usec / 1000), what, ns / 1e6, n );
+}
+
 static inline void main_loop_epoll(void)
 {
     int i, ret, timeout;
     struct timespec ts;
     struct kevent events[128];
+    unsigned long long t0, t1;
 
     if (kqueue_fd == -1) return;
 
@@ -717,7 +750,10 @@ static inline void main_loop_epoll(void)
         if (!active_users) break;  /* last user removed by a timeout */
         if (kqueue_fd == -1) break;  /* an error occurred with kqueue */
 
+        t0 = pmw_slow_ns() ? pmw_now_ns() : 0;
         ret = kevent( kqueue_fd, NULL, 0, events, ARRAY_SIZE( events ), timeout == -1 ? NULL : &ts );
+        if (t0 && ret > 0 && (t1 = pmw_now_ns()) - t0 >= pmw_slow_ns()) pmw_slow_log( "kevent wait", t1 - t0, ret );
+        t0 = pmw_slow_ns() ? pmw_now_ns() : 0;
 
         set_current_time();
 
@@ -743,6 +779,7 @@ static inline void main_loop_epoll(void)
             if (pollfd[user].revents) fd_poll_event( poll_users[user], pollfd[user].revents );
             pollfd[user].revents = 0;
         }
+        if (t0 && (t1 = pmw_now_ns()) - t0 >= pmw_slow_ns()) pmw_slow_log( "loop pass", t1 - t0, ret );
     }
 }
 
@@ -1928,6 +1965,8 @@ void get_nt_name( struct fd *fd, struct unicode_str *name )
 }
 
 /* open() wrapper that returns a struct fd with no fd user set */
+unsigned long long pmw_slow_ns(void);
+unsigned long long pmw_now_ns(void);
 struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_name,
                     int flags, mode_t *mode, unsigned int access,
                     unsigned int sharing, unsigned int options )
@@ -1938,6 +1977,9 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
     int root_fd = -1;
     int rw_mode;
     char *path;
+    /* PROTON_DARWIN diagnostic (PMW_SERVER_SLOW_MS): step times of a slow open */
+    unsigned long long pt[8] = { pmw_slow_ns() ? pmw_now_ns() : 0 };
+#define PMW_STEP(i) do { if (pt[0]) pt[i] = pmw_now_ns(); } while (0)
 
     if (((options & FILE_DELETE_ON_CLOSE) && !(access & DELETE)) ||
         ((options & FILE_DIRECTORY_FILE) && (flags & O_TRUNC)))
@@ -1966,6 +2008,7 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         }
     }
 
+    PMW_STEP(1);
     /* create the directory if needed */
     if ((options & FILE_DIRECTORY_FILE) && (flags & O_CREAT))
     {
@@ -2007,9 +2050,11 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
         }
     }
 
+    PMW_STEP(2);
     fd->nt_name = dup_nt_name( root, nt_name, &fd->nt_namelen );
     fd->unix_name = NULL;
     fstat( fd->unix_fd, &st );
+    PMW_STEP(3);
     *mode = st.st_mode;
 
     /* only bother with an inode for normal files and directories */
@@ -2026,12 +2071,14 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             goto error;
         }
 
+        PMW_STEP(4);
         if ((path = dup_fd_name( root, name )))
         {
             fd->unix_name = realpath( path, NULL );
             free( path );
         }
 
+        PMW_STEP(5);
         closed_fd->unix_fd = fd->unix_fd;
         closed_fd->unix_name = fd->unix_name;
         closed_fd->disp_flags = 0;
@@ -2057,6 +2104,11 @@ struct fd *open_fd( struct fd *root, const char *name, struct unicode_str nt_nam
             set_error( err );
             goto error;
         }
+        PMW_STEP(6);
+        if (pt[0] && pt[6] - pt[0] >= pmw_slow_ns())
+            fprintf( stderr, "[SERVER-SLOW] open_fd steps ms: fchdir %.1f open %.1f fstat %.1f get_inode %.1f realpath %.1f "
+                     "check_sharing %.1f\n", (pt[1] - pt[0]) / 1e6, (pt[2] - pt[1]) / 1e6, (pt[3] - pt[2]) / 1e6,
+                     (pt[4] - pt[3]) / 1e6, (pt[5] - pt[4]) / 1e6, (pt[6] - pt[5]) / 1e6 );
 
         /* can't unlink files if we don't have permission to access */
         if ((options & FILE_DELETE_ON_CLOSE) && !(flags & O_CREAT) &&
