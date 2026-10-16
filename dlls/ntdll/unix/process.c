@@ -1907,6 +1907,7 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
             ret = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!ret) thread_basic_info_changed();
         break;
     }
     case ProcessPriorityClass:
@@ -1924,6 +1925,7 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
                 ret = wine_server_call( req );
             }
             SERVER_END_REQ;
+            if (!ret) thread_basic_info_changed();
         }
         break;
 
@@ -1941,6 +1943,7 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
                 ret = wine_server_call( req );
             }
             SERVER_END_REQ;
+            if (!ret) thread_basic_info_changed();
         }
         break;
 

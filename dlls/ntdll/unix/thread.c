@@ -2301,6 +2301,39 @@ static BOOL is_process_wow64( const CLIENT_ID *id )
     return ret;
 }
 
+/* PROTON_DARWIN: current-thread ThreadBasicInformation cache (see NtQueryInformationThread) */
+#define THREAD_BASIC_INFO_TTL (50 * 1000000ull)  /* ns */
+
+LONG thread_basic_info_generation;
+
+static __thread struct
+{
+    BOOL valid;
+    LONG generation;
+    ULONGLONG time;
+    THREAD_BASIC_INFORMATION info;
+} thread_basic_info_cache;
+
+static BOOL thread_basic_info_cache_enabled(void)
+{
+    static int enabled = -1;
+
+    if (enabled == -1)
+    {
+        const char *env = getenv( "PMW_THREAD_INFO_CACHE" );
+        enabled = !(env && !strcmp( env, "0" ));
+    }
+    return enabled;
+}
+
+static ULONGLONG thread_basic_info_now(void)
+{
+    struct timespec ts;
+
+    clock_gettime( CLOCK_MONOTONIC, &ts );
+    return ts.tv_sec * 1000000000ull + ts.tv_nsec;
+}
+
 /******************************************************************************
  *              NtQueryInformationThread  (NTDLL.@)
  */
@@ -2317,6 +2350,29 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
     {
         THREAD_BASIC_INFORMATION info;
         const ULONG_PTR affinity_mask = get_system_affinity_mask();
+        BOOL cacheable = handle == GetCurrentThread() && thread_basic_info_cache_enabled();
+        LONG generation = 0;
+
+        /* PROTON_DARWIN: a thread asking for its own basic info is answered from a per-thread copy for up to
+         * THREAD_BASIC_INFO_TTL, unless a priority or affinity change in this process (any thread, any handle) bumped
+         * thread_basic_info_generation since; only a change made by another process can be seen late, by at most the
+         * TTL. Batman: Arkham Asylum's PhysX 2.8.1 / APEX profiling events ask for their thread's priority ~8.6k
+         * times a second, each a wineserver round trip of ~7 us. PMW_THREAD_INFO_CACHE=0 turns it off. */
+        if (cacheable)
+        {
+            ULONGLONG now = thread_basic_info_now();
+
+            generation = __atomic_load_n( &thread_basic_info_generation, __ATOMIC_ACQUIRE );
+            if (thread_basic_info_cache.valid && thread_basic_info_cache.generation == generation &&
+                now - thread_basic_info_cache.time < THREAD_BASIC_INFO_TTL)
+            {
+                info = thread_basic_info_cache.info;
+                if (data) memcpy( data, &info, min( length, sizeof(info) ));
+                if (ret_len) *ret_len = min( length, sizeof(info) );
+                return STATUS_SUCCESS;
+            }
+            thread_basic_info_cache.time = now;
+        }
 
         SERVER_START_REQ( get_thread_info )
         {
@@ -2341,6 +2397,12 @@ NTSTATUS WINAPI NtQueryInformationThread( HANDLE handle, THREADINFOCLASS class,
                     info.TebBaseAddress = (char *)info.TebBaseAddress + teb_offset;
                 else
                     info.TebBaseAddress = NULL;
+            }
+            if (cacheable)
+            {
+                thread_basic_info_cache.info = info;
+                thread_basic_info_cache.generation = generation;
+                thread_basic_info_cache.valid = TRUE;
             }
             if (data) memcpy( data, &info, min( length, sizeof(info) ));
             if (ret_len) *ret_len = min( length, sizeof(info) );
@@ -2661,6 +2723,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status) thread_basic_info_changed();
         if (!status && vcpu_prof_interval) vcpu_prof_note_priority( handle );
         return status;
     }
@@ -2677,6 +2740,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status) thread_basic_info_changed();
         if (!status && vcpu_prof_interval) vcpu_prof_note_priority( handle );
         return status;
     }
@@ -2697,6 +2761,7 @@ NTSTATUS WINAPI NtSetInformationThread( HANDLE handle, THREADINFOCLASS class,
             status = wine_server_call( req );
         }
         SERVER_END_REQ;
+        if (!status) thread_basic_info_changed();
         return status;
     }
 

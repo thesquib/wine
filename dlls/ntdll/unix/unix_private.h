@@ -330,6 +330,13 @@ extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags );
 extern void *anon_mmap_alloc( size_t size, int prot );
 extern void virtual_init(void);
 extern ULONG_PTR get_system_affinity_mask(void);
+/* PROTON_DARWIN: bumped by every successful thread/process priority or affinity change in this process; the
+ * current-thread ThreadBasicInformation cache (thread.c) is dropped when it moves */
+extern LONG thread_basic_info_generation;
+static inline void thread_basic_info_changed(void)
+{
+    __atomic_add_fetch( &thread_basic_info_generation, 1, __ATOMIC_RELEASE );
+}
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info, BOOL wow64 );
 extern NTSTATUS virtual_map_builtin_module( HANDLE mapping, void **module, SIZE_T *size,
                                             SECTION_IMAGE_INFORMATION *info, ULONG_PTR limit_low,
