@@ -78,7 +78,7 @@ static void set_wow64_environment( WCHAR **env )
     RtlSetEnvironmentVariable( env, &arch_strW, get_machine_name( current_machine, &nameW ));
     if (!is_win64 && NtCurrentTeb()->WowTebOffset)
     {
-        RtlWow64GetProcessMachines( GetCurrentProcess(), NULL, &machine );
+        RtlWow64GetProcessMachines( NtCurrentProcess(), NULL, &machine );
         RtlSetEnvironmentVariable( env, &arch6432_strW, get_machine_name( machine, &nameW ));
     }
     else RtlSetEnvironmentVariable( env, &arch6432_strW, NULL );
@@ -727,7 +727,7 @@ void init_user_process_params(void)
         RtlInitUnicodeString( &curdir, windows_dir );
         RtlSetCurrentDirectory_U( &curdir );
     }
-    NtFreeVirtualMemory( GetCurrentProcess(), (void **)&params, &size, MEM_RELEASE );
+    NtFreeVirtualMemory( NtCurrentProcess(), (void **)&params, &size, MEM_RELEASE );
     set_wow64_environment( &new_params->Environment );
     new_params->EnvironmentSize = RtlSizeHeap( GetProcessHeap(), 0, new_params->Environment );
 }
