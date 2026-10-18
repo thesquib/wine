@@ -66,7 +66,14 @@ static char __wine_reserve[0x1fffff000] __attribute__((section("WINE_RESERVE, WI
 #endif
 
 __asm__(".zerofill WINE_TOP_DOWN,WINE_TOP_DOWN");
-static char __wine_top_down[0x001ff0000] __attribute__((section("WINE_TOP_DOWN, WINE_TOP_DOWN")));
+/* arm64 needs space above PAGEZERO reserved by dyld before libmalloc initializes.
+ * The slid range covers conventional 0x140000000 fixed-base images without replacing host allocations. */
+#ifdef __aarch64__
+static char __wine_top_down[0x60000000]
+#else
+static char __wine_top_down[0x001ff0000]
+#endif
+    __attribute__((section("WINE_TOP_DOWN, WINE_TOP_DOWN")));
 
 /* Not const: on arm64 entry 0's size is only known once we can read our own
  * __PAGEZERO back at runtime. */
