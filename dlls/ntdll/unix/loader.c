@@ -552,12 +552,20 @@ static void init_paths(void)
         char exe[PATH_MAX];
         uint32_t size = sizeof(exe);
         char *real;
+        const char *loader;
 
         /* children must re-enter the entitled bundle binary, not the vCPU loader next to ntdll.so */
         if (flag && *flag && !_NSGetExecutablePath( exe, &size ) && (real = realpath( exe, NULL )))
         {
             native_route = 1;
             wineloader = real;
+            /* Preserve the bundle path chosen by a launcher for child processes. */
+            loader = getenv( "WINELOADER" );
+            if (loader && loader[0] == '/' && !access( loader, X_OK ))
+            {
+                free( real );
+                wineloader = strdup( loader );
+            }
         }
     }
 #endif
