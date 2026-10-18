@@ -37,6 +37,19 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(threadname);
+WINE_DECLARE_DEBUG_CHANNEL(ecfault);
+
+/* Diagnostic only: shared process-wide event budget for the error-pointer AV. */
+BOOL trace_status_fault( const EXCEPTION_RECORD *rec )
+{
+    static LONG events;
+    return TRACE_ON(ecfault) && rec->ExceptionCode == STATUS_ACCESS_VIOLATION &&
+           rec->NumberParameters > 1 &&
+           (rec->ExceptionInformation[1] == (ULONG_PTR)(LONG_PTR)STATUS_INVALID_SYSTEM_SERVICE ||
+            rec->ExceptionInformation[1] == (ULONG_PTR)(ULONG)STATUS_INVALID_SYSTEM_SERVICE) &&
+           ReadAcquire( &events ) < 128 && InterlockedIncrement( &events ) <= 128;
+}
+
 
 typedef struct
 {
@@ -173,7 +186,9 @@ static LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 
         TRACE( "calling handler at %p code=%lx flags=%lx\n",
                func, rec->ExceptionCode, rec->ExceptionFlags );
+        if (trace_status_fault( rec )) TRACE_(ecfault)( "veh-call tid %p handler %p\n", NtCurrentTeb()->ClientId.UniqueThread, func );
         ret = func( &except_ptrs );
+        if (trace_status_fault( rec )) TRACE_(ecfault)( "veh-return tid %p handler %p disposition %lx\n", NtCurrentTeb()->ClientId.UniqueThread, func, ret );
         TRACE( "handler at %p returned %lx\n", func, ret );
 
         RtlEnterCriticalSection( &vectored_handlers_section );
@@ -265,6 +280,7 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
 
+    if (trace_status_fault( rec )) TRACE_(ecfault)( "dispatch tid %p rip %I64x\n", NtCurrentTeb()->ClientId.UniqueThread, (ULONGLONG)rec->ExceptionAddress );
     if (call_vectored_handlers( rec, context ) == EXCEPTION_CONTINUE_EXECUTION)
         NtContinue( context, FALSE );
 

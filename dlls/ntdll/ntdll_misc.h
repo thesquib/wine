@@ -56,6 +56,7 @@ extern BOOL heap_zero_hack;
 extern BOOL heap_top_down_hack;
 
 /* exceptions */
+extern BOOL trace_status_fault( const EXCEPTION_RECORD *rec );
 extern NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *context );
 extern NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context );
 extern NTSTATUS WINAPI dispatch_user_callback( void *args, ULONG len, ULONG id );
