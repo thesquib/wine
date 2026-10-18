@@ -4153,7 +4153,8 @@ static void *get_host_addr_space_limit(void)
 {
 #ifdef __APPLE__
     /* See MACH_VM_MAX_ADDRESS_RAW in xnu osfmk/mach/arm/vm_param.h */
-    return (void *)0x7ffffe000000;
+    /* Leave room for XNU copyinstr() to validate child-process strings near the limit. */
+    return (void *)(0x7ffffe000000 - (native_route ? 0x1000000 : 0));
 #else
     unsigned int flags = MAP_PRIVATE | MAP_ANON;
     UINT_PTR addr = (UINT_PTR)1 << 63;
