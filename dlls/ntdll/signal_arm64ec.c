@@ -1295,6 +1295,11 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
     for (;;)
     {
         status = virtual_unwind( UNW_FLAG_EHANDLER, &dispatch, &context, need_backtrace( rec->ExceptionCode ) );
+        if (trace_status_fault( rec ))
+            TRACE_(ecfault)( "unwind tid %p status %lx pc %I64x base %I64x function %p handler %p frame %I64x next_rip %I64x next_rsp %I64x\n",
+                            NtCurrentTeb()->ClientId.UniqueThread, status, dispatch.ControlPc,
+                            dispatch.ImageBase, dispatch.FunctionEntry, dispatch.LanguageHandler,
+                            dispatch.EstablisherFrame, context.AMD64_Context.Rip, context.Sp );
         if (status != STATUS_SUCCESS) return status;
 
     unwind_done:
@@ -1312,8 +1317,10 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         {
             TRACE( "calling handler %p (rec=%p, frame=%I64x context=%p, dispatch=%p)\n",
                    dispatch.LanguageHandler, rec, dispatch.EstablisherFrame, orig_context, &dispatch );
+            if (trace_status_fault( rec )) TRACE_(ecfault)( "seh-call tid %p handler %p\n", NtCurrentTeb()->ClientId.UniqueThread, dispatch.LanguageHandler );
             res = call_seh_handler( rec, dispatch.EstablisherFrame, orig_context,
                                     &dispatch, dispatch.LanguageHandler );
+            if (trace_status_fault( rec )) TRACE_(ecfault)( "seh-return tid %p handler %p disposition %lu\n", NtCurrentTeb()->ClientId.UniqueThread, dispatch.LanguageHandler, res );
             rec->ExceptionFlags &= EXCEPTION_NONCONTINUABLE;
             TRACE( "handler at %p returned %lu\n", dispatch.LanguageHandler, res );
 
@@ -1342,8 +1349,10 @@ NTSTATUS call_seh_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_context )
         {
             TRACE( "calling TEB handler %p (rec=%p frame=%p context=%p dispatch=%p) sp=%I64x\n",
                    teb_frame->Handler, rec, teb_frame, orig_context, &dispatch, context.Sp );
+            if (trace_status_fault( rec )) TRACE_(ecfault)( "teb-call tid %p handler %p\n", NtCurrentTeb()->ClientId.UniqueThread, teb_frame->Handler );
             res = call_seh_handler( rec, (ULONG_PTR)teb_frame, orig_context,
                                     &dispatch, (PEXCEPTION_ROUTINE)teb_frame->Handler );
+            if (trace_status_fault( rec )) TRACE_(ecfault)( "teb-return tid %p handler %p disposition %lu\n", NtCurrentTeb()->ClientId.UniqueThread, teb_frame->Handler, res );
             TRACE( "TEB handler at %p returned %lu\n", teb_frame->Handler, res );
 
             switch (res)
@@ -1470,6 +1479,20 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
                         NtCurrentTeb()->ClientId.UniqueThread, rec->ExceptionCode, rec->ExceptionAddress,
                         rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0,
                         context->context.AMD64_Context.Rip, context->context.AMD64_Context.Rsp );
+
+    if (trace_status_fault( rec ))
+    {
+        static LONG captures;
+        if (InterlockedIncrement( &captures ) <= 2)
+        {
+            CONTEXT *c = &context->context.AMD64_Context;
+            TRACE_(ecfault)( "fault tid %p code %lx flags %lx rip %I64x rsp %I64x rbp %I64x rax %I64x rcx %I64x rdx %I64x access %Ix ec %u\n",
+                            NtCurrentTeb()->ClientId.UniqueThread, rec->ExceptionCode, rec->ExceptionFlags,
+                            c->Rip, c->Rsp, c->Rbp, c->Rax, c->Rcx, c->Rdx, rec->ExceptionInformation[1], !!RtlIsEcCode( c->Rip ) );
+            trace_syscall_memory( "fault-code", c->Rip, 64, 16, TRUE );
+            trace_syscall_memory( "fault-stack", c->Rsp, 128, 0, TRUE );
+        }
+    }
 
     /* call x64 dispatcher if the thunk or the function pointer was modified */
     if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
