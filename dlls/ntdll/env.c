@@ -224,6 +224,48 @@ NTSTATUS WINAPI RtlQueryEnvironmentVariable_U(PWSTR env,
 /******************************************************************
  *		RtlQueryEnvironmentVariable   [NTDLL.@]
  */
+#ifdef __arm64ec__
+WINE_DECLARE_DEBUG_CHANNEL(ecpriv);
+static int ph_read(void *p,void *out,SIZE_T n)
+{
+ SIZE_T done=0;return !NtReadVirtualMemory(NtCurrentProcess(),p,out,n,&done) && done==n;
+}
+static int ph_query(void *p,MEMORY_BASIC_INFORMATION *m)
+{
+ return !NtQueryVirtualMemory(NtCurrentProcess(),p,MemoryBasicInformation,m,sizeof(*m),NULL);
+}
+static void *ph_alloc(SIZE_T n){return RtlAllocateHeap(NtCurrentTeb()->Peb->ProcessHeap,0,n);}
+static void ph_free(void *p){RtlFreeHeap(NtCurrentTeb()->Peb->ProcessHeap,0,p);}
+static int ph_mark(void *p,SIZE_T n,DWORD protect)
+{
+ MEM_EXTENDED_PARAMETER e={0};e.Type=MemExtendedParameterAttributeFlags;e.ULong64=MEM_EXTENDED_PARAMETER_EC_CODE;
+ return !NtAllocateVirtualMemoryEx(NtCurrentProcess(),&p,&n,MEM_COMMIT,protect,&e,1);
+}
+#include "private_hybrid_probe.h"
+#include "private_hybrid_gate.h"
+static LONG ph_busy,ph_logged;
+static void ph_environment_boundary(const WCHAR *name,SIZE_T length)
+{
+ static const WCHAR trigger[]=L"PACKER_CRASH_AT";
+ static const WCHAR enabled[]=L"PMW_PRIVATE_HYBRID_REGISTER";
+ UNICODE_STRING module;HMODULE loader=NULL;const WCHAR *value;BOOL active;ULONG_PTR dispatch_ret=0;
+ if(length!=15 || memcmp(name,trigger,30))return;
+ RtlAcquirePebLock();value=ENV_FindVariable(NtCurrentTeb()->Peb->ProcessParameters->Environment,enabled,27);
+ active=value && value[0]=='1' && !value[1];RtlReleasePebLock();if(!active)return;
+ RtlInitUnicodeString(&module,L"preloader.dll");
+ if(LdrGetDllHandle(NULL,0,&module,&loader) || !loader)return;
+ if(InterlockedCompareExchange(&ph_busy,1,0)){
+  ERR_(ecpriv)("registration concurrent/reentrant; stopping before runtime entry\n");NtTerminateProcess(NtCurrentProcess(),STATUS_INVALID_IMAGE_FORMAT);return;
+ }
+ if(!ph_gate((BYTE*)loader)){
+  ERR_(ecpriv)("registration validation failed; stopping before runtime entry\n");NtTerminateProcess(NtCurrentProcess(),STATUS_INVALID_IMAGE_FORMAT);return;
+ }
+ ph_read(ph_state.base+12673048,&dispatch_ret,sizeof(dispatch_ret));
+ if(!InterlockedExchange(&ph_logged,1)) TRACE_(ecpriv)("registered base %p x64 %lu native %lu leaf_ec %u bridge_ec %u dispatch_ret %p; process-lifetime diagnostic\n",ph_state.base,ph_state.nx,ph_state.na,!!RtlIsEcCode((ULONG_PTR)ph_state.base+0x9f0642),!!RtlIsEcCode((ULONG_PTR)ph_state.base+0x9f1880),(void*)dispatch_ret);
+ InterlockedExchange(&ph_busy,0);
+}
+#endif
+
 NTSTATUS WINAPI RtlQueryEnvironmentVariable( WCHAR *env, const WCHAR *name, SIZE_T namelen,
                                              WCHAR *value, SIZE_T value_length, SIZE_T *return_length )
 {
@@ -231,6 +273,9 @@ NTSTATUS WINAPI RtlQueryEnvironmentVariable( WCHAR *env, const WCHAR *name, SIZE
     SIZE_T len = 0;
     const WCHAR *var;
 
+#ifdef __arm64ec__
+    ph_environment_boundary(name,namelen);
+#endif
     if (!namelen) return nts;
 
     if (!env)
