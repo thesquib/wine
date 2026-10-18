@@ -99,6 +99,7 @@ static int vcpu_acqrel;
 static int vcpu_sigfast;
 /* shortcut: only these local Wine service IDs; validate the caller before extending this diagnostic. */
 static int vcpu_svc_wait, vcpu_svc_keyed, vcpu_svc_section, vcpu_svc_file;
+static _Atomic unsigned int svc_wait_captures;
 /* what the hook did with each data-abort alignment fault, by vcpu_acqrel_result, plus the faults it saw and the
  * ones without a valid FAR (FnV), as running totals; PMW_VCPU_PROF prints their deltas */
 static _Atomic uint64_t acqrel_result[VCPU_AR_COUNT], acqrel_seen, acqrel_fnv;
@@ -629,6 +630,7 @@ struct vcpu_level
     BOOL                callback_ran;  /* a nested callback ran other guest code on the vCPU */
     void               *cb_ret_ptr;
     ULONG               cb_ret_len;
+    unsigned int        svc_capture;  /* survives syscall-fault longjmp; 32 means no capture */
     NTSTATUS            cb_status;
 };
 
@@ -4537,6 +4539,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
     for (;;)
     {
         kind = vcpu_run( vt, &e );
+        level->svc_capture = 32;
         frame = get_syscall_frame();
         if (kind == VEL1_EXIT_UNKNOWN && vcpu_spurious_unknown( vt, &e )) kind = VEL1_EXIT_KICK;
         else vt->unknown_run = 0;
@@ -4667,6 +4670,41 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         switch (kind)
         {
         case VEL1_EXIT_SYSCALL:
+        {
+            unsigned int capture = 32;
+
+            if (e.kind == VEL1_EXIT_FAULT_SYNC)
+            {
+                capture = atomic_load( &svc_wait_captures );
+                while (capture < 32 && !atomic_compare_exchange_weak( &svc_wait_captures, &capture, capture + 1 ));
+            }
+            level->svc_capture = capture;
+            if (capture < 32)
+            {
+                ULONG64 words[16], timeout = 0;
+                ULONG code[4];
+                SIZE_T count, i, timeout_bytes;
+                ULONG_PTR timeout_ptr = e.regs.x[frame->syscall_id == 4 ? 2 : frame->syscall_id == 0x55 ? 4 : 3];
+
+                fprintf( stderr, "wine: svc-wait[%u] tid %04x id %#x pc %#llx lr %#llx sp %#llx x0 %#llx x1 %#llx x2 %#llx x3 %#llx x4 %#llx x5 %#llx x6 %#llx x7 %#llx\n",
+                         capture, (UINT)GetCurrentThreadId(), (UINT)frame->syscall_id,
+                         (unsigned long long)frame->pc, (unsigned long long)frame->lr, (unsigned long long)frame->sp,
+                         e.regs.x[0], e.regs.x[1], e.regs.x[2], e.regs.x[3], e.regs.x[4],
+                         e.regs.x[5], e.regs.x[6], e.regs.x[7] );
+                timeout_bytes = virtual_uninterrupted_read_memory( (void *)timeout_ptr, &timeout, sizeof(timeout) );
+                fprintf( stderr, "wine: svc-wait[%u] %s_bytes %lu value %#llx\n", capture,
+                         (frame->syscall_id == 0x4a || frame->syscall_id == 0x55) ? "size" : "timeout",
+                         (unsigned long)timeout_bytes, (unsigned long long)timeout );
+                count = virtual_uninterrupted_read_memory( (void *)(frame->pc - 8), code, sizeof(code) );
+                fprintf( stderr, "wine: svc-wait[%u] code_bytes %lu\n", capture, (unsigned long)count );
+                for (i = 0; i < count / sizeof(code[0]); i++)
+                    fprintf( stderr, "wine: svc-wait[%u] code+%lu %08x\n", capture, (unsigned long)(i * sizeof(code[0])), (UINT)code[i] );
+                count = virtual_uninterrupted_read_memory( (void *)frame->sp, words, sizeof(words) );
+                fprintf( stderr, "wine: svc-wait[%u] stack_bytes %lu\n", capture, (unsigned long)count );
+                for (i = 0; i < count / sizeof(words[0]); i++)
+                    fprintf( stderr, "wine: svc-wait[%u] stack+%lu %#llx\n", capture,
+                             (unsigned long)(i * sizeof(words[0])), (unsigned long long)words[i] );
+            }
             vt->syscalls++;
             level->kind = kind;
             if (!fast) vcpu_unblock_signals();  /* syscalls run with signals deliverable, as in the EL0 mode */
@@ -4674,6 +4712,7 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             ret = vcpu_dispatch_syscall( frame, &e );
             level->dispatching = FALSE;
             break;
+        }
         case VEL1_EXIT_UNIX_CALL:
             vt->unix_calls++;
             level->kind = kind;
@@ -4691,6 +4730,8 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         }
 
     syscall_return:
+        if (level->svc_capture < 32)
+            fprintf( stderr, "wine: svc-wait[%u] result %#llx\n", level->svc_capture, (unsigned long long)ret );
         if (vcpu_waitdump) wd_pop( vt, level, ret );
         if (level->done)
         {
