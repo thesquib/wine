@@ -2465,6 +2465,13 @@ typedef enum _MEMORY_INFORMATION_CLASS {
 #endif
 } MEMORY_INFORMATION_CLASS;
 
+#ifdef __WINESRC__
+/* Experimental native-only immutable JIT allocation: size must be a multiple of 64 KB.
+ * GUARD64 reserves the last 64 KB as noaccess before publication. Only full release is supported. */
+#define MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT 0x80000000
+#define MEM_EXTENDED_PARAMETER_WINE_JIT_GUARD64 0x40000000
+#endif
+
 typedef struct _MEMORY_SECTION_NAME
 {
     UNICODE_STRING SectionFileName;

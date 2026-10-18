@@ -276,6 +276,7 @@ struct file_view
 #define VPROT_FREE_PLACEHOLDER 0x0800
 #define VPROT_NATIVE           0x1000
 #define VPROT_HOSTONLY         0x2000  /* vCPU mode: never visible to the guest (kernel stacks) */
+#define VPROT_JIT              0x8000  /* native-only immutable MAP_JIT allocation */
 #define VPROT_ALIASED          0x4000  /* vCPU mode: a view of its section's anchor (vcpu_section) */
 
 #if defined(__APPLE__) && defined(__aarch64__)
@@ -3078,6 +3079,11 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
         if (view && is_guest_view( view )) return vcpu_sync_pages( view, base, size, set, clear );
     }
 
+    if (native_wx)
+    {
+        struct file_view *view = find_view( base, 0 );
+        if (view && (view->protect & VPROT_JIT)) return -1;
+    }
     size = ROUND_SIZE( base, size, host_page_mask );
 
     vprot = get_host_page_vprot( addr );
@@ -3103,6 +3109,7 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+    if (view->protect & VPROT_JIT) return FALSE;
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -6502,8 +6509,12 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
              (vprot & VPROT_COMMITTED) && (vprot & VPROT_EXEC) && (vprot & (VPROT_WRITE | VPROT_WRITECOPY)) &&
              !(vprot & VPROT_WRITEWATCH))
     {
+        struct file_view *view = find_view( page, 0 );
+        /* JIT faults must reach the caller; sigreturn would undo a per-thread toggle here. */
+        if (view && (view->protect & VPROT_JIT))
+            WARN( "access outside JIT write/execute window at %p\n", addr );
         /* W^X flip of the whole host page (see native_wx) */
-        if (!mprotect( page, fault_page_size, err == EXCEPTION_WRITE_FAULT ? PROT_READ | PROT_WRITE
+        else if (!mprotect( page, fault_page_size, err == EXCEPTION_WRITE_FAULT ? PROT_READ | PROT_WRITE
                                                                           : PROT_READ | PROT_EXEC ))
             ret = STATUS_SUCCESS;
     }
@@ -7111,6 +7122,51 @@ void virtual_prepare_wow_window(void)
 }
 
 
+/* Fresh mappings only: never open a hole in an existing view or restore over a raced mapping.
+ * shortcut: immutable JIT views, add transactional transitions only when a caller needs them. */
+static NTSTATUS map_native_jit_view( struct file_view **view, SIZE_T size, ULONG attributes )
+{
+#if defined(__APPLE__) && defined(__aarch64__)
+    const SIZE_T alignment = 0x10000;
+    char *raw, *base;
+    SIZE_T total, prefix, suffix;
+    NTSTATUS status;
+    BOOL guard = attributes & MEM_EXTENDED_PARAMETER_WINE_JIT_GUARD64;
+
+    if (!native_wx || !getenv("PMW_NATIVE_MAP_JIT") || strcmp(getenv("PMW_NATIVE_MAP_JIT"), "1"))
+        return STATUS_NOT_SUPPORTED;
+    if ((size & (alignment - 1)) || (guard && size <= alignment) || size > SIZE_MAX - alignment)
+        return STATUS_INVALID_PARAMETER;
+    total = size + alignment;
+    raw = mmap( NULL, total, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0 );
+    if (raw == MAP_FAILED) return STATUS_NO_MEMORY;
+    base = (char *)(((ULONG_PTR)raw + alignment - 1) & ~(alignment - 1));
+    prefix = base - raw;
+    suffix = total - prefix - size;
+    if (is_beyond_limit( base, size, user_space_limit ) || find_view_range( base, size ))
+    {
+        munmap( raw, total );
+        return STATUS_CONFLICTING_ADDRESSES;
+    }
+    /* Replace only our unpublished tail; MAP_FIXED is atomic and cannot clobber a foreign mapping. */
+    if (guard && mmap( base + size - alignment, alignment, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0 ) == MAP_FAILED)
+    {
+        munmap( raw, total );
+        return STATUS_NO_MEMORY;
+    }
+    if (prefix) munmap( raw, prefix );
+    if (suffix) munmap( base + size, suffix );
+    status = create_view( view, base, size, VPROT_JIT | VPROT_COMMITTED | VPROT_READ | VPROT_WRITE | VPROT_EXEC );
+    if (status) munmap( base, size );
+    else if (guard) set_page_vprot( base + size - alignment, alignment, VPROT_COMMITTED );
+    return status;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+
 /***********************************************************************
  *             allocate_virtual_memory
  *
@@ -7168,11 +7224,26 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     if (type & MEM_RESERVE_PLACEHOLDER && (protect != PAGE_NOACCESS)) return STATUS_INVALID_PARAMETER;
     if (!arm64ec_view && (attributes & MEM_EXTENDED_PARAMETER_EC_CODE)) return STATUS_INVALID_PARAMETER;
 
+    if (attributes & MEM_EXTENDED_PARAMETER_WINE_JIT_GUARD64 &&
+        !(attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT)) return STATUS_INVALID_PARAMETER;
+    if (attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT)
+    {
+        if (base || limit_low || limit_high || align ||
+            (type & ~MEM_TOP_DOWN) != (MEM_RESERVE | MEM_COMMIT) || protect != PAGE_EXECUTE_READWRITE ||
+            (attributes & ~(MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT | MEM_EXTENDED_PARAMETER_WINE_JIT_GUARD64 |
+                            MEM_EXTENDED_PARAMETER_EC_CODE))) return STATUS_INVALID_PARAMETER;
+    }
+
     /* Reserve the memory */
 
     virtual_mutex_enter( &sigset );
 
-    if ((type & MEM_RESERVE) || !base)
+    if (attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT)
+    {
+        status = map_native_jit_view( &view, size, attributes );
+        if (!status) base = view->base;
+    }
+    else if ((type & MEM_RESERVE) || !base)
     {
         if (!(status = get_vprot_flags( protect, &vprot, FALSE )))
         {
@@ -7196,6 +7267,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
     else if (type & MEM_RESET)
     {
         if (!(view = find_view( base, size ))) status = STATUS_NOT_MAPPED_VIEW;
+        else if (view->protect & VPROT_JIT) status = STATUS_NOT_SUPPORTED;
         else if (!is_guest_view( view )) madvise( base, size, MADV_DONTNEED );  /* never under gmm (rule R2) */
     }
     else  /* commit the pages */
@@ -7507,6 +7579,9 @@ NTSTATUS WINAPI NtFreeVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *si
     else if (!size && base != view->base) status = STATUS_FREE_VM_NOT_AT_BASE;
     else if ((char *)view->base + view->size - base < size && !(type & MEM_COALESCE_PLACEHOLDERS))
              status = STATUS_UNABLE_TO_FREE_VM;
+    else if ((view->protect & VPROT_JIT) &&
+             (type != MEM_RELEASE || base != view->base || (size && size != view->size)))
+        status = STATUS_NOT_SUPPORTED;
     else switch (type)
     {
     case MEM_DECOMMIT:
