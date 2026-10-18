@@ -409,7 +409,7 @@ static void *preload_reserve_end;
 static BOOL force_exec_prot;  /* whether to force PROT_EXEC on all PROT_READ mmaps */
 static BOOL enable_write_exceptions;  /* raise exception on writes to executable memory */
 /* PROTON_DARWIN native route: macOS refuses write+exec for non-MAP_JIT memory, and 4K PE sections share 16K host
- * pages. Such host pages are mapped RX and flipped to RW on a write fault and back to RX on an execute fault. */
+ * pages. Start them RW so image loading can write before signal setup; flip to RX on execute faults. */
 static BOOL native_wx;
 
 struct range_entry
@@ -1677,7 +1677,7 @@ static int get_unix_prot( BYTE vprot )
         if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
         if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
         if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
-        if (native_wx && (prot & PROT_WRITE) && (prot & PROT_EXEC)) prot &= ~PROT_WRITE;  /* RX first, see native_wx */
+        if (native_wx && (prot & PROT_WRITE) && (prot & PROT_EXEC)) prot &= ~PROT_EXEC;  /* RW first, see native_wx */
     }
     if (!prot) prot = PROT_NONE;
     return prot;
