@@ -1901,7 +1901,7 @@ NTSTATUS load_unixlib_by_name( const UNICODE_STRING *nt_name, void **handle_ret 
     }
     file[pos + len] = 0;
     file[--pos] = '/';
-    if (!ext) ext = file + pos + len;
+    if (!ext) ext = file + pos + 1 + len;  /* pos now points at the '/' */
 
     if (build_dir)
     {
