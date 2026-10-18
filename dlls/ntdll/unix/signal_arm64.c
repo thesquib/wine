@@ -1371,6 +1371,17 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
 
+#ifdef __APPLE__
+    DWORD64 esr = get_fault_esr( sigcontext );
+    unsigned int ec = esr >> 26;
+
+    /* Darwin also delivers VM protection faults as SIGBUS; preserve real alignment faults. */
+    if (native_route && (ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25) && (esr & 0x3f) != 0x21)
+    {
+        segv_handler( signal, siginfo, sigcontext );
+        return;
+    }
+#endif
     setup_exception( sigcontext, &rec );
 }
 
