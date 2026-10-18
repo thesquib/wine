@@ -2615,6 +2615,23 @@ static UINT gcd( UINT a, UINT b )
 }
 
 /* display_lock must be held */
+/* num * dpi / den packed as (den << 16) | num, as get_dpi_num_den() reads it. A mode pair with almost no common factor
+ * (e.g. an odd mode height) has no exact 16-bit fraction; use the rounded whole DPI instead of aborting. */
+static UINT dpi_fraction( UINT num, UINT dpi, UINT den )
+{
+    UINT d = gcd( num * dpi, den );
+
+    if (num * dpi / d >= 65536 || den / d >= 65536)
+    {
+        static LONG once;
+        if (!InterlockedExchange( &once, 1 )) ERR( "inexact DPI ratio %u * %u / %u, rounding\n", num, dpi, den );
+        return max( 1, (num * dpi + den / 2) / den );
+    }
+    den /= d;
+    if (den == 1) den = 0;
+    return (den << 16) | (num * dpi / d);
+}
+
 static UINT monitor_get_dpi( struct monitor *monitor, MONITOR_DPI_TYPE type, UINT *dpi_x, UINT *dpi_y )
 {
     struct source *source = monitor->source;
@@ -2623,25 +2640,8 @@ static UINT monitor_get_dpi( struct monitor *monitor, MONITOR_DPI_TYPE type, UIN
     if (!source || !(dpi = source->dpi)) dpi = system_dpi;
     if (source && type != MDT_EFFECTIVE_DPI)
     {
-        UINT num, den, d;
-
-        num = source->physical.dmPelsWidth;
-        den = source->current.dmPelsWidth;
-        d = gcd( num * dpi, den );
-        assert( num * dpi / d < 65536 );
-        assert( den / d < 65536 );
-        den /= d;
-        if (den == 1) den = 0;
-        *dpi_x = (den << 16) | (num * dpi / d);
-
-        num = source->physical.dmPelsHeight;
-        den = source->current.dmPelsHeight;
-        d = gcd( num * dpi, den );
-        assert( num * dpi / d < 65536 );
-        assert( den / d < 65536 );
-        den /= d;
-        if (den == 1) den = 0;
-        *dpi_y = (den << 16) | (num * dpi / d);
+        *dpi_x = dpi_fraction( source->physical.dmPelsWidth, dpi, source->current.dmPelsWidth );
+        *dpi_y = dpi_fraction( source->physical.dmPelsHeight, dpi, source->current.dmPelsHeight );
         if (source->physical.dmPelsWidth * source->current.dmPelsHeight <=
             source->physical.dmPelsHeight * source->current.dmPelsWidth)
             dpi_ret = *dpi_x;
