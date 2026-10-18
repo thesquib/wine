@@ -249,11 +249,53 @@ static void *try_dlopen( const char *argv0 )
 /**********************************************************************
  *           main
  */
+#if defined(__APPLE__) && defined(__aarch64__) && !defined(HAVE_WINE_PRELOADER)
+#include <spawn.h>
+#include <crt_externs.h>
+
+/* PROTON_DARWIN native route, opt-in PMW_NATIVE_4K=1: re-exec in place with 4-KB host pages, so Windows 4-KB page
+ * protections are exact (a 16-KB host page takes the union of its four pages; FEX's x86 SMC traps and write-watch
+ * break on that). Only an executable with the cross-architecture entitlement gets 4 KB; a plain execve drops back
+ * to 16 KB, which is why every native process (children included) passes through here. */
+static void native_4k_relaunch( char *argv[] )
+{
+    static const char guard[] = "PMW_NATIVE_4K_RELAUNCHED";
+    const char *opt = getenv( "PMW_NATIVE_4K" );
+    posix_spawnattr_t attr;
+    int err;
+
+    if (!opt || strcmp( opt, "1" )) return;
+    if (sysconf( _SC_PAGESIZE ) == 4096)
+    {
+        unsetenv( guard );  /* children start at 16 KB again and must relaunch themselves */
+        return;
+    }
+    if (getenv( guard ))
+    {
+        fprintf( stderr, "wine: PMW_NATIVE_4K relaunch did not give 4-KB pages, continuing at %ld\n",
+                 sysconf( _SC_PAGESIZE ) );
+        unsetenv( guard );
+        return;
+    }
+    setenv( guard, "1", 1 );
+    posix_spawnattr_init( &attr );
+    posix_spawnattr_setflags( &attr, POSIX_SPAWN_SETEXEC );
+    if (!(err = posix_spawnattr_set_4k_page_size_np( &attr )))
+        err = posix_spawn( NULL, get_self_exe(), NULL, &attr, argv, *_NSGetEnviron() );
+    posix_spawnattr_destroy( &attr );
+    fprintf( stderr, "wine: PMW_NATIVE_4K relaunch failed (%d), continuing with 16-KB pages\n", err );
+    unsetenv( guard );
+}
+#endif
+
 int main( int argc, char *argv[] )
 {
     void *handle;
 
     init_reserved_areas();
+#if defined(__APPLE__) && defined(__aarch64__) && !defined(HAVE_WINE_PRELOADER)
+    if (wine_main_native_route) native_4k_relaunch( argv );
+#endif
 
     if ((handle = try_dlopen( get_self_exe() )) ||
         (handle = try_dlopen( argv[0] )))
