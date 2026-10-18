@@ -43,6 +43,7 @@ union ARM64EC_NT_XCONTEXT {
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
+WINE_DECLARE_DEBUG_CHANNEL(ecinit);
 
 /* xtajit64.dll functions */
 static void     (WINAPI *pBTCpu64FlushInstructionCache)(const void*,SIZE_T);
@@ -611,7 +612,7 @@ DEFINE_SYSCALL(NtWriteFile, (HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, v
 DEFINE_SYSCALL(NtWriteFileGather, (HANDLE file, HANDLE event, PIO_APC_ROUTINE apc, void *apc_user, IO_STATUS_BLOCK *io, FILE_SEGMENT_ELEMENT *segments, ULONG length, LARGE_INTEGER *offset, ULONG *key))
 DEFINE_SYSCALL(NtWriteRequestData, (HANDLE handle, LPC_MESSAGE *request, ULONG id, void *buffer, ULONG len, ULONG *retlen))
 DEFINE_SYSCALL(NtWriteVirtualMemory, (HANDLE process, void *addr, const void *buffer, SIZE_T size, SIZE_T *bytes_written))
-DEFINE_SYSCALL(NtYieldExecution, (void))
+DEFINE_WRAPPED_SYSCALL(NtYieldExecution, (void))
 
 NTSTATUS SYSCALL_API NtAllocateVirtualMemory( HANDLE process, PVOID *ret, ULONG_PTR zero_bits,
                                               SIZE_T *size_ptr, ULONG type, ULONG protect )
@@ -661,6 +662,111 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
 
     leave_syscall_callback();
     return status;
+}
+
+/* Diagnostic only: bounded process-wide budget, no loader lock or unwind callbacks. */
+static LONG ecinit_yields, ecinit_exceptions;
+
+static BOOL ecinit_read( const void *address, void *out, SIZE_T size )
+{
+    MEMORY_BASIC_INFORMATION info;
+    SIZE_T got = 0, offset;
+    if (NtQueryVirtualMemory( NtCurrentProcess(), address, MemoryBasicInformation,
+                              &info, sizeof(info), NULL )) return FALSE;
+    if (info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) ||
+        !(info.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return FALSE;
+    offset = (ULONG_PTR)address - (ULONG_PTR)info.BaseAddress;
+    if (offset >= info.RegionSize || size > info.RegionSize - offset) return FALSE;
+    /* shortcut: mappings must remain stable during diagnostic reads; no unmap-race guarantee. */
+    return !NtReadVirtualMemory( NtCurrentProcess(), address, out, size, &got ) && got == size;
+}
+
+static void ecinit_env( const WCHAR *key, WCHAR *buffer, ULONG count )
+{
+    UNICODE_STRING name, value;
+    RtlInitUnicodeString( &name, key );
+    value.Buffer = buffer;
+    value.Length = 0;
+    value.MaximumLength = (count - 1) * sizeof(WCHAR);
+    if (RtlQueryEnvironmentVariable_U( NULL, &name, &value )) buffer[0] = 0;
+    else buffer[value.Length / sizeof(WCHAR)] = 0;
+}
+
+static ULONG ecinit_rva( const WCHAR *key, ULONG fallback )
+{
+    WCHAR buffer[32];
+    UNICODE_STRING value;
+    ULONG result;
+    ecinit_env( key, buffer, ARRAY_SIZE(buffer) );
+    RtlInitUnicodeString( &value, buffer );
+    if (!buffer[0] || RtlUnicodeStringToInteger( &value, 16, &result )) return fallback;
+    return result;
+}
+
+static __declspec(noinline) void ecinit_snapshot( CONTEXT *context )
+{
+    PEB_LDR_DATA ldr;
+    LDR_DATA_TABLE_ENTRY module;
+    LIST_ENTRY *head, *next;
+    WCHAR wanted[128], name[128];
+    ULONG state_rva, entry_rva, i;
+    ULONG_PTR base = 0, entry = 0, low = (ULONG_PTR)NtCurrentTeb()->Tib.StackLimit;
+    ULONG_PTR high = (ULONG_PTR)NtCurrentTeb()->Tib.StackBase, sp = context->Rsp;
+    SHORT state = 0;
+    ULONG64 words[512];
+    SIZE_T size = 0;
+    BOOL state_ok = FALSE, entry_ok = FALSE;
+
+    ecinit_env( L"PMW_ECINIT_MODULE", wanted, ARRAY_SIZE(wanted) );
+    if (!wanted[0]) wcscpy( wanted, L"preloader.dll" );
+    state_rva = ecinit_rva( L"PMW_ECINIT_STATE_RVA", 0xa1c0 );
+    entry_rva = ecinit_rva( L"PMW_ECINIT_ENTRY_RVA", 0xa078 );
+    if (ecinit_read( NtCurrentTeb()->Peb->LdrData, &ldr, sizeof(ldr) ))
+    {
+        head = &NtCurrentTeb()->Peb->LdrData->InLoadOrderModuleList;
+        for (i = 0, next = ldr.InLoadOrderModuleList.Flink; next != head && i < 128; i++)
+        {
+            if (!ecinit_read( CONTAINING_RECORD(next, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks),
+                              &module, sizeof(module) )) break;
+            next = module.InLoadOrderLinks.Flink;
+            if (module.BaseDllName.Length >= sizeof(name) ||
+                !ecinit_read( module.BaseDllName.Buffer, name, module.BaseDllName.Length )) continue;
+            name[module.BaseDllName.Length / sizeof(WCHAR)] = 0;
+            if (wcsicmp( name, wanted )) continue;
+            base = (ULONG_PTR)module.DllBase;
+            if (module.SizeOfImage >= sizeof(state) && state_rva <= module.SizeOfImage - sizeof(state))
+                state_ok = ecinit_read( (void *)(base + state_rva), &state, sizeof(state) );
+            if (module.SizeOfImage >= sizeof(entry) && entry_rva <= module.SizeOfImage - sizeof(entry))
+                entry_ok = ecinit_read( (void *)(base + entry_rva), &entry, sizeof(entry) );
+            break;
+        }
+    }
+    TRACE_(ecinit)( "snapshot tid %p rip %I64x rsp %I64x rbp %I64x bounds %Ix-%Ix module %s base %Ix state_ok %u state %x entry_ok %u entry %Ix\n",
+                    NtCurrentTeb()->ClientId.UniqueThread, context->Rip, context->Rsp, context->Rbp,
+                    low, high, debugstr_w(wanted), base, state_ok, (unsigned short)state, entry_ok, entry );
+    if (sp >= low && sp < high) size = min( sizeof(words), high - sp ) & ~(SIZE_T)7;
+    if (!size || !ecinit_read( (void *)sp, words, size ))
+    {
+        TRACE_(ecinit)( "stack unreadable size %Iu\n", size );
+        return;
+    }
+    TRACE_(ecinit)( "stack bytes %Iu; values are not validated frames\n", size );
+    for (i = 0; i < size / sizeof(words[0]); i++)
+        TRACE_(ecinit)( "stack %Ix %I64x\n", sp + i * sizeof(words[0]), words[i] );
+}
+
+NTSTATUS SYSCALL_API NtYieldExecution(void)
+{
+    /* Saturate so a long-running process cannot wrap the diagnostic counter. */
+    if (TRACE_ON(ecinit) && ReadAcquire( &ecinit_yields ) < 4096 &&
+        InterlockedIncrement( &ecinit_yields ) == 4096)
+    {
+        CONTEXT context;
+        RtlCaptureContext( &context );
+        ecinit_snapshot( &context );
+    }
+    return syscall_NtYieldExecution();
 }
 
 NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
@@ -1314,6 +1420,13 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
     RtlInitializeExtendedContext( context, ctx_flags_arm_to_x64( arm_ctx->ContextFlags ), &xctx );
     context_arm_to_x64( &context->context, arm_ctx );
     if (pResetToConsistentState) pResetToConsistentState( rec, &context->context.AMD64_Context, arm_ctx );
+    if (TRACE_ON(ecinit) && ReadAcquire( &ecinit_exceptions ) < 8 &&
+        InterlockedIncrement( &ecinit_exceptions ) <= 8)
+        TRACE_(ecinit)( "exception tid %p code %lx address %p access %Ix rip %I64x rsp %I64x\n",
+                        NtCurrentTeb()->ClientId.UniqueThread, rec->ExceptionCode, rec->ExceptionAddress,
+                        rec->NumberParameters > 1 ? rec->ExceptionInformation[1] : 0,
+                        context->context.AMD64_Context.Rip, context->context.AMD64_Context.Rsp );
+
     /* call x64 dispatcher if the thunk or the function pointer was modified */
     if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
                                              sizeof(KiUserExceptionDispatcher_orig) ))
