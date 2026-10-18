@@ -2558,11 +2558,92 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
 #include <Hypervisor/Hypervisor.h>
 #include <os/object.h>
 
+static DWORD get_native_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs,
+                                     WORD logical_thread_id )
+{
+    /* The ID registers can't be read from user space and the kernel only reports features that
+     * are common to all cores, so build the fields from those. Fields are listed in ascending
+     * order of their value, the remaining ones are left as zero. */
+    static const struct
+    {
+        WORD        reg;
+        BYTE        shift;
+        BYTE        value;
+        const char *feature;
+    }
+    fields[] =
+    {
+        { 0x4020, 16, 1, "FEAT_FP16" },       /* ID_AA64PFR0_EL1.FP */
+        { 0x4020, 20, 1, "FEAT_FP16" },       /* ID_AA64PFR0_EL1.AdvSIMD */
+        { 0x4020, 48, 1, "FEAT_DIT" },        /* ID_AA64PFR0_EL1.DIT */
+        { 0x4020, 56, 1, "FEAT_CSV2" },       /* ID_AA64PFR0_EL1.CSV2 */
+        { 0x4020, 60, 1, "FEAT_CSV3" },       /* ID_AA64PFR0_EL1.CSV3 */
+        { 0x4021,  0, 1, "FEAT_BTI" },        /* ID_AA64PFR1_EL1.BT */
+        { 0x4021,  4, 1, "FEAT_SSBS" },       /* ID_AA64PFR1_EL1.SSBS */
+        { 0x4021,  8, 1, "FEAT_MTE" },        /* ID_AA64PFR1_EL1.MTE */
+        { 0x4021,  8, 2, "FEAT_MTE2" },
+        { 0x4021,  8, 3, "FEAT_MTE3" },
+        { 0x4021, 24, 1, "FEAT_SME" },        /* ID_AA64PFR1_EL1.SME */
+        { 0x4021, 24, 2, "FEAT_SME2" },
+        { 0x4030,  4, 1, "FEAT_AES" },        /* ID_AA64ISAR0_EL1.AES */
+        { 0x4030,  4, 2, "FEAT_PMULL" },
+        { 0x4030,  8, 1, "FEAT_SHA1" },       /* ID_AA64ISAR0_EL1.SHA1 */
+        { 0x4030, 12, 1, "FEAT_SHA256" },     /* ID_AA64ISAR0_EL1.SHA2 */
+        { 0x4030, 12, 2, "FEAT_SHA512" },
+        { 0x4030, 16, 1, "FEAT_CRC32" },      /* ID_AA64ISAR0_EL1.CRC32 */
+        { 0x4030, 20, 2, "FEAT_LSE" },        /* ID_AA64ISAR0_EL1.Atomic */
+        { 0x4030, 28, 1, "FEAT_RDM" },        /* ID_AA64ISAR0_EL1.RDM */
+        { 0x4030, 32, 1, "FEAT_SHA3" },       /* ID_AA64ISAR0_EL1.SHA3 */
+        { 0x4030, 44, 1, "FEAT_DotProd" },    /* ID_AA64ISAR0_EL1.DP */
+        { 0x4030, 48, 1, "FEAT_FHM" },        /* ID_AA64ISAR0_EL1.FHM */
+        { 0x4030, 52, 1, "FEAT_FlagM" },      /* ID_AA64ISAR0_EL1.TS */
+        { 0x4030, 52, 2, "FEAT_FlagM2" },
+        { 0x4031,  0, 1, "FEAT_DPB" },        /* ID_AA64ISAR1_EL1.DPB */
+        { 0x4031,  0, 2, "FEAT_DPB2" },
+        { 0x4031, 12, 1, "FEAT_JSCVT" },      /* ID_AA64ISAR1_EL1.JSCVT */
+        { 0x4031, 16, 1, "FEAT_FCMA" },       /* ID_AA64ISAR1_EL1.FCMA */
+        { 0x4031, 20, 1, "FEAT_LRCPC" },      /* ID_AA64ISAR1_EL1.LRCPC */
+        { 0x4031, 20, 2, "FEAT_LRCPC2" },
+        { 0x4031, 32, 1, "FEAT_FRINTTS" },    /* ID_AA64ISAR1_EL1.FRINTTS */
+        { 0x4031, 36, 1, "FEAT_SB" },         /* ID_AA64ISAR1_EL1.SB */
+        { 0x4031, 40, 1, "FEAT_SPECRES" },    /* ID_AA64ISAR1_EL1.SPECRES */
+        { 0x4031, 40, 2, "FEAT_SPECRES2" },
+        { 0x4031, 44, 1, "FEAT_BF16" },       /* ID_AA64ISAR1_EL1.BF16 */
+        { 0x4031, 44, 2, "FEAT_EBF16" },
+        { 0x4031, 52, 1, "FEAT_I8MM" },       /* ID_AA64ISAR1_EL1.I8MM */
+        { 0x4032,  0, 2, "FEAT_WFxT" },       /* ID_AA64ISAR2_EL1.WFxT */
+        { 0x4032,  4, 1, "FEAT_RPRES" },      /* ID_AA64ISAR2_EL1.RPRES */
+        { 0x4032, 20, 1, "FEAT_HBC" },        /* ID_AA64ISAR2_EL1.BC */
+        { 0x4032, 52, 1, "FEAT_CSSC" },       /* ID_AA64ISAR2_EL1.CSSC */
+        { 0x4032, 56, 1, "FEAT_LUT" },        /* ID_AA64ISAR2_EL1.LUT */
+        { 0x4038, 60, 1, "FEAT_ECV" },        /* ID_AA64MMFR0_EL1.ECV */
+        { 0x4039, 44, 1, "FEAT_AFP" },        /* ID_AA64MMFR1_EL1.AFP */
+        { 0x403a, 32, 1, "FEAT_LSE2" },       /* ID_AA64MMFR2_EL1.AT */
+    };
+    DWORD regidx = 0;
+    unsigned int i;
+
+    regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ 0x4000, cpu_id }; /* MIDR_EL1 */
+
+    for (i = 0; i < ARRAY_SIZE(fields); i++)
+    {
+        if (!i || fields[i].reg != fields[i - 1].reg)
+        {
+            /* AArch64 only at EL0 and EL1 */
+            UINT64 value = fields[i].reg == 0x4020 ? 0x11 : 0;
+            regs[regidx++] = (struct smbios_wine_id_reg_value_arm64){ fields[i].reg, value };
+        }
+        if (!has_feature( fields[i].feature )) continue;
+        regs[regidx - 1].value &= ~((UINT64)0xf << fields[i].shift);
+        regs[regidx - 1].value |= (UINT64)fields[i].value << fields[i].shift;
+    }
+    return regidx;
+}
+
 /* macOS gives user space no view of the ID registers. Hypervisor.framework reports the values a vCPU created from
  * a default configuration sees, which in the vCPU mode (PMW_VCPU) is exactly what the Windows code, including an
  * ARM64EC emulator reading "CP xxxx" under CentralProcessor, runs against (ntdll links the framework for that mode,
- * vcpu_el1_live_arm64.c). Without the hypervisor entitlement the config cannot be created and nothing is reported,
- * as before. MIDR_EL1 is not a feature register there and stays unpopulated. ID_AA64ISAR2_EL1 is not one either;
+ * vcpu_el1_live_arm64.c). The native route uses sysctl feature flags instead. MIDR_EL1 is not a feature register there and stays unpopulated. ID_AA64ISAR2_EL1 is not one either;
  * it is built from the host's sysctl feature flags, RPRES only (FEAT_RPRES, bits [7:4]): without it an emulator
  * lowers x86 rcp/rsqrt estimates to a divide and a square root (openrosetta 2026-09-30: rsqrt about 2x slower than
  * with frecpe/frsqrte, and a different result from Rosetta 2's). WFxT is deliberately left out: it would advertise
@@ -2583,9 +2664,12 @@ static DWORD get_core_id_regs_arm64( struct smbios_wine_id_reg_value_arm64 *regs
         { HV_FEATURE_REG_ID_AA64MMFR2_EL1, 0x403a },
         { HV_FEATURE_REG_CTR_EL0,          0x5801 },
     };
-    hv_vcpu_config_t config = hv_vcpu_config_create();
+    hv_vcpu_config_t config;
     DWORD i, regidx = 0;
     uint64_t value;
+
+    if (native_route) return get_native_core_id_regs_arm64( regs, logical_thread_id );
+    config = hv_vcpu_config_create();
 
     if (!config)
     {
