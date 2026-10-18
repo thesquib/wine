@@ -253,7 +253,7 @@ static void *try_dlopen( const char *argv0 )
 #include <spawn.h>
 #include <crt_externs.h>
 
-/* PROTON_DARWIN native route, opt-in PMW_NATIVE_4K=1: re-exec in place with 4-KB host pages, so Windows 4-KB page
+/* PROTON_DARWIN native route, default on (PMW_NATIVE_4K=0 turns it off): re-exec in place with 4-KB host pages, so Windows 4-KB page
  * protections are exact (a 16-KB host page takes the union of its four pages; FEX's x86 SMC traps and write-watch
  * break on that). Only an executable with the cross-architecture entitlement gets 4 KB; a plain execve drops back
  * to 16 KB, which is why every native process (children included) passes through here. */
@@ -264,7 +264,7 @@ static void native_4k_relaunch( char *argv[] )
     posix_spawnattr_t attr;
     int err;
 
-    if (!opt || strcmp( opt, "1" )) return;
+    if (opt && !strcmp( opt, "0" )) return;
     if (sysconf( _SC_PAGESIZE ) == 4096)
     {
         unsetenv( guard );  /* children start at 16 KB again and must relaunch themselves */
