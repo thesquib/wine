@@ -1328,6 +1328,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     else if (esr & 0x40) rec.ExceptionInformation[0] = EXCEPTION_WRITE_FAULT;
     else rec.ExceptionInformation[0] = EXCEPTION_READ_FAULT;
     rec.ExceptionInformation[1] = (ULONG_PTR)siginfo->si_addr;
+    rec.ExceptionAddress = (void *)PC_sig(context);  /* for virtual_handle_fault diagnostics; setup_exception resets it */
     if (!virtual_handle_fault( &rec, (void *)SP_sig(context) )) return;
     if (handle_syscall_fault( context, &rec )) return;
     setup_exception( context, &rec );

@@ -6512,7 +6512,8 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
         struct file_view *view = find_view( page, 0 );
         /* JIT faults must reach the caller; sigreturn would undo a per-thread toggle here. */
         if (view && (view->protect & VPROT_JIT))
-            WARN( "access outside JIT write/execute window at %p\n", addr );
+            WARN( "access outside JIT write/execute window at %p (%s, pc %p)\n", addr,
+                  err == EXCEPTION_WRITE_FAULT ? "write" : "execute", rec->ExceptionAddress );
         /* W^X flip of the whole host page (see native_wx) */
         else if (!mprotect( page, fault_page_size, err == EXCEPTION_WRITE_FAULT ? PROT_READ | PROT_WRITE
                                                                           : PROT_READ | PROT_EXEC ))
@@ -7124,7 +7125,7 @@ void virtual_prepare_wow_window(void)
 
 /* Fresh mappings only: never open a hole in an existing view or restore over a raced mapping.
  * shortcut: immutable JIT views, add transactional transitions only when a caller needs them. */
-static NTSTATUS map_native_jit_view( struct file_view **view, SIZE_T size, ULONG attributes )
+static NTSTATUS map_native_jit_view( struct file_view **view, SIZE_T size, ULONG attributes, ULONG_PTR limit_low )
 {
 #if defined(__APPLE__) && defined(__aarch64__)
     const SIZE_T alignment = 0x10000;
@@ -7143,7 +7144,8 @@ static NTSTATUS map_native_jit_view( struct file_view **view, SIZE_T size, ULONG
     base = (char *)(((ULONG_PTR)raw + alignment - 1) & ~(alignment - 1));
     prefix = base - raw;
     suffix = total - prefix - size;
-    if (is_beyond_limit( base, size, user_space_limit ) || find_view_range( base, size ))
+    /* limit_low is only checked, never used as a hint: WoW64 FEX asks for memory above the 32-bit space */
+    if ((ULONG_PTR)base < limit_low || is_beyond_limit( base, size, user_space_limit ) || find_view_range( base, size ))
     {
         munmap( raw, total );
         return STATUS_CONFLICTING_ADDRESSES;
@@ -7228,7 +7230,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
         !(attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT)) return STATUS_INVALID_PARAMETER;
     if (attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT)
     {
-        if (base || limit_low || limit_high || align ||
+        if (base || limit_high || align ||
             (type & ~MEM_TOP_DOWN) != (MEM_RESERVE | MEM_COMMIT) || protect != PAGE_EXECUTE_READWRITE ||
             (attributes & ~(MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT | MEM_EXTENDED_PARAMETER_WINE_JIT_GUARD64 |
                             MEM_EXTENDED_PARAMETER_EC_CODE))) return STATUS_INVALID_PARAMETER;
@@ -7240,7 +7242,7 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
 
     if (attributes & MEM_EXTENDED_PARAMETER_WINE_UNIX_JIT)
     {
-        status = map_native_jit_view( &view, size, attributes );
+        status = map_native_jit_view( &view, size, attributes, limit_low );
         if (!status) base = view->base;
     }
     else if ((type & MEM_RESERVE) || !base)
