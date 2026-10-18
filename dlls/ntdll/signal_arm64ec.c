@@ -43,7 +43,9 @@ union ARM64EC_NT_XCONTEXT {
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 WINE_DECLARE_DEBUG_CHANNEL(relay);
+WINE_DECLARE_DEBUG_CHANNEL(ecsyscall);
 WINE_DECLARE_DEBUG_CHANNEL(ecinit);
+WINE_DECLARE_DEBUG_CHANNEL(ecfault);
 
 /* xtajit64.dll functions */
 static void     (WINAPI *pBTCpu64FlushInstructionCache)(const void*,SIZE_T);
@@ -1397,6 +1399,36 @@ __ASM_GLOBAL_FUNC( "#KiUserEmulationDispatcher",
 /*******************************************************************
  *		dispatch_syscall
  */
+/* Clip diagnostics to one committed readable region before entering the host read. */
+static void trace_syscall_memory( const char *name, ULONG_PTR address, SIZE_T size,
+                                  SIZE_T before, BOOL fault )
+{
+    BYTE bytes[128];
+    SIZE_T i, offset;
+    MEMORY_BASIC_INFORMATION info;
+    struct __wine_debug_channel *channel = fault ? &__wine_dbch_ecfault : &__wine_dbch_ecsyscall;
+
+    if (NtQueryVirtualMemory( NtCurrentProcess(), (void *)address, MemoryBasicInformation,
+                              &info, sizeof(info), NULL )) return;
+    offset = address - (ULONG_PTR)info.BaseAddress;
+    if (offset >= info.RegionSize) return;
+    before = min( before, offset );
+    address -= before;
+    offset -= before;
+    size = min( min( size, sizeof(bytes) ), info.RegionSize - offset );
+    __WINE_DPRINTF(_TRACE,channel)( "%s address %p allocation %p region %p size %Ix state %lx protect %lx type %lx\n",
+                                  name, (void *)address, info.AllocationBase, info.BaseAddress,
+                                  info.RegionSize, info.State, info.Protect, info.Type );
+    if (!size || !ecinit_read( (void *)address, bytes, size ))
+    {
+        __WINE_DPRINTF(_TRACE,channel)( "%s skipped unreadable range\n", name );
+        return;
+    }
+    __WINE_DPRINTF(_TRACE,channel)( "%s read status 0 bytes %Iu\n", name, size );
+    for (i = 0; i < size; i++)
+        __WINE_DPRINTF(_TRACE,channel)( "%s +%02Ix %02x\n", name, i, bytes[i] );
+}
+
 static void dispatch_syscall( ARM64_NT_CONTEXT *context )
 {
     if (context->X8 < __nb_syscalls)  /* syscall number in rax */
@@ -1405,7 +1437,20 @@ static void dispatch_syscall( ARM64_NT_CONTEXT *context )
         context->X4 = context->Pc;  /* and save return address to syscall thunk */
         context->Pc = (ULONG_PTR)invoke_arm64ec_syscall;
     }
-    else context->X8 = STATUS_INVALID_SYSTEM_SERVICE;  /* set return value in rax */
+    else
+    {
+        TRACE_(ecsyscall)( "ARM64EC rejected syscall %I64x at %I64x (limit %x)\n",
+                         context->X8, context->Pc - 2, __nb_syscalls );
+        if (TRACE_ON(ecsyscall))
+        {
+            TRACE_(ecsyscall)( "caller rip %I64x rsp %I64x rbp %I64x rax %I64x rcx %I64x rdx %I64x r8 %I64x r9 %I64x r10 %I64x r11 %I64x\n",
+                              context->Pc, context->Sp, context->Fp, context->X8, context->X0, context->X1,
+                              context->X2, context->X3, context->X4, context->X5 );
+            trace_syscall_memory( "code", context->Pc, 64, 18, FALSE );
+            trace_syscall_memory( "stack", context->Sp, 128, 0, FALSE );
+        }
+        context->X8 = STATUS_INVALID_SYSTEM_SERVICE;  /* set return value in rax */
+    }
 
     /* return to x64 code so that the syscall entry thunk is invoked properly */
     get_arm64ec_cpu_area()->InSimulation = 1;
