@@ -1412,6 +1412,8 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
     ULONG_PTR page = ptr / page_size;
+    /* Match the 64-bit user-space ceiling used by unix/virtual.c. */
+    if (ptr >= 0x7fffffff0000ULL) return FALSE;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
