@@ -97,6 +97,8 @@ static int vcpu_acqrel;
  * pair (two sigprocmask syscalls per exit). =2 also checks, with a mask query per exit, that no signal of the set is
  * blocked on that path, and reports the first offender. The argument is at vcpu_loop's fast path. */
 static int vcpu_sigfast;
+/* shortcut: only these local Wine service IDs; validate the caller before extending this diagnostic. */
+static int vcpu_svc_wait, vcpu_svc_keyed, vcpu_svc_section, vcpu_svc_file;
 /* what the hook did with each data-abort alignment fault, by vcpu_acqrel_result, plus the faults it saw and the
  * ones without a valid FAR (FnV), as running totals; PMW_VCPU_PROF prints their deltas */
 static _Atomic uint64_t acqrel_result[VCPU_AR_COUNT], acqrel_seen, acqrel_fnv;
@@ -4318,6 +4320,7 @@ static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_ex
     SYSTEM_SERVICE_TABLE *table = thread_data->syscall_table + ((id >> 12) & 3);
     UINT num = id & 0xfff;
     ULONG64 args[32], ret;
+    const ULONG64 *stack_args = (const ULONG64 *)frame->sp;
     ULONG size, stack_bytes;
     void *func;
 
@@ -4332,13 +4335,15 @@ static ULONG64 vcpu_dispatch_syscall( struct syscall_frame *frame, const vel1_ex
                  "proton-darwin mac/vcpu/gen/gen_syscall_shims.py: ntdll, win32u vcpu_shims_arm64.c)\n", id );
         abort_process( 1 );
     }
+    /* The raw NtCreateFile stub reserves 16 bytes; preserve frame->sp for its return epilogue. */
+    if (e->kind == VEL1_EXIT_FAULT_SYNC && id == 0x55) stack_args += 2;
     memcpy( args, e->regs.x, 8 * sizeof(args[0]) );
     if (thread_data->syscall_trace)
     {
-        memcpy( args + 8, (void *)frame->sp, min( stack_bytes, sizeof(args) - 64 ));
+        memcpy( args + 8, stack_args, min( stack_bytes, sizeof(args) - 64 ));
         trace_syscall( id, (ULONG_PTR *)args, size );
     }
-    ret = vcpu_call_syscall( func, args, (const ULONG64 *)frame->sp, stack_bytes );
+    ret = vcpu_call_syscall( func, args, stack_args, stack_bytes );
     if (thread_data->syscall_trace) trace_sysret( id, ret );
     return ret;
 }
@@ -4541,12 +4546,6 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
         {
         case VEL1_EXIT_SYSCALL:
             vcpu_frame_from_syscall_exit( frame, &e );
-            if (vcpu_waitdump) wd_push( vt, level, FALSE, &e, frame );
-            if (prof_interval)
-            {
-                vt->prof_charge = prof_sys_bucket( frame->syscall_id );
-                if (!vt->wait_t0 && prof_sys_blocks( frame->syscall_id )) prof_wait_start( vt );
-            }
             break;
         case VEL1_EXIT_UNIX_CALL:
             vcpu_frame_from_unix_call_exit( frame, &e );
@@ -4570,10 +4569,38 @@ static void vcpu_loop( struct vcpu_thread *vt, struct vcpu_level *level )
             vt->hv_depth--;
             if (err) vcpu_fatal_exit( vt, &e, NULL );
             vcpu_frame_from_regs( frame, &regs );
+            if (kind == VEL1_EXIT_FAULT_SYNC && e.fclass == VEL1_FC_SVC &&
+                ((vcpu_svc_wait && e.iss_imm == 4) || (vcpu_svc_keyed && e.iss_imm == 0x101) ||
+                 (vcpu_svc_section && e.iss_imm == 0x4a) || (vcpu_svc_file && e.iss_imm == 0x55)))
+            {
+                SYSTEM_SERVICE_TABLE *table = ntdll_get_thread_data()->syscall_table;
+
+                ULONG_PTR expected = e.iss_imm == 4 ? (ULONG_PTR)NtWaitForSingleObject :
+                                     e.iss_imm == 0x101 ? (ULONG_PTR)NtWaitForKeyedEvent :
+                                     e.iss_imm == 0x4a ? (ULONG_PTR)NtCreateSection : (ULONG_PTR)NtCreateFile;
+
+                if (table->ServiceLimit <= e.iss_imm || table->ServiceTable[e.iss_imm] != expected)
+                    vcpu_fatal( "SVC %#x does not match the expected local service\n", e.iss_imm );
+                e.regs = regs;
+                e.regs.x[8] = frame->syscall_id = e.iss_imm;
+                /* A vector exit needs CPSR restored too; the dispatcher fast return only writes PC/LR/x0. */
+                frame->restore_flags = CONTEXT_CONTROL;
+                kind = VEL1_EXIT_SYSCALL;
+            }
             break;
         }
         default:
             vcpu_fatal_exit( vt, &e, NULL );
+        }
+
+        if (kind == VEL1_EXIT_SYSCALL)
+        {
+            if (vcpu_waitdump) wd_push( vt, level, FALSE, &e, frame );
+            if (prof_interval)
+            {
+                vt->prof_charge = prof_sys_bucket( frame->syscall_id );
+                if (!vt->wait_t0 && prof_sys_blocks( frame->syscall_id )) prof_wait_start( vt );
+            }
         }
 
         /* PMW_VCPU_STALLPC / PMW_VCPU_SAMPLE_MS: a diagnostics kick; nothing to write back, the vCPU still holds
@@ -5012,6 +5039,10 @@ void vcpu_init_process(void)
     fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_ACQREL=%d (host emulation of misaligned ldar/ldapr/stlr in "
              "image code %s)\n", (int)getpid(), vcpu_acqrel, vcpu_acqrel ? "on" : "off" );
 
+    vcpu_svc_wait = (env = getenv( "PMW_VCPU_SVC_WAIT" )) && !strcmp( env, "1" );
+    vcpu_svc_keyed = (env = getenv( "PMW_VCPU_SVC_KEYED" )) && !strcmp( env, "1" );
+    vcpu_svc_section = (env = getenv( "PMW_VCPU_SVC_SECTION" )) && !strcmp( env, "1" );
+    vcpu_svc_file = (env = getenv( "PMW_VCPU_SVC_FILE" )) && !strcmp( env, "1" );
     vcpu_sigfast = (env = getenv( "PMW_VCPU_SIGFAST" )) ? atoi( env ) : 1;
     fprintf( stderr, "wine: vCPU mode: pid %d PMW_VCPU_SIGFAST=%d (no sigprocmask pair on syscall / unix-call exits "
              "%s)\n", (int)getpid(), vcpu_sigfast, vcpu_sigfast ? "on" : "off" );
