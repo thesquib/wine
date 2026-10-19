@@ -132,12 +132,18 @@ BOOL WINAPI DECLSPEC_HOTPATCH FlushViewOfFile( const void *base, SIZE_T size )
 /****************************************************************************
  *           FlushInstructionCache   (kernelbase.@)
  */
-#if defined(__i386__) || (defined(__x86_64__) && !defined(__arm64ec__))
+#if defined(__x86_64__) && !defined(__arm64ec__)
 BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID addr, SIZE_T size )
 {
     /* X86 processors have coherent instruction and data caches, no need to do anything. Not under ARM64EC (whose
      * compilers define __x86_64__ too): the emulator learns of a code write through another mapping only here */
     return TRUE;
+}
+#elif defined(__i386__)
+BOOL WINAPI DECLSPEC_HOTPATCH FlushInstructionCache( HANDLE process, LPCVOID addr, SIZE_T size )
+{
+    /* Under WoW64 the syscall thunk tells the emulator (BTCpuFlushInstructionCache2, or a cross-process notification) */
+    return set_ntstatus( NtFlushInstructionCache( process, addr, size ));
 }
 #else
 static BOOL __attribute__((used)) flush_instruction_cache( HANDLE process, LPCVOID addr, SIZE_T size )
