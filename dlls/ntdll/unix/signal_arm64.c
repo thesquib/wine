@@ -1371,6 +1371,17 @@ static void bus_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_DATATYPE_MISALIGNMENT };
 
+#ifdef __APPLE__
+    /* XNU reports a write to a read-only shared mapping (a vCPU shared image run's host remap) as SIGBUS, si_code
+     * BUS_ADRALN like a real misalignment: only the fault status (ESR DFSC 0x21 = alignment fault) tells them apart.
+     * The rest is an access violation, which a syscall's __TRY (virtual_check_buffer_for_write) must see as one. */
+    if ((get_fault_esr( sigcontext ) & 0x3f) != 0x21)
+    {
+        segv_handler( signal, siginfo, sigcontext );
+        return;
+    }
+#endif
+
     setup_exception( sigcontext, &rec );
 }
 
