@@ -2431,7 +2431,9 @@ static int page_ident(uint64_t va, uint64_t *obj, uint64_t *off) {  // the PARAN
   return page_ident_depth(va, obj, off, &depth);
 }
 
-// Layer 3, the remap identity check: every host entry over [va, va+len) is tag 252, protection exactly READ|WRITE,
+// Layer 3, the remap identity check: every host entry over [va, va+len) is tag 252, protection exactly READ|WRITE or
+// (v13) exactly READ -- a read-only remap keeps host-side writes out of a shared run; it reads SM_TRUESHARED with the
+// anchor's object, offset and page_info depth like a RW one (N22ro), and HVF never maps the view, only the anchor --
 // VM_INHERIT_NONE, not a submap, not file-backed, and maps the SAME VM object at the SAME object offset as the anchor
 // at off + (p - va): the 32-bit region object_id and the offset arithmetic, and the 64-bit page_ident of the first
 // page of every stretch (K5: a missing remap, a wrong offset or another anchor's remap all fail, and a 32-bit hash
@@ -2452,7 +2454,8 @@ static int view_remap_ok(const gmm_sect_t *s, uint64_t off, uint64_t va, uint64_
     host_region_t v, a;
     if (host_region_at(p, &v) != 0 || v.start > p || host_region_at(ap, &a) != 0 || a.start > ap) return 0;
     if (v.is_submap || a.is_submap || v.tag != GMM_ANCHOR_TAG || a.tag != GMM_ANCHOR_TAG || v.external_pager ||
-        (v.prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_WRITE) ||
+        ((v.prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != (VM_PROT_READ | VM_PROT_WRITE) &&
+         (v.prot & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) != VM_PROT_READ) ||
         v.inherit != VM_INHERIT_NONE || v.share_mode != SM_TRUESHARED)
       return 0;
     if (!v.object_id || v.object_id != a.object_id || v.offset + (p - v.start) != a.offset + (ap - a.start)) return 0;

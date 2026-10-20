@@ -574,8 +574,9 @@ gmm_vfault_t gmm_vm_fault(gmm_t *gmm, uint64_t far, uint64_t esr);
 //
 // Caller rules (gmm README "Wine M1 fixes", R8-R12): the anchor is never mprotected, munmapped, madvised or
 // MAP_FIXED until gmm_sect_destroy returned 0 (R8); a view's host side is only ever the remap, made BEFORE
-// gmm_view_alias, never mprotected (it stays RW) and never executable, replaced only after gmm_view_unmap returned
-// (R9; the kernel does NOT refuse PROT_READ|PROT_EXEC on tagged memory); unmap order R10; exact views R11. With
+// gmm_view_alias, READ|WRITE or (v13) READ-only as made, never mprotected while registered and never executable,
+// replaced only after gmm_view_unmap returned (R9; the kernel does NOT refuse PROT_READ|PROT_EXEC on tagged memory);
+// unmap order R10; exact views R11. With
 // GMM_CFG_PARANOID, identity (tag-250) memory aliased onto itself is refused too (GMM_EGUARD): its physical page, keyed
 // by the full 64-bit VM object id, already stage-2 mapped at another VA.
 typedef struct gmm_sect gmm_sect_t;
@@ -628,7 +629,8 @@ int gmm_sect_destroy(gmm_t *gmm, gmm_sect_t *sect);
 //   va % 16K == 0, off % 16K == 0, size % 4K == 0, off + size <= the section's size; else GMM_EINVAL (the view is
 //   not host-congruent: keep the caller's copy path).
 //   The caller has ALREADY made [va, round16K(va+size)) a mach_vm_remap(copy=FALSE, ..., VM_INHERIT_NONE) of
-//   anchor+off. gmm checks it at every host entry: tag 252, protection exactly READ|WRITE, VM_INHERIT_NONE, not a
+//   anchor+off. gmm checks it at every host entry: tag 252, protection exactly READ|WRITE or (v13) exactly READ (a
+//   read-only remap keeps host-side writes out of a shared section; EXECUTE is always refused), VM_INHERIT_NONE, not a
 //   submap, not file-backed, truly shared (SM_TRUESHARED, with the anchor's page_info depth) and the same VM object
 //   (its full 64-bit id) and object offset as the anchor at that offset; else GMM_EGUARD, nothing registered. A
 //   copy=TRUE (copy-on-write) remap is refused by the SM_TRUESHARED/depth check: it is never truly shared with the

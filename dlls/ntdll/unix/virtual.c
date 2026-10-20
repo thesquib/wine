@@ -2908,9 +2908,12 @@ static BOOL vcpu_image_run_alias( struct file_view *view, struct vcpu_section *s
     /* the run's pages were committed by the read: gmm must give them up before the host pages change (R2, R3) */
     vcpu_revoke_pages( base, size );
     vcpu_assert_s2_unmapped( base, size );
-    kr = mach_vm_remap( mach_task_self(), &addr, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-                        (mach_vm_address_t)(UINT_PTR)(section->anchor + offset), FALSE, &cur_prot, &max_prot,
-                        VM_INHERIT_NONE );
+    /* read-only on the host too (gmm v13): a host-side write into a shared run (a syscall's output buffer) faults
+     * like the guest's would, instead of writing every process's bytes (openrosetta review I1) */
+    cur_prot = max_prot = VM_PROT_READ;
+    kr = mach_vm_remap_new( mach_task_self(), &addr, size, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
+                            (mach_vm_address_t)(UINT_PTR)(section->anchor + offset), FALSE, &cur_prot, &max_prot,
+                            VM_INHERIT_NONE );
     if (kr != KERN_SUCCESS)
     {
         ERR( "vCPU mode: remap of image run %p-%p failed: kern_return_t %d\n", base, base + size, kr );
