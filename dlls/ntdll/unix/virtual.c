@@ -2963,10 +2963,17 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
     HANDLE handle = 0;
     struct stat st;
     char *map;
+    int why = 0;
 
-    if (vcpu_shared_images_level() <= 0 || !vcpu_shared_sections || is_wow64() ||
-        view->size < VCPU_IMAGE_MIN_SIZE || ((UINT_PTR)view->base & (VCPU_IMAGE_CHUNK - 1)))
+    if (vcpu_shared_images_level() <= 0) return;
+    if (!vcpu_shared_sections || is_wow64() || view->size < VCPU_IMAGE_MIN_SIZE ||
+        ((UINT_PTR)view->base & (VCPU_IMAGE_CHUNK - 1)))
+    {
+        if (vcpu_shared_images >= 3)
+            fprintf( stderr, "[SHARED-IMAGES] pid %d image %p size %#zx not shared (shared sections %d, wow64 %d)\n",
+                     (int)getpid(), view->base, view->size, vcpu_shared_sections, is_wow64() );
         return;
+    }
 
     SERVER_START_REQ( get_image_share )
     {
@@ -2981,40 +2988,43 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
         }
     }
     SERVER_END_REQ;
+    if (vcpu_shared_images >= 3)
+        fprintf( stderr, "[SHARED-IMAGES] pid %d image %p size %#zx: get_image_share status %#x state %d runs %u\n",
+                 (int)getpid(), view->base, view->size, status, state, nb_runs );
     if (status || state == IMAGE_SHARE_NONE) return;
 
+    /* the fd may be the handle's cached one: the handle stays open until done */
     status = server_get_unix_fd( handle, FILE_READ_DATA | FILE_WRITE_DATA, &fd, &needs_close, NULL, NULL );
-    NtClose( handle );
-    if (status) goto drop;
+    if (status) { why = __LINE__; goto drop; }
 
     if (state == IMAGE_SHARE_FILL)
     {
-        if (!(nb_runs = vcpu_image_runs_compute( view, runs ))) goto drop;
-        if ((map = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED) goto drop;
+        if (!(nb_runs = vcpu_image_runs_compute( view, runs ))) { why = __LINE__; goto drop; }
+        if ((map = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED) { why = __LINE__; goto drop; }
         for (i = 0; i < nb_runs; i++) memcpy( map + runs[2 * i], (char *)view->base + runs[2 * i], runs[2 * i + 1] );
         munmap( map, map_size );
         /* wineserver must know the runs before any is shared: it refuses writes into them */
-        if (vcpu_image_share_send( view, IMAGE_SHARE_READY, 0, runs, nb_runs )) goto drop;
+        if (vcpu_image_share_send( view, IMAGE_SHARE_READY, 0, runs, nb_runs )) { why = __LINE__; goto drop; }
     }
     else
     {
         size_t end = 0;
 
-        if (!nb_runs || nb_runs > VCPU_IMAGE_MAX_RUNS) goto drop;
+        if (!nb_runs || nb_runs > VCPU_IMAGE_MAX_RUNS) { why = __LINE__; goto drop; }
         for (i = 0; i < nb_runs; i++)
         {
             size_t pos, off = runs[2 * i], size = runs[2 * i + 1];
 
-            if ((off | size) & (VCPU_IMAGE_CHUNK - 1) || !size || off < end || off + size > view->size) goto drop;
+            if ((off | size) & (VCPU_IMAGE_CHUNK - 1) || !size || off < end || off + size > view->size) { why = __LINE__; goto drop; }
             for (pos = off; pos < off + size; pos += VCPU_IMAGE_CHUNK)
-                if (!vcpu_image_chunk_shareable( (char *)view->base + pos )) goto drop;
+                if (!vcpu_image_chunk_shareable( (char *)view->base + pos )) { why = __LINE__; goto drop; }
             end = off + size;
         }
         if (vcpu_shared_images_verify)
         {
             BOOL same = TRUE;
 
-            if ((map = mmap( NULL, map_size, PROT_READ, MAP_SHARED, fd, 0 )) == MAP_FAILED) goto drop;
+            if ((map = mmap( NULL, map_size, PROT_READ, MAP_SHARED, fd, 0 )) == MAP_FAILED) { why = __LINE__; goto drop; }
             for (i = 0; i < nb_runs && same; i++)
                 same = !memcmp( map + runs[2 * i], (char *)view->base + runs[2 * i], runs[2 * i + 1] );
             munmap( map, map_size );
@@ -3022,12 +3032,12 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
             {
                 ERR( "vCPU mode: image at %p differs from its shared object in run %u, kept private\n", view->base,
                      i - 1 );
-                goto drop;
+                { why = __LINE__; goto drop; }
             }
         }
     }
 
-    if (fstat( fd, &st ) == -1 || !(section = vcpu_section_get( fd, &st, view->size ))) goto drop;
+    if (fstat( fd, &st ) == -1 || !(section = vcpu_section_get( fd, &st, view->size ))) { why = __LINE__; goto drop; }
     section->views++;  /* a run that fails its commit drops its own reference (openrosetta review B1) */
     for (i = 0; i < nb_runs; i++)
     {
@@ -3045,9 +3055,13 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
     goto done;
 
 drop:
+    if (vcpu_shared_images >= 2)
+        fprintf( stderr, "[SHARED-IMAGES] pid %d image %p-%p dropped at line %d (state %d, %u runs, errno %d)\n",
+                 (int)getpid(), view->base, (char *)view->base + view->size, why, state, nb_runs, errno );
     vcpu_image_share_send( view, IMAGE_SHARE_DROP, 0, NULL, 0 );
 done:
     if (needs_close) close( fd );
+    NtClose( handle );
 }
 
 /* vCPU mode: gmm maps only anonymous memory into the guest, so a file view is a copy of the file. A shared writable
