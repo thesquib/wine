@@ -4362,6 +4362,15 @@ static void vcpu_handle_fault( struct vcpu_thread *vt, struct syscall_frame *fra
             vcpu_store_full( vt, frame );  /* guard page, write watch or stack growth handled: retry */
             return;
         }
+        /* a shared image run being privatised (virtual.c) is unmapped from the guest until its commit, both under
+         * virtual_mutex, which virtual_handle_fault just took: the page may be there now. Only for an access
+         * violation: a guard page or stack growth it already handled also makes the page valid */
+        if (mem_abort && rec.ExceptionCode == STATUS_ACCESS_VIOLATION && gmm_vm_fault( gmm, far, e->esr ) == GMM_VF_RETRY)
+        {
+            if (prof_interval) vt->prof_charge = &prof_extra[VCPU_PROF_FAULT_RETRY];
+            vcpu_store_full( vt, frame );
+            return;
+        }
         rec.ExceptionInformation[1] = e->far;  /* the faulting code sees the address it used */
     }
     if (e->fclass == VEL1_FC_BRK && (e->esr & 0xffff) == 0xf003)

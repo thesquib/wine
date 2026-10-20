@@ -2025,12 +2025,47 @@ static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base
                          pthread_sigmask( SIG_BLOCK, &vcpu_quit_, &vcpu_old_ )
 #define VCPU_GMM_END()   pthread_sigmask( SIG_SETMASK, &vcpu_old_, NULL )
 
+/* vCPU mode, shared PE image pages (proton-darwin vcpu-shared-image-pages-design-2026-10-20): a run is a whole-16K
+ * range of an image view that is a gmm alias of the image's shared anchor, nested in the view's identity gmm view.
+ * gmm only takes a range wholly inside one gmm view, so every gmm call on a guest range is split at run edges.
+ * Sorted by base, under virtual_mutex. Nothing adds runs yet. */
+struct vcpu_image_run
+{
+    struct list             entry;
+    const struct file_view *view;
+    char                   *base;
+    size_t                  size;
+};
+
+static struct list vcpu_image_runs = LIST_INIT( vcpu_image_runs );
+
+/* the size of the piece of [addr, end) that starts at addr and lies wholly inside or wholly outside one run */
+/* shortcut: linear in the number of runs, switch to an rb tree once runs exist (~200 for libcef alone) */
+static size_t vcpu_image_run_piece( const char *addr, const char *end )
+{
+    struct vcpu_image_run *run;
+
+    LIST_FOR_EACH_ENTRY( run, &vcpu_image_runs, struct vcpu_image_run, entry )
+    {
+        if (run->base + run->size <= addr) continue;
+        if (run->base <= addr) return min( end, run->base + run->size ) - addr;
+        return min( end, run->base ) - addr;
+    }
+    return end - addr;
+}
+
 static int vcpu_sync_pages( const struct file_view *view, const void *base, size_t size, BYTE set, BYTE clear )
 {
     uint64_t t0 = vcpu_prof_interval ? vcpu_prof_now() : 0;
-    int res;
+    const char *addr = base, *end = addr + size;
+    size_t piece;
+    int res = 0;
     VCPU_GMM_BEGIN();
-    res = vcpu_sync_pages_nosig( view, base, size, set, clear );
+    for (; !res && addr < end; addr += piece)
+    {
+        piece = vcpu_image_run_piece( addr, end );
+        res = vcpu_sync_pages_nosig( view, addr, piece, set, clear );
+    }
     VCPU_GMM_END();
     if (vcpu_prof_interval) vcpu_prof_add( VCPU_PROF_S1_SYNC, vcpu_prof_now() - t0 );
     return res;
@@ -2125,7 +2160,8 @@ static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base
 /* vCPU mode: revoke every page of the range from the guest (decommit, free); returns once no vCPU can reach it */
 static void vcpu_revoke_pages( const void *base, size_t size )
 {
-    char *addr = ROUND_ADDR( base, page_mask );
+    char *addr = ROUND_ADDR( base, page_mask ), *p;
+    size_t piece;
     int ret = 0;
 
     size = ROUND_SIZE( base, size, page_mask );
@@ -2133,7 +2169,11 @@ static void vcpu_revoke_pages( const void *base, size_t size )
     {
         uint64_t t0 = vcpu_prof_interval ? vcpu_prof_now() : 0;
         VCPU_GMM_BEGIN();
-        ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)addr, size, GMM_S1_NONE );
+        for (p = addr; !ret && p < addr + size; p += piece)
+        {
+            piece = vcpu_image_run_piece( p, addr + size );
+            ret = gmm_vm_range_set( vcpu_gmm(), (UINT_PTR)p, piece, GMM_S1_NONE );
+        }
         VCPU_GMM_END();
         if (vcpu_prof_interval) vcpu_prof_add( VCPU_PROF_S1_REVOKE, vcpu_prof_now() - t0 );
     }
@@ -2733,7 +2773,8 @@ static void vcpu_view_flush( const struct file_view *view, BOOL remove )
 
 static void vcpu_view_deleted( struct file_view *view )
 {
-    int ret;
+    struct vcpu_image_run *run, *next;
+    int ret = 0;
 
     if (view->protect & VPROT_ALIASED)
     {
@@ -2743,7 +2784,16 @@ static void vcpu_view_deleted( struct file_view *view )
     {
         VCPU_GMM_BEGIN();
         vcpu_view_flush( view, TRUE );
-        ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
+        /* the nested run views first: gmm unmaps only exactly one registered view */
+        LIST_FOR_EACH_ENTRY_SAFE( run, next, &vcpu_image_runs, struct vcpu_image_run, entry )
+        {
+            if (run->view != view) continue;
+            if (!ret && (ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)run->base, run->size )))
+                ERR( "gmm_view_unmap of run %p-%p failed %d\n", run->base, run->base + run->size, ret );
+            list_remove( &run->entry );
+            free( run );
+        }
+        if (!ret) ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)view->base, view->size );
         VCPU_GMM_END();
     }
     if (ret)
