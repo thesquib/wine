@@ -2182,7 +2182,22 @@ void macdrv_restore_metal_layer_delegate(void *layer_ptr, void *saved)
                 if (next && [self level] < [next level])
                     [self setLevel:[next level]];
                 [self setAutodisplay:YES];
-                [self orderFront:nil];
+                if ([NSApp isActive])
+                {
+                    [self orderFront:nil];
+                    self.heldBackWhileInactive = FALSE;
+                }
+                else
+                {
+                    /* -orderFront: would put the window in front of the active app's windows too (macOS 14+ refuses
+                     * the activation Wine asked for above): a background Steam's popups covered the app in use. Go in
+                     * front of our own windows only; -applicationDidBecomeActive: brings it forward. */
+                    if (!next)
+                        [self orderBack:nil];
+                    else if (next != self)
+                        [self orderWindow:NSWindowAbove relativeTo:[next windowNumber]];
+                    self.heldBackWhileInactive = TRUE;
+                }
                 [self checkWineDisplayLink];
                 needAdjustWindowLevels = TRUE;
             }

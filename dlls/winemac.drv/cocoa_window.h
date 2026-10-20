@@ -103,6 +103,9 @@
  * background is black, so any sliver the layer does not cover reads as the
  * letterbox instead of a white line (DOOM: The Dark Ages, 2026-10-08). */
 @property (nonatomic) BOOL hostsGameLayer;
+/* Shown or raised while the app was inactive, so it went in front of our own windows only (not the active app's);
+ * -applicationDidBecomeActive: brings it forward. */
+@property (nonatomic) BOOL heldBackWhileInactive;
 
     - (NSInteger) minimumLevelForActive:(BOOL)active;
     - (void) updateFullscreen;

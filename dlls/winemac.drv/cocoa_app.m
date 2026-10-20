@@ -3450,6 +3450,18 @@ static NSString* WineLocalizedString(unsigned int stringID)
             [self setMode:mode forDisplay:[displayID unsignedIntValue]];
         }
 
+        // Windows shown while we were inactive went in front of our own windows only; bring them forward now, in
+        // their current order (back to front).
+        for (NSNumber* number in [[NSWindow windowNumbersWithOptions:0] reverseObjectEnumerator])
+        {
+            WineWindow* window = (WineWindow*)[NSApp windowWithWindowNumber:[number integerValue]];
+            if ([window isKindOfClass:[WineWindow class]] && window.heldBackWhileInactive)
+            {
+                window.heldBackWhileInactive = FALSE;
+                [window orderFront:nil];
+            }
+        }
+
         [self updateFullscreenWindows];
         [self adjustWindowLevels:YES];
 
