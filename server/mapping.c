@@ -134,6 +134,8 @@ struct memory_view
     struct fd      *fd;              /* fd for mapped file */
     struct ranges  *committed;       /* list of committed ranges in this mapping */
     struct shared_map *shared;       /* temp file for shared PE mapping */
+    struct image_share *share;       /* vCPU route: the shared object of its read-only pages */
+    unsigned char  *privatised;      /* per run of share: a private copy again in this view */
     struct pe_image_info image;      /* image info (for PE image mapping) */
     unsigned int    flags;           /* SEC_* flags */
     client_ptr_t    base;            /* view base address (in process addr space) */
@@ -438,12 +440,11 @@ static int create_temp_file( file_pos_t size )
  * with pwrite) keep the temp file. */
 static int session_mapping_creating;
 
+static int create_shm_fd( file_pos_t size );
+
 static int create_shm_file( file_pos_t size )
 {
     static int enabled = -1;
-    static unsigned int counter;
-    char name[32];
-    int fd = -1, tries;
 
     if (enabled == -1)
     {
@@ -457,6 +458,15 @@ static int create_shm_file( file_pos_t size )
 #endif
     }
     if (!enabled || session_mapping_creating || size != (off_t)size) return -1;
+    return create_shm_fd( size );
+}
+
+static int create_shm_fd( file_pos_t size )
+{
+    static unsigned int counter;
+    char name[32];
+    int fd = -1, tries;
+
     for (tries = 0; tries < 16 && fd == -1; tries++)
     {
         snprintf( name, sizeof(name), "/wine-%x-%x", (unsigned int)getpid(), counter++ );  /* PSHMNAMLEN 31 */
@@ -561,8 +571,75 @@ static int add_process_view( struct thread *thread, struct memory_view *view )
     return 0;
 }
 
+#ifdef __APPLE__
+/* vCPU route, shared PE image pages (proton-darwin vcpu-shared-image-pages-design-2026-10-20): one shm object per
+ * image file, landing address and machine holds the bytes every process computes for the image's read-only 16K
+ * runs. The first view of an image there fills it and sends its runs; later views alias them, and a view privatises
+ * a run (a private copy again) before anything may write it. Writes into a run a view still shares are refused
+ * (image_share_blocks_write): the bytes are every process's. */
+struct image_share
+{
+    struct list         entry;      /* in image_share_list */
+    unsigned int        refs;       /* views using it */
+    dev_t               dev;        /* the image file */
+    ino_t               ino;
+    off_t               size;
+    struct timespec     mtime;
+    struct timespec     ctime;
+    client_ptr_t        base;       /* the address it landed at */
+    unsigned short      machine;
+    struct file        *file;       /* the shm object */
+    struct memory_view *filler;     /* the view filling it, NULL once ready */
+    unsigned int        nb_runs;
+    unsigned int       *runs;       /* view offset and size of each run */
+};
+
+static struct list image_share_list = LIST_INIT( image_share_list );
+
+static void image_share_detach( struct memory_view *view )
+{
+    struct image_share *share = view->share;
+
+    if (share->filler == view)  /* never filled: the next view of the image starts over */
+    {
+        list_remove( &share->entry );
+        list_init( &share->entry );
+        share->filler = NULL;
+    }
+    view->share = NULL;
+    free( view->privatised );
+    view->privatised = NULL;
+    if (--share->refs) return;
+    list_remove( &share->entry );
+    release_object( share->file );
+    free( share->runs );
+    free( share );
+}
+
+int image_share_blocks_write( struct process *process, client_ptr_t addr, data_size_t size )
+{
+    struct memory_view *view;
+    unsigned int i;
+
+    LIST_FOR_EACH_ENTRY( view, &process->views, struct memory_view, entry )
+    {
+        if (!view->privatised || addr + size <= view->base || addr >= view->base + view->size) continue;
+        for (i = 0; i < view->share->nb_runs; i++)
+        {
+            client_ptr_t start = view->base + view->share->runs[2 * i];
+            if (!view->privatised[i] && addr < start + view->share->runs[2 * i + 1] && addr + size > start) return 1;
+        }
+    }
+    return 0;
+}
+#else
+static void image_share_detach( struct memory_view *view ) {}
+int image_share_blocks_write( struct process *process, client_ptr_t addr, data_size_t size ) { return 0; }
+#endif
+
 static void free_memory_view( struct memory_view *view )
 {
+    if (view->share) image_share_detach( view );
     if (view->fd) release_object( view->fd );
     if (view->committed) release_object( view->committed );
     if (view->shared) release_object( view->shared );
@@ -1722,6 +1799,8 @@ DECL_HANDLER(map_view)
         view->fd        = !is_fd_removable( mapping->fd ) ? (struct fd *)grab_object( mapping->fd ) : NULL;
         view->committed = mapping->committed ? (struct ranges *)grab_object( mapping->committed ) : NULL;
         view->shared    = NULL;
+        view->share     = NULL;
+        view->privatised = NULL;
         add_process_view( current, view );
     }
 
@@ -1759,6 +1838,8 @@ DECL_HANDLER(map_image_view)
         view->fd        = !is_fd_removable( mapping->fd ) ? (struct fd *)grab_object( mapping->fd ) : NULL;
         view->committed = NULL;
         view->shared    = mapping->shared ? (struct shared_map *)grab_object( mapping->shared ) : NULL;
+        view->share     = NULL;
+        view->privatised = NULL;
         view->image     = mapping->image;
         if (add_process_view( current, view ))
         {
@@ -1889,4 +1970,146 @@ DECL_HANDLER(get_mapping_filename)
     else set_error( STATUS_INVALID_ADDRESS );
 
     release_object( process );
+}
+
+/* vCPU route, shared PE image pages: the shared object of an image view of the current process */
+DECL_HANDLER(get_image_share)
+{
+#ifdef __APPLE__
+    struct memory_view *view = find_mapped_view( current->process, req->base );
+    struct image_share *share;
+    struct file *file;
+    struct stat st;
+    int unix_fd;
+
+    if (!view) return;
+    if (!(view->flags & SEC_IMAGE) || !view->fd || view->share || (view->base & 0x3fff))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if ((unix_fd = get_unix_fd( view->fd )) == -1) return;
+    if (fstat( unix_fd, &st ) == -1)
+    {
+        file_set_error();
+        return;
+    }
+    LIST_FOR_EACH_ENTRY( share, &image_share_list, struct image_share, entry )
+    {
+        if (share->dev != st.st_dev || share->ino != st.st_ino || share->size != st.st_size ||
+            share->mtime.tv_sec != st.st_mtimespec.tv_sec || share->mtime.tv_nsec != st.st_mtimespec.tv_nsec ||
+            share->ctime.tv_sec != st.st_ctimespec.tv_sec || share->ctime.tv_nsec != st.st_ctimespec.tv_nsec ||
+            share->base != view->base || share->machine != req->machine)
+            continue;
+        if (share->filler) return;  /* IMAGE_SHARE_NONE: another view is filling it */
+        if (!(view->privatised = calloc( share->nb_runs, 1 ))) return;
+        if (!(reply->file = alloc_handle( current->process, share->file, GENERIC_READ | GENERIC_WRITE, 0 )))
+        {
+            free( view->privatised );
+            view->privatised = NULL;
+            return;
+        }
+        view->share = share;
+        share->refs++;
+        reply->state = IMAGE_SHARE_READY;
+        reply->nb_runs = share->nb_runs;
+        set_reply_data( share->runs, min( share->nb_runs * 2 * sizeof(*share->runs), get_reply_max_size() ));
+        return;
+    }
+
+    if ((unix_fd = create_shm_fd( view->size )) == -1)
+    {
+        file_set_error();
+        return;
+    }
+    if (!(file = create_file_for_fd( unix_fd, FILE_GENERIC_READ | FILE_GENERIC_WRITE, 0 ))) return;
+    if (!(share = mem_alloc( sizeof(*share) )))
+    {
+        release_object( file );
+        return;
+    }
+    if (!(reply->file = alloc_handle( current->process, file, GENERIC_READ | GENERIC_WRITE, 0 )))
+    {
+        release_object( file );
+        free( share );
+        return;
+    }
+    share->refs    = 1;
+    share->dev     = st.st_dev;
+    share->ino     = st.st_ino;
+    share->size    = st.st_size;
+    share->mtime   = st.st_mtimespec;
+    share->ctime   = st.st_ctimespec;
+    share->base    = view->base;
+    share->machine = req->machine;
+    share->file    = file;
+    share->filler  = view;
+    share->nb_runs = 0;
+    share->runs    = NULL;
+    list_add_head( &image_share_list, &share->entry );
+    view->share = share;
+    reply->state = IMAGE_SHARE_FILL;
+#else
+    set_error( STATUS_NOT_SUPPORTED );
+#endif
+}
+
+/* vCPU route, shared PE image pages: change the state of an image view's shared object */
+DECL_HANDLER(set_image_share)
+{
+#ifdef __APPLE__
+    struct memory_view *view = find_mapped_view( current->process, req->base );
+    struct image_share *share;
+    const unsigned int *runs = get_req_data();
+    unsigned int i, nb = get_req_data_size() / (2 * sizeof(*runs));
+    mem_size_t end = 0;
+
+    if (!view) return;
+    if (!(share = view->share))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    switch (req->action)
+    {
+    case IMAGE_SHARE_READY:
+        if (share->filler != view || !nb || get_req_data_size() != nb * 2 * sizeof(*runs))
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+        for (i = 0; i < nb; i++)  /* whole 16K chunks, sorted, inside the view */
+        {
+            if ((runs[2 * i] & 0x3fff) || (runs[2 * i + 1] & 0x3fff) || !runs[2 * i + 1] || runs[2 * i] < end ||
+                (mem_size_t)runs[2 * i] + runs[2 * i + 1] > view->size)
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return;
+            }
+            end = (mem_size_t)runs[2 * i] + runs[2 * i + 1];
+        }
+        if (!(share->runs = memdup( runs, get_req_data_size() ))) return;
+        if (!(view->privatised = calloc( nb, 1 )))
+        {
+            free( share->runs );
+            share->runs = NULL;
+            return;
+        }
+        share->nb_runs = nb;
+        share->filler = NULL;
+        break;
+    case IMAGE_SHARE_PRIVATISE:
+        if (!view->privatised || req->run >= share->nb_runs) set_error( STATUS_INVALID_PARAMETER );
+        else view->privatised[req->run] = 1;
+        break;
+    case IMAGE_SHARE_DROP:
+        image_share_detach( view );
+        break;
+    default:
+        set_error( STATUS_INVALID_PARAMETER );
+        break;
+    }
+#else
+    set_error( STATUS_NOT_SUPPORTED );
+#endif
 }

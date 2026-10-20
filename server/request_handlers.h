@@ -317,6 +317,8 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(fsync_free_shm_idx);
+DECL_HANDLER(get_image_share);
+DECL_HANDLER(set_image_share);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -631,6 +633,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_fsync_free_shm_idx,
+    (req_handler)req_get_image_share,
+    (req_handler)req_set_image_share,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2413,3 +2417,14 @@ C_ASSERT( sizeof(struct d3dkmt_mutex_release_request) == 40 );
 C_ASSERT( offsetof(struct fsync_free_shm_idx_request, shm_idx) == 12 );
 C_ASSERT( sizeof(struct fsync_free_shm_idx_request) == 16 );
 C_ASSERT( sizeof(struct fsync_free_shm_idx_reply) == 8 );
+C_ASSERT( offsetof(struct get_image_share_request, base) == 16 );
+C_ASSERT( offsetof(struct get_image_share_request, machine) == 24 );
+C_ASSERT( sizeof(struct get_image_share_request) == 32 );
+C_ASSERT( offsetof(struct get_image_share_reply, state) == 8 );
+C_ASSERT( offsetof(struct get_image_share_reply, file) == 12 );
+C_ASSERT( offsetof(struct get_image_share_reply, nb_runs) == 16 );
+C_ASSERT( sizeof(struct get_image_share_reply) == 24 );
+C_ASSERT( offsetof(struct set_image_share_request, base) == 16 );
+C_ASSERT( offsetof(struct set_image_share_request, action) == 24 );
+C_ASSERT( offsetof(struct set_image_share_request, run) == 28 );
+C_ASSERT( sizeof(struct set_image_share_request) == 32 );

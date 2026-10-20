@@ -1810,7 +1810,9 @@ DECL_HANDLER(write_process_memory)
     {
         data_size_t len = get_req_data_size();
         reply->written = 0;
-        if (len) write_process_memory( process, req->addr, len, get_req_data(), &reply->written );
+        /* a still-shared image run is every process's: the writer must make it writable first, as on Windows */
+        if (image_share_blocks_write( process, req->addr, len )) set_error( STATUS_PARTIAL_COPY );
+        else if (len) write_process_memory( process, req->addr, len, get_req_data(), &reply->written );
         release_object( process );
     }
 }

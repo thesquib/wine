@@ -3569,6 +3569,28 @@ static void dump_fsync_free_shm_idx_request( const struct fsync_free_shm_idx_req
     fprintf( stderr, " shm_idx=%08x", req->shm_idx );
 }
 
+static void dump_get_image_share_request( const struct get_image_share_request *req )
+{
+    dump_uint64( " base=", &req->base );
+    fprintf( stderr, ", machine=%04x", req->machine );
+}
+
+static void dump_get_image_share_reply( const struct get_image_share_reply *req )
+{
+    fprintf( stderr, " state=%d", req->state );
+    fprintf( stderr, ", file=%04x", req->file );
+    fprintf( stderr, ", nb_runs=%08x", req->nb_runs );
+    dump_varargs_uints( ", runs=", cur_size );
+}
+
+static void dump_set_image_share_request( const struct set_image_share_request *req )
+{
+    dump_uint64( " base=", &req->base );
+    fprintf( stderr, ", action=%d", req->action );
+    fprintf( stderr, ", run=%08x", req->run );
+    dump_varargs_uints( ", runs=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3883,6 +3905,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_fsync_free_shm_idx_request,
+    (dump_func)dump_get_image_share_request,
+    (dump_func)dump_set_image_share_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4196,6 +4220,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_object_open_name_reply,
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
+    NULL,
+    (dump_func)dump_get_image_share_reply,
     NULL,
 };
 
@@ -4511,6 +4537,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "fsync_free_shm_idx",
+    "get_image_share",
+    "set_image_share",
 };
 
 static const struct

@@ -6272,6 +6272,45 @@ struct fsync_free_shm_idx_reply
 };
 
 
+struct get_image_share_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    client_ptr_t   base;
+    unsigned short machine;
+    char __pad_26[6];
+};
+struct get_image_share_reply
+{
+    struct reply_header __header;
+    int            state;
+    obj_handle_t   file;
+    unsigned int   nb_runs;
+    /* VARARG(runs,uints); */
+    char __pad_20[4];
+};
+#define IMAGE_SHARE_NONE      0
+#define IMAGE_SHARE_FILL      1
+#define IMAGE_SHARE_READY     2
+#define IMAGE_SHARE_PRIVATISE 3
+#define IMAGE_SHARE_DROP      4
+
+
+struct set_image_share_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    client_ptr_t   base;
+    int            action;
+    unsigned int   run;
+    /* VARARG(runs,uints); */
+};
+struct set_image_share_reply
+{
+    struct reply_header __header;
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6584,6 +6623,8 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_fsync_free_shm_idx,
+    REQ_get_image_share,
+    REQ_set_image_share,
     REQ_NB_REQUESTS
 };
 
@@ -6901,6 +6942,8 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct fsync_free_shm_idx_request fsync_free_shm_idx_request;
+    struct get_image_share_request get_image_share_request;
+    struct set_image_share_request set_image_share_request;
 };
 union generic_reply
 {
@@ -7216,8 +7259,10 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct fsync_free_shm_idx_reply fsync_free_shm_idx_reply;
+    struct get_image_share_reply get_image_share_reply;
+    struct set_image_share_reply set_image_share_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 934
+#define SERVER_PROTOCOL_VERSION 935
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

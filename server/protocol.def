@@ -4361,3 +4361,27 @@ enum fsync_type
     unsigned int shm_idx;
 @REPLY
 @END
+
+/* vCPU route, shared PE image pages: the shared object of an image view of the current process */
+@REQ(get_image_share)
+    client_ptr_t   base;        /* view base */
+    unsigned short machine;     /* machine of the view's code (after ARM64X fixups) */
+@REPLY
+    int            state;       /* IMAGE_SHARE_NONE/FILL/READY */
+    obj_handle_t   file;        /* the shared object (FILL, READY) */
+    unsigned int   nb_runs;     /* READY: number of runs */
+    VARARG(runs,uints);         /* READY: view offset and size of each run */
+@END
+#define IMAGE_SHARE_NONE      0  /* map privately */
+#define IMAGE_SHARE_FILL      1  /* fill the object's runs, then send IMAGE_SHARE_READY with them */
+#define IMAGE_SHARE_READY     2  /* alias the runs */
+#define IMAGE_SHARE_PRIVATISE 3  /* run is a private copy again in this view */
+#define IMAGE_SHARE_DROP      4  /* the view keeps private copies */
+
+/* vCPU route, shared PE image pages: change the state of an image view's shared object */
+@REQ(set_image_share)
+    client_ptr_t   base;        /* view base */
+    int            action;      /* IMAGE_SHARE_READY/PRIVATISE/DROP */
+    unsigned int   run;         /* PRIVATISE: run index */
+    VARARG(runs,uints);         /* READY: view offset and size of each run */
+@END
