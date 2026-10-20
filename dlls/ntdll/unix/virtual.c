@@ -3002,7 +3002,15 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
 
     if (state == IMAGE_SHARE_FILL)
     {
-        if (!(nb_runs = vcpu_image_runs_compute( view, runs ))) { why = __LINE__; goto drop; }
+        if (!(nb_runs = vcpu_image_runs_compute( view, runs )))
+        {
+            /* nothing shareable: wineserver remembers, later views of the image skip it */
+            if (vcpu_image_share_send( view, IMAGE_SHARE_READY, 0, NULL, 0 )) { why = __LINE__; goto drop; }
+            if (vcpu_shared_images >= 3)
+                fprintf( stderr, "[SHARED-IMAGES] pid %d image %p size %#zx: nothing shareable\n", (int)getpid(),
+                         view->base, view->size );
+            goto done;
+        }
         if ((map = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED) { why = __LINE__; goto drop; }
         for (i = 0; i < nb_runs; i++) memcpy( map + runs[2 * i], (char *)view->base + runs[2 * i], runs[2 * i + 1] );
         munmap( map, map_size );

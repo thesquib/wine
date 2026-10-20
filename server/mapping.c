@@ -611,7 +611,7 @@ static void image_share_detach( struct memory_view *view )
     view->privatised = NULL;
     if (--share->refs) return;
     list_remove( &share->entry );
-    release_object( share->file );
+    if (share->file) release_object( share->file );
     free( share->runs );
     free( share );
 }
@@ -2002,6 +2002,12 @@ DECL_HANDLER(get_image_share)
             share->base != view->base || share->machine != req->machine)
             continue;
         if (share->filler) return;  /* IMAGE_SHARE_NONE: another view is filling it */
+        if (!share->nb_runs)  /* IMAGE_SHARE_NONE: nothing shareable, kept while a view of it exists */
+        {
+            view->share = share;
+            share->refs++;
+            return;
+        }
         if (!(view->privatised = calloc( share->nb_runs, 1 ))) return;
         if (!(reply->file = alloc_handle( current->process, share->file, GENERIC_READ | GENERIC_WRITE, 0 )))
         {
@@ -2073,7 +2079,7 @@ DECL_HANDLER(set_image_share)
     switch (req->action)
     {
     case IMAGE_SHARE_READY:
-        if (share->filler != view || !nb || get_req_data_size() != nb * 2 * sizeof(*runs))
+        if (share->filler != view || get_req_data_size() != nb * 2 * sizeof(*runs))
         {
             set_error( STATUS_INVALID_PARAMETER );
             return;
@@ -2087,6 +2093,13 @@ DECL_HANDLER(set_image_share)
                 return;
             }
             end = (mem_size_t)runs[2 * i] + runs[2 * i + 1];
+        }
+        if (!nb)  /* nothing shareable: later views of the image skip it */
+        {
+            release_object( share->file );
+            share->file = NULL;
+            share->filler = NULL;
+            break;
         }
         if (!(share->runs = memdup( runs, get_req_data_size() ))) return;
         if (!(view->privatised = calloc( nb, 1 )))
