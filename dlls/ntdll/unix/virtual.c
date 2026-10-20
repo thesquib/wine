@@ -2028,10 +2028,10 @@ static int vcpu_sync_pages_nosig( const struct file_view *view, const void *base
 /* vCPU mode, shared PE image pages (proton-darwin vcpu-shared-image-pages-design-2026-10-20): a run is a whole-16K
  * range of an image view that is a gmm alias of the image's shared anchor, nested in the view's identity gmm view.
  * gmm only takes a range wholly inside one gmm view, so every gmm call on a guest range is split at run edges.
- * Sorted by base, under virtual_mutex. Nothing adds runs yet. */
+ * Under virtual_mutex; runs are whole 16K chunks and never overlap. */
 struct vcpu_image_run
 {
-    struct list             entry;
+    struct wine_rb_entry    entry;    /* in vcpu_image_runs, by base */
     const struct file_view *view;
     char                   *base;
     size_t                  size;
@@ -2039,21 +2039,51 @@ struct vcpu_image_run
     unsigned int            index;    /* of the run in the image's run list (wineserver) */
 };
 
-static struct list vcpu_image_runs = LIST_INIT( vcpu_image_runs );
+static int compare_image_run( const void *addr, const struct wine_rb_entry *entry )
+{
+    const struct vcpu_image_run *run = WINE_RB_ENTRY_VALUE( entry, struct vcpu_image_run, entry );
+
+    if ((const char *)addr < run->base) return -1;
+    if ((const char *)addr > run->base) return 1;
+    return 0;
+}
+
+static struct wine_rb_tree vcpu_image_runs = { compare_image_run };
+
+/* the first run that ends after addr, NULL if none (runs never overlap: ends are in base order) */
+static struct vcpu_image_run *vcpu_image_run_after( const char *addr )
+{
+    struct wine_rb_entry *ptr = vcpu_image_runs.root;
+    struct vcpu_image_run *found = NULL;
+
+    while (ptr)
+    {
+        struct vcpu_image_run *run = WINE_RB_ENTRY_VALUE( ptr, struct vcpu_image_run, entry );
+
+        if (run->base + run->size > addr)
+        {
+            found = run;
+            ptr = ptr->left;
+        }
+        else ptr = ptr->right;
+    }
+    return found;
+}
+
+static struct vcpu_image_run *vcpu_image_run_next( struct vcpu_image_run *run )
+{
+    struct wine_rb_entry *next = rb_next( &run->entry );
+    return next ? WINE_RB_ENTRY_VALUE( next, struct vcpu_image_run, entry ) : NULL;
+}
 
 /* the size of the piece of [addr, end) that starts at addr and lies wholly inside or wholly outside one run */
-/* shortcut: linear in the number of runs, switch to an rb tree once runs exist (~200 for libcef alone) */
 static size_t vcpu_image_run_piece( const char *addr, const char *end )
 {
     struct vcpu_image_run *run;
 
-    LIST_FOR_EACH_ENTRY( run, &vcpu_image_runs, struct vcpu_image_run, entry )
-    {
-        if (run->base + run->size <= addr) continue;
-        if (run->base <= addr) return min( end, run->base + run->size ) - addr;
-        return min( end, run->base ) - addr;
-    }
-    return end - addr;
+    if (!vcpu_image_runs.root || !(run = vcpu_image_run_after( addr ))) return end - addr;
+    if (run->base <= addr) return min( end, run->base + run->size ) - addr;
+    return min( end, run->base ) - addr;
 }
 
 static int vcpu_sync_pages( const struct file_view *view, const void *base, size_t size, BYTE set, BYTE clear )
@@ -2789,6 +2819,9 @@ static unsigned int vcpu_image_share_send( const struct file_view *view, int act
 /* a run of the view is a private copy again: its own tagged memory with the anchor's bytes, committed through the
  * view's identity gmm view (openrosetta review 2026-10-20 item 2). A vCPU touching it meanwhile faults, and
  * vcpu_handle_fault asks gmm again once virtual_mutex is free. */
+static void vcpu_image_run_restore( const struct file_view *view, struct vcpu_section *section, char *base,
+                                    size_t size, unsigned int index );
+
 static void vcpu_image_run_privatise( struct vcpu_image_run *run )
 {
     struct vcpu_section *section = run->section;
@@ -2805,17 +2838,8 @@ static void vcpu_image_run_privatise( struct vcpu_image_run *run )
         ERR( "gmm_view_unmap of run %p-%p failed %d\n", run->base, run->base + run->size, ret );
         abort();
     }
-    list_remove( &run->entry );
-    if (anon_mmap_fixed_tag( run->base, run->size, PROT_READ | PROT_WRITE, 0, TRUE ) == MAP_FAILED)
-    {
-        ERR( "vCPU mode: no private memory for run %p-%p: %s\n", run->base, run->base + run->size, strerror( errno ));
-        abort();
-    }
-    memcpy( run->base, section->anchor + (run->base - (char *)view->base), run->size );
-    sys_icache_invalidate( run->base, run->size );
-    if (vcpu_sync_pages( view, run->base, run->size, 0, 0 ))
-        ERR( "vCPU mode: run %p-%p not committed again\n", run->base, run->base + run->size );
-    vcpu_image_share_send( view, IMAGE_SHARE_PRIVATISE, run->index, NULL, 0 );
+    wine_rb_remove( &vcpu_image_runs, &run->entry );
+    vcpu_image_run_restore( view, section, run->base, run->size, run->index );
     TRACE( "vCPU mode: image run %p-%p privatised\n", run->base, run->base + run->size );
     if (!--section->views) vcpu_section_destroy( section );
     free( run );
@@ -2825,32 +2849,44 @@ static void vcpu_image_run_privatise( struct vcpu_image_run *run )
 static void vcpu_image_runs_privatise( const struct file_view *view, const void *base, size_t size )
 {
     struct vcpu_image_run *run, *next;
-    const char *start = base, *end = start + size;
+    const char *end = (const char *)base + size;
 
-    LIST_FOR_EACH_ENTRY_SAFE( run, next, &vcpu_image_runs, struct vcpu_image_run, entry )
-        if (run->view == view && run->base < end && run->base + run->size > start) vcpu_image_run_privatise( run );
+    if (!(view->protect & SEC_IMAGE) || !vcpu_image_runs.root) return;
+    for (run = vcpu_image_run_after( base ); run && run->base < end; run = next)
+    {
+        next = vcpu_image_run_next( run );
+        if (run->view == view) vcpu_image_run_privatise( run );
+    }
 }
 
 static void vcpu_image_run_insert( struct vcpu_image_run *run )
 {
-    struct vcpu_image_run *other;
+    struct vcpu_image_run *other = vcpu_image_runs.root ? vcpu_image_run_after( run->base ) : NULL;
 
     assert( !((UINT_PTR)run->base & (VCPU_IMAGE_CHUNK - 1)) && !(run->size & (VCPU_IMAGE_CHUNK - 1)) );
-    LIST_FOR_EACH_ENTRY( other, &vcpu_image_runs, struct vcpu_image_run, entry )
+    if (other && other->base < run->base + run->size)
     {
-        if (other->base < run->base + run->size && run->base < other->base + other->size)
-        {
-            ERR( "vCPU mode: run %p-%p overlaps run %p-%p\n", run->base, run->base + run->size, other->base,
-                 other->base + other->size );
-            abort();
-        }
-        if (other->base > run->base)
-        {
-            list_add_before( &other->entry, &run->entry );
-            return;
-        }
+        ERR( "vCPU mode: run %p-%p overlaps run %p-%p\n", run->base, run->base + run->size, other->base,
+             other->base + other->size );
+        abort();
     }
-    list_add_tail( &vcpu_image_runs, &run->entry );
+    wine_rb_put( &vcpu_image_runs, run->base, &run->entry );
+}
+
+/* a run whose host pages may no longer be its own private memory goes back to private memory with the anchor's
+ * bytes (the bytes the run held: the filler wrote them, a reader compared them) and is committed again */
+static void vcpu_image_run_restore( const struct file_view *view, struct vcpu_section *section, char *base,
+                                    size_t size, unsigned int index )
+{
+    if (anon_mmap_fixed_tag( base, size, PROT_READ | PROT_WRITE, 0, TRUE ) == MAP_FAILED)
+    {
+        ERR( "vCPU mode: no private memory for run %p-%p: %s\n", base, base + size, strerror( errno ));
+        abort();
+    }
+    memcpy( base, section->anchor + (base - (char *)view->base), size );
+    sys_icache_invalidate( base, size );
+    if (vcpu_sync_pages( view, base, size, 0, 0 )) ERR( "vCPU mode: run %p-%p not committed again\n", base, base + size );
+    vcpu_image_share_send( view, IMAGE_SHARE_PRIVATISE, index, NULL, 0 );
 }
 
 /* alias a run of the view to the section's anchor; on failure the run stays a private copy */
@@ -2864,7 +2900,11 @@ static BOOL vcpu_image_run_alias( struct file_view *view, struct vcpu_section *s
     kern_return_t kr;
     int ret;
 
-    if (!(run = malloc( sizeof(*run) ))) return FALSE;
+    if (!(run = malloc( sizeof(*run) )))
+    {
+        vcpu_image_share_send( view, IMAGE_SHARE_PRIVATISE, index, NULL, 0 );
+        return FALSE;
+    }
     /* the run's pages were committed by the read: gmm must give them up before the host pages change (R2, R3) */
     vcpu_revoke_pages( base, size );
     vcpu_assert_s2_unmapped( base, size );
@@ -2874,7 +2914,7 @@ static BOOL vcpu_image_run_alias( struct file_view *view, struct vcpu_section *s
     if (kr != KERN_SUCCESS)
     {
         ERR( "vCPU mode: remap of image run %p-%p failed: kern_return_t %d\n", base, base + size, kr );
-        if (vcpu_sync_pages( view, base, size, 0, 0 )) ERR( "vCPU mode: run %p not committed again\n", base );
+        vcpu_image_run_restore( view, section, base, size, index );  /* XNU may have removed the old pages */
         free( run );
         return FALSE;
     }
@@ -2887,11 +2927,7 @@ static BOOL vcpu_image_run_alias( struct file_view *view, struct vcpu_section *s
     {
         ERR( "gmm_view_alias of image run %p-%p failed %d\n", base, base + size, ret );
         if (!vcpu_gmm_out_of_resources( ret )) abort();
-        /* the host pages are the anchor's now: back to private memory holding the same bytes */
-        if (anon_mmap_fixed_tag( base, size, PROT_READ | PROT_WRITE, 0, TRUE ) == MAP_FAILED) abort();
-        memcpy( base, section->anchor + offset, size );
-        sys_icache_invalidate( base, size );
-        if (vcpu_sync_pages( view, base, size, 0, 0 )) ERR( "vCPU mode: run %p not committed again\n", base );
+        vcpu_image_run_restore( view, section, base, size, index );  /* the host pages are the anchor's now */
         free( run );
         return FALSE;
     }
@@ -2991,21 +3027,15 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
         }
     }
 
-    if (fstat( fd, &st ) == -1 || !(section = vcpu_section_get( fd, &st, view->size )))
-    {
-        for (i = 0; i < nb_runs; i++) vcpu_image_share_send( view, IMAGE_SHARE_PRIVATISE, i, NULL, 0 );
-        goto done;
-    }
+    if (fstat( fd, &st ) == -1 || !(section = vcpu_section_get( fd, &st, view->size ))) goto drop;
+    section->views++;  /* a run that fails its commit drops its own reference (openrosetta review B1) */
     for (i = 0; i < nb_runs; i++)
     {
-        if (vcpu_image_run_alias( view, section, runs[2 * i], runs[2 * i + 1], i ))
-        {
-            aliased++;
-            shared += runs[2 * i + 1];
-        }
-        else vcpu_image_share_send( view, IMAGE_SHARE_PRIVATISE, i, NULL, 0 );
+        if (!vcpu_image_run_alias( view, section, runs[2 * i], runs[2 * i + 1], i )) continue;
+        aliased++;
+        shared += runs[2 * i + 1];
     }
-    if (!section->views) vcpu_section_destroy( section );
+    if (!--section->views) vcpu_section_destroy( section );
     TRACE( "vCPU mode: image %p-%p %s, %u/%u runs, %#zx bytes shared\n", view->base, (char *)view->base + view->size,
            state == IMAGE_SHARE_FILL ? "filled" : "aliased", aliased, nb_runs, shared );
     if (vcpu_shared_images >= 2)
@@ -3097,6 +3127,7 @@ static void vcpu_view_flush( const struct file_view *view, BOOL remove )
 static void vcpu_view_deleted( struct file_view *view )
 {
     struct vcpu_image_run *run, *next;
+    char *end = (char *)view->base + view->size;
     int ret = 0;
 
     if (view->protect & VPROT_ALIASED)
@@ -3108,12 +3139,13 @@ static void vcpu_view_deleted( struct file_view *view )
         VCPU_GMM_BEGIN();
         vcpu_view_flush( view, TRUE );
         /* the nested run views first: gmm unmaps only exactly one registered view */
-        LIST_FOR_EACH_ENTRY_SAFE( run, next, &vcpu_image_runs, struct vcpu_image_run, entry )
+        for (run = vcpu_image_runs.root ? vcpu_image_run_after( view->base ) : NULL; run && run->base < end; run = next)
         {
+            next = vcpu_image_run_next( run );
             if (run->view != view) continue;
             if (!ret && (ret = gmm_view_unmap( vcpu_gmm(), (UINT_PTR)run->base, run->size )))
                 ERR( "gmm_view_unmap of run %p-%p failed %d\n", run->base, run->base + run->size, ret );
-            list_remove( &run->entry );
+            wine_rb_remove( &vcpu_image_runs, &run->entry );
             if (!ret && !--run->section->views) vcpu_section_destroy( run->section );
             free( run );
         }
@@ -4287,7 +4319,6 @@ static NTSTATUS free_pages_preserve_placeholder( struct file_view *view, char *b
     NTSTATUS status;
 
     if (!size) return STATUS_INVALID_PARAMETER_3;
-    vcpu_image_runs_privatise( view, base, size );
     if (!(view->protect & VPROT_PLACEHOLDER)) return STATUS_CONFLICTING_ADDRESSES;
     if (view->protect & VPROT_FREE_PLACEHOLDER && size == view->size) return STATUS_CONFLICTING_ADDRESSES;
 
