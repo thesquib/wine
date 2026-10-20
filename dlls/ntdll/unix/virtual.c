@@ -2768,8 +2768,8 @@ static unsigned int vcpu_image_runs_compute( const struct file_view *view, unsig
     return n;
 }
 
-static void vcpu_image_share_send( const struct file_view *view, int action, unsigned int run,
-                                   const unsigned int *runs, unsigned int nb_runs )
+static unsigned int vcpu_image_share_send( const struct file_view *view, int action, unsigned int run,
+                                           const unsigned int *runs, unsigned int nb_runs )
 {
     unsigned int status;
 
@@ -2783,6 +2783,7 @@ static void vcpu_image_share_send( const struct file_view *view, int action, uns
     }
     SERVER_END_REQ;
     if (status) ERR( "set_image_share %p action %d run %u failed %#x\n", view->base, action, run, status );
+    return status;
 }
 
 /* a run of the view is a private copy again: its own tagged memory with the anchor's bytes, committed through the
@@ -2956,7 +2957,8 @@ static void vcpu_image_share( struct file_view *view, USHORT machine )
         if ((map = mmap( NULL, map_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 )) == MAP_FAILED) goto drop;
         for (i = 0; i < nb_runs; i++) memcpy( map + runs[2 * i], (char *)view->base + runs[2 * i], runs[2 * i + 1] );
         munmap( map, map_size );
-        vcpu_image_share_send( view, IMAGE_SHARE_READY, 0, runs, nb_runs );
+        /* wineserver must know the runs before any is shared: it refuses writes into them */
+        if (vcpu_image_share_send( view, IMAGE_SHARE_READY, 0, runs, nb_runs )) goto drop;
     }
     else
     {
