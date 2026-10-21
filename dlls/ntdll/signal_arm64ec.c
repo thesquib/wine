@@ -1412,6 +1412,8 @@ BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
     const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
     ULONG_PTR page = ptr / page_size;
+    /* the map ends at the user space limit: a garbage pc from an unwind would fault here, inside the dispatcher */
+    if (ptr >= 0x7fffffff0000) return FALSE;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
