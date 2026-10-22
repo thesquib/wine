@@ -319,6 +319,8 @@ struct layout
 };
 
 static pthread_mutex_t layout_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* CarbonCore's locale list is process-wide and not thread-safe; threads compute their layouts concurrently. */
+static pthread_mutex_t locale_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 int macdrv_layout_list_needs_update = TRUE;
 
@@ -680,12 +682,14 @@ void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data)
 
     uchr = (const UCKeyboardLayout*)CFDataGetBytePtr(thread_data->keyboard_layout_uchr);
 
+    pthread_mutex_lock(&locale_mutex);
     LocaleRefFromLocaleString("POSIX", &localeRef);
     UCCreateCollator(localeRef, 0, collateOptions, &collatorRef);
     collateOptions |= kUCCollateComposeInsensitiveMask | kUCCollateWidthInsensitiveMask | kUCCollateCaseInsensitiveMask;
     UCCreateCollator(localeRef, 0, collateOptions, &caseInsensitiveCollatorRef);
     collateOptions |= kUCCollateDiacritInsensitiveMask;
     UCCreateCollator(localeRef, 0, collateOptions, &diacriticInsensitiveCollatorRef);
+    pthread_mutex_unlock(&locale_mutex);
 
     /* Using the keyboard layout, build a map of key code + modifiers -> characters. */
     memset(map, 0, sizeof(map));
@@ -891,9 +895,11 @@ void macdrv_compute_keyboard_layout(struct macdrv_thread_data *thread_data)
         TRACE("keyc 0x%04x -> vkey 0x%04x (spare vkey)\n", keyc, vkey);
     }
 
+    pthread_mutex_lock(&locale_mutex);
     UCDisposeCollator(&collatorRef);
     UCDisposeCollator(&caseInsensitiveCollatorRef);
     UCDisposeCollator(&diacriticInsensitiveCollatorRef);
+    pthread_mutex_unlock(&locale_mutex);
 }
 
 
