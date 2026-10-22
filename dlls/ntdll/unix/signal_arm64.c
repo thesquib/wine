@@ -153,9 +153,9 @@ static DWORD64 get_fault_esr( ucontext_t *sigcontext )
 
 #endif /* linux */
 
-/* x86 PF/AF/DF carried by the ARM64EC emulator in Cpsr bits 14-16 (RES0 in SPSR,
- * see __wine_arm64ec_ext_eflags); never let them reach the real PSTATE */
-#define CPSR_EXT_EFLAGS 0x0001c000
+/* x86 PF/AF/DF and NT carried by the ARM64EC emulator in Cpsr bits 14-17 (RES0 in SPSR,
+ * see __wine_arm64ec_ext_eflags[_nt]); never let them reach the real PSTATE */
+#define CPSR_EXT_EFLAGS 0x0003c000
 
 /* stack layout when calling KiUserExceptionDispatcher */
 struct exc_stack_layout

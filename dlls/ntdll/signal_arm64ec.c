@@ -1910,6 +1910,10 @@ NTSTATUS (WINAPI *__wine_unix_call_dispatcher_arm64ec)( unixlib_handle_t, unsign
  * context conversions (eflags_to_cpsr/cpsr_to_eflags), and are stripped before PSTATE. */
 const int __wine_arm64ec_ext_eflags = 1;
 
+/* Capability marker for the emulator: Cpsr bit 17 carries x86 NT the same way. A separate marker because a
+ * Wine with only the one above would let bit 17 reach PSTATE. */
+const int __wine_arm64ec_ext_eflags_nt = 1;
+
 static void __attribute__((naked)) arm64x_check_call_early(void)
 {
     asm( "mov x11, x9\n\t"
