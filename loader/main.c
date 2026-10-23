@@ -68,6 +68,15 @@ static char __wine_reserve[0x1fffff000] __attribute__((section("WINE_RESERVE, WI
 __asm__(".zerofill WINE_TOP_DOWN,WINE_TOP_DOWN");
 static char __wine_top_down[0x001ff0000] __attribute__((section("WINE_TOP_DOWN, WINE_TOP_DOWN")));
 
+#ifdef __aarch64__
+/* The default 64-bit EXE image base, 0x140000000, lies above PAGEZERO, where the host allocates freely before
+ * main() (libmalloc metadata was seen at 0x153e00000): an EXE without relocations then failed to load with
+ * STATUS_CONFLICTING_ADDRESSES. This zerofill follows WINE_TOP_DOWN, right after the image, and reaches past
+ * 0x160000000. */
+__asm__(".zerofill WINE_EXE_BASE,WINE_EXE_BASE");
+static char __wine_exe_base[0x60000000] __attribute__((section("WINE_EXE_BASE, WINE_EXE_BASE")));
+#endif
+
 /* Not const: on arm64 entry 0's size is only known once we can read our own
  * __PAGEZERO back at runtime. */
 static struct wine_preload_info preload_info[] =
@@ -78,7 +87,10 @@ static struct wine_preload_info preload_info[] =
     { (void *)0x1000, 0 },                        /*         0x1000 - end of PAGEZERO, filled in below */
 #endif
     { __wine_top_down, sizeof(__wine_top_down) }, /* 0x7ff000000000 - 0x7ff001ff0000: top-down allocations + virtual heap */
-    { 0, 0 }                                      /* end of list */
+#ifdef __aarch64__
+    { __wine_exe_base, sizeof(__wine_exe_base) }, /* after the image - past 0x160000000: the default EXE base */
+#endif
+    { 0, 0 }                                     /* end of list */
 };
 
 __attribute((visibility("default"))) struct wine_preload_info *wine_main_preload_info = preload_info;
