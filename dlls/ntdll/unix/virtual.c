@@ -6115,10 +6115,23 @@ static void *vcpu_reserve_wow_window( SIZE_T total, SIZE_T block_size )
     int ret;
 
     if (env && !strcmp( env, "0" )) return NULL;
+    /* Every process must get the SAME window: a WoW64 caller widens a target process's 32-bit addresses with its
+     * own BASE (the wow64 thunks, and read/write_process_memory in the server), so two bases make cross-process
+     * calls hit free space (VirtualProtectEx -> 87). The first aligned gap used to be 0x300000000 everywhere by luck;
+     * host allocations moved by the loader's WINE_EXE_BASE reserve made it 0x300000000 or 0x400000000 per process.
+     * Try a fixed base far above the host's low allocations first, then fall back to the aligned search. */
+    base = (void *)0x7e0000000000;
+    if (NtAllocateVirtualMemory( NtCurrentProcess(), &base, 0, &size, MEM_RESERVE, PAGE_NOACCESS ))
+    {
+        ERR( "vCPU: fixed WoW64 window %p unavailable, searching; cross-process calls to WoW64 processes may fail\n",
+             (void *)0x7e0000000000 );
+        base = NULL;
+        size = (SIZE_T)1 << 32;
+    }
     req.Alignment = size;
     ext.Type = MemExtendedParameterAddressRequirements;
     ext.Pointer = &req;
-    if ((status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size, MEM_RESERVE, PAGE_NOACCESS, &ext, 1 )))
+    if (!base && (status = NtAllocateVirtualMemoryEx( NtCurrentProcess(), &base, &size, MEM_RESERVE, PAGE_NOACCESS, &ext, 1 )))
     {
         ERR( "vCPU: no 4 GiB-aligned window for the 32-bit address space: %08x\n", status );
         return NULL;
