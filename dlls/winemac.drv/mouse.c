@@ -189,6 +189,35 @@ static void send_mouse_input(HWND hwnd, macdrv_window cocoa_window, UINT flags, 
         }
     }
 
+    /* A Windows mouse reports relative raw input; wineserver copies an absolute input into the raw packet as
+     * MOUSE_MOVE_ABSOLUTE with pixel coordinates, which raw-input UIs read as 0..65535 and so place every click
+     * near the top-left corner (Planet Zoo 2). As x11drv does, keep absolute input out of raw input and send a
+     * relative raw copy: the pixel delta since the last absolute position, none for a button that doesn't move. */
+    if (flags & MOUSEEVENTF_ABSOLUTE)
+    {
+        static int last_x, last_y, have_last; /* shortcut: one position for all threads, fine for one pointer */
+        INPUT raw = input;
+
+        NtUserSendHardwareInput(top_level_hwnd, SEND_HWMSG_NO_RAW, &input, 0);
+
+        raw.mi.dwFlags &= ~(MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE);
+        raw.mi.dx = raw.mi.dy = 0;
+        if (flags & MOUSEEVENTF_MOVE)
+        {
+            if (have_last && (x != last_x || y != last_y))
+            {
+                raw.mi.dwFlags |= MOUSEEVENTF_MOVE;
+                raw.mi.dx = x - last_x;
+                raw.mi.dy = y - last_y;
+            }
+            last_x = x;
+            last_y = y;
+            have_last = TRUE;
+        }
+        if (raw.mi.dwFlags) NtUserSendHardwareInput(top_level_hwnd, SEND_HWMSG_NO_MSG, &raw, 0);
+        return;
+    }
+
     NtUserSendHardwareInput(top_level_hwnd, 0, &input, 0);
 }
 
