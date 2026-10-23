@@ -563,7 +563,7 @@ static void *mach_message_pump( void *args )
             val = __atomic_load_n( &obj->low, __ATOMIC_SEQ_CST );
             if ((is_mutex && (val == 0 || val == ~0 || val == tid)) || (!is_mutex && val != 0))
             {
-                if (i > 1) unregister_wait( &receive_message, tid, i );
+                unregister_wait( &receive_message, tid, i );
                 wake_tid( tid );
                 break;
             }

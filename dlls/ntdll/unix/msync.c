@@ -470,15 +470,10 @@ static NTSTATUS msync_wait_multiple( const int *objs, void **objs_shm, int alert
     {
         if (check_shm_contention( objs_shm, alert_obj_shm, count, tid ))
         {
-            int i;
-            for (i = 0; i < count; i++)
-            {
-                struct event *obj = (struct event *)objs_shm[i];
-
-                int refs = __atomic_sub_fetch( &obj->multiple_waiters, 1, __ATOMIC_SEQ_CST);
-                if (refs < 0)
-                    __atomic_store_n( &obj->multiple_waiters, 0, __ATOMIC_SEQ_CST);
-            }
+            /* The server may still register every object (the signal can be consumed before it reads the
+             * message), and nothing else would take those entries back: they piled up by the million in
+             * Planet Zoo 2 (pool exhausted at startup), slowing the single pump thread for every wait. */
+            server_remove_wait( msgh_id, objs, objs_shm, alert_obj, alert_obj_shm, count );
             return STATUS_PENDING;
         }
         /* MSYNC-ACK-BLOCK: the server's mach_message_pump is a single thread;
